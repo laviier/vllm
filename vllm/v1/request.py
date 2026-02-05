@@ -25,6 +25,7 @@ from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
+    from vllm.beam_search import BeamGroup
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
 
@@ -175,6 +176,11 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
+
+        # Beam search grouping optimization
+        # When set, this request represents a group of beams tracked together
+        # to reduce scheduler overhead
+        self.beam_group: BeamGroup | None = None
 
     @classmethod
     def from_engine_core_request(
