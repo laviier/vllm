@@ -16,6 +16,7 @@ from vllm.entrypoints.pooling.base.protocol import (
     EncodingRequestMixin,
     PoolingBasicRequestMixin,
 )
+from vllm.entrypoints.pooling.forecast.protocol import ForecastRequest
 from vllm.logger import init_logger
 from vllm.renderers import TokenizeParams
 from vllm.tasks import PoolingTask
@@ -119,7 +120,7 @@ class IOProcessorResponse(OpenAIBaseModel, Generic[T]):
 
 
 PoolingRequest: TypeAlias = (
-    PoolingCompletionRequest | PoolingChatRequest | IOProcessorRequest
+    PoolingCompletionRequest | PoolingChatRequest | ForecastRequest | IOProcessorRequest
 )
 
 

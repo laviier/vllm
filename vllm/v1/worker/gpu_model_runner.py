@@ -5096,12 +5096,25 @@ class GPUModelRunner(
                 "to learn more."
             )
 
+        # Skip pooler warmup for forecast task - it uses external pipeline
+        # with custom data format (time series, not text tokens)
+        if supported_pooling_tasks == ["forecast"]:
+            logger.info("Skipping pooler warmup for forecast-only model")
+            return torch.tensor([])
+
         output_size = dict[PoolingTask, float]()
         for task in supported_pooling_tasks:
+            # Skip forecast task during warmup
+            if task == "forecast":
+                continue
             # Run a full batch with each task to ensure none of them OOMs
             output = self._dummy_pooler_run_task(hidden_states, task)
             output_size[task] = sum(o.nbytes for o in output if o is not None)
             del output  # Allow GC
+
+        if not output_size:
+            # All tasks were forecast (skipped)
+            return torch.tensor([])
 
         max_task = max(output_size.items(), key=lambda x: x[1])[0]
         return self._dummy_pooler_run_task(hidden_states, max_task)

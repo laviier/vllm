@@ -66,6 +66,7 @@ class PoolingParams(
             "score": ["use_activation"],
             "token_embed": ["dimensions", "use_activation"],
             "token_classify": ["use_activation"],
+            "forecast": [],  # Forecast task doesn't use standard pooling params
         }
 
     def clone(self) -> "PoolingParams":
@@ -170,6 +171,10 @@ class PoolingParams(
         elif self.task in ["classify", "score", "token_classify"]:
             if self.use_activation is None:
                 self.use_activation = True
+        elif self.task == "forecast":
+            # Forecast task doesn't use standard pooling parameters
+            # Parameters are handled in the forecast request protocol
+            pass
         else:
             raise ValueError(f"Unknown pooling task: {self.task!r}")
 

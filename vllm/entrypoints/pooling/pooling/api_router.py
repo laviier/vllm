@@ -8,6 +8,10 @@ from typing_extensions import assert_never
 
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.utils import validate_json_request
+from vllm.entrypoints.pooling.forecast.protocol import (
+    ForecastRequest,
+    ForecastResponse,
+)
 from vllm.entrypoints.pooling.pooling.protocol import (
     IOProcessorResponse,
     PoolingBytesResponse,
@@ -34,7 +38,9 @@ def pooling(request: Request) -> OpenAIServingPooling | None:
 )
 @with_cancellation
 @load_aware_call
-async def create_pooling(request: PoolingRequest, raw_request: Request):
+async def create_pooling(
+    request: PoolingRequest | ForecastRequest, raw_request: Request
+):
     handler = pooling(raw_request)
     if handler is None:
         base_server = raw_request.app.state.openai_serving_tokenization
@@ -50,7 +56,9 @@ async def create_pooling(request: PoolingRequest, raw_request: Request):
         return JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
-    elif isinstance(generator, (PoolingResponse, IOProcessorResponse)):
+    elif isinstance(
+        generator, (PoolingResponse, IOProcessorResponse, ForecastResponse)
+    ):
         return JSONResponse(content=generator.model_dump())
     elif isinstance(generator, PoolingBytesResponse):
         return StreamingResponse(

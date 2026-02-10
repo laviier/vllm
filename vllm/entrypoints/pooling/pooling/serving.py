@@ -18,6 +18,10 @@ from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.pooling.forecast.protocol import (
+    ForecastRequest,
+    ForecastResponse,
+)
 from vllm.entrypoints.pooling.pooling.protocol import (
     IOProcessorRequest,
     IOProcessorResponse,
@@ -69,9 +73,15 @@ class OpenAIServingPooling(OpenAIServing):
 
     async def create_pooling(
         self,
-        request: PoolingRequest,
+        request: PoolingRequest | ForecastRequest,
         raw_request: Request | None = None,
-    ) -> PoolingResponse | IOProcessorResponse | PoolingBytesResponse | ErrorResponse:
+    ) -> (
+        PoolingResponse
+        | IOProcessorResponse
+        | PoolingBytesResponse
+        | ForecastResponse
+        | ErrorResponse
+    ):
         """
         See https://platform.openai.com/docs/api-reference/embeddings/create
         for the API specification. This API mimics the OpenAI Embedding API.
@@ -84,6 +94,13 @@ class OpenAIServingPooling(OpenAIServing):
 
         request_id = f"pool-{self._base_request_id(raw_request)}"
         created_time = int(time.time())
+
+        # Handle forecast requests separately - MUST check before IOProcessorRequest
+        # since both have 'data' fields
+        if isinstance(request, ForecastRequest):
+            return await self._handle_forecast_request(
+                request, request_id, created_time
+            )
 
         is_io_processor_request = isinstance(request, IOProcessorRequest)
         try:
@@ -341,3 +358,64 @@ class OpenAIServingPooling(OpenAIServing):
             )
 
         assert_never(encoding_format)
+
+    async def _handle_forecast_request(
+        self,
+        request: ForecastRequest,
+        request_id: str,
+        created_time: int,
+    ) -> ForecastResponse | ErrorResponse:
+        """
+        Handle time series forecasting requests.
+
+        This creates a Chronos2ForForecasting instance and uses its predict()
+        method to generate forecasts via the Chronos2Pipeline.
+        """
+        try:
+            from vllm.config import ModelConfig, VllmConfig
+            from vllm.model_executor.models.chronos2 import Chronos2ForForecasting
+
+            # Extract validated data (already validated by ForecastRequest protocol)
+            inputs = request.data["inputs"]
+            params = request.data.get("parameters", {})
+
+            logger.info("Processing forecast request for model: %s", request.model)
+
+            # Create ModelConfig for Chronos-2
+            # Note: This creates a new model instance per request, which loads
+            # Chronos2Pipeline. In production, consider caching the model instance.
+            model_config_obj = ModelConfig(
+                model=request.model,
+                runner="pooling",
+                dtype="float32",
+                trust_remote_code=True,
+            )
+            vllm_config = VllmConfig(model_config=model_config_obj)
+
+            # Initialize model (pipeline loads lazily on first predict() call)
+            model = Chronos2ForForecasting(vllm_config=vllm_config)
+
+            # Generate forecasts
+            predictions = model.predict(
+                inputs=inputs,
+                prediction_length=params.get("prediction_length", 1),
+                batch_size=params.get("batch_size", 256),
+                cross_learning=params.get("cross_learning", False),
+                quantile_levels=params.get("quantile_levels", [0.1, 0.5, 0.9]),
+            )
+
+            return ForecastResponse(
+                request_id=request_id,
+                created_at=created_time,
+                data={"predictions": predictions},
+            )
+
+        except ImportError:
+            logger.exception("Failed to import chronos-forecasting package")
+            return self.create_error_response(
+                "chronos-forecasting package not installed. "
+                "Install with: pip install chronos-forecasting"
+            )
+        except Exception as e:
+            logger.exception("Forecast request failed")
+            return self.create_error_response(str(e))
