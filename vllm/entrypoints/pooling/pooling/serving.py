@@ -373,11 +373,14 @@ class OpenAIServingPooling(OpenAIServing):
         """
         try:
             from vllm.config import ModelConfig, VllmConfig
+            from vllm.entrypoints.pooling.forecast.protocol import (
+                ForecastParameters,
+            )
             from vllm.model_executor.models.chronos2 import Chronos2ForForecasting
 
             # Extract validated data (already validated by ForecastRequest protocol)
             inputs = request.data["inputs"]
-            params = request.data.get("parameters", {})
+            params = ForecastParameters(**request.data.get("parameters", {}))
 
             logger.info("Processing forecast request for model: %s", request.model)
 
@@ -395,13 +398,13 @@ class OpenAIServingPooling(OpenAIServing):
             # Initialize model (pipeline loads lazily on first predict() call)
             model = Chronos2ForForecasting(vllm_config=vllm_config)
 
-            # Generate forecasts
+            # Generate forecasts using validated parameters
             predictions = model.predict(
                 inputs=inputs,
-                prediction_length=params.get("prediction_length", 1),
-                batch_size=params.get("batch_size", 256),
-                cross_learning=params.get("cross_learning", False),
-                quantile_levels=params.get("quantile_levels", [0.1, 0.5, 0.9]),
+                prediction_length=params.prediction_length,
+                batch_size=params.batch_size,
+                cross_learning=params.cross_learning,
+                quantile_levels=params.quantile_levels,
             )
 
             return ForecastResponse(
