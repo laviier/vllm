@@ -207,6 +207,8 @@ _EMBEDDING_MODELS = {
     # [Text-only]
     "BertModel": ("bert", "BertEmbeddingModel"),
     "BertSpladeSparseEmbeddingModel": ("bert", "BertSpladeSparseEmbeddingModel"),
+    # [Time series forecasting]
+    "Chronos2Model": ("chronos2", "Chronos2ForForecasting"),
     "HF_ColBERT": ("colbert", "ColBERTModel"),
     "DeciLMForCausalLM": ("nemotron_nas", "DeciLMForCausalLM"),
     "Gemma2Model": ("gemma2", "Gemma2ForCausalLM"),
