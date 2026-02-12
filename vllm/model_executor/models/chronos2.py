@@ -153,70 +153,6 @@ class Chronos2ForForecasting(nn.Module, VllmModelForPooling):
                 ) from e
         return self._pipeline
 
-    def predict_raw(
-        self,
-        inputs: list[dict[str, Any]],
-        prediction_length: int = 1,
-        batch_size: int = 256,
-        cross_learning: bool = False,
-        **kwargs,
-    ) -> list[torch.Tensor]:
-        """
-        Generate raw tensor forecasts (like pipeline.predict()).
-
-        Args:
-            inputs: List of time series dictionaries with 'target' and optional covariates
-            prediction_length: Number of future timesteps to forecast
-            batch_size: Batch size for inference
-            cross_learning: Whether to enable cross-series learning
-            **kwargs: Additional arguments passed to pipeline.predict()
-
-        Returns:
-            List of torch.Tensor with shape (n_variates, n_quantiles, prediction_length)
-        """
-        # Convert inputs to Chronos2 format
-        chronos_inputs = []
-        for ts in inputs:
-            input_dict = {
-                "target": (
-                    torch.tensor(ts["target"], dtype=torch.float32)
-                    if not isinstance(ts["target"], torch.Tensor)
-                    else ts["target"]
-                ),
-            }
-
-            # Add past covariates if present
-            if ts.get("past_covariates"):
-                past_cov = {}
-                for k, v in ts["past_covariates"].items():
-                    if not isinstance(v, torch.Tensor):
-                        past_cov[k] = torch.tensor(v, dtype=torch.float32)
-                    else:
-                        past_cov[k] = v
-                input_dict["past_covariates"] = past_cov
-
-            # Add future covariates if present
-            if ts.get("future_covariates"):
-                future_cov = {}
-                for k, v in ts["future_covariates"].items():
-                    if not isinstance(v, torch.Tensor):
-                        future_cov[k] = torch.tensor(v, dtype=torch.float32)
-                    else:
-                        future_cov[k] = v
-                input_dict["future_covariates"] = future_cov
-
-            chronos_inputs.append(input_dict)
-
-        # Return raw tensor outputs from pipeline.predict()
-        return self.pipeline.predict(
-            inputs=chronos_inputs,
-            prediction_length=prediction_length,
-            batch_size=batch_size,
-            cross_learning=cross_learning,
-            limit_prediction_length=False,
-            **kwargs,
-        )
-
     def predict(
         self,
         inputs: list[dict[str, Any]],
@@ -241,7 +177,7 @@ class Chronos2ForForecasting(nn.Module, VllmModelForPooling):
             **kwargs: Additional arguments passed to pipeline.predict_quantiles()
 
         Returns:
-            List of prediction dictionaries with quantile forecasts in fev-compatible format
+            List of prediction dictionaries with quantile forecasts in SageMaker-compatible format
         """
         # Delegate to predict_quantiles for formatted output
         return self.predict_quantiles(
@@ -263,7 +199,7 @@ class Chronos2ForForecasting(nn.Module, VllmModelForPooling):
         **kwargs,
     ) -> list[dict[str, Any]]:
         """
-        Generate formatted quantile forecasts (like pipeline.predict_quantiles()).
+        Generate formatted quantile forecasts following the SageMaker example logic.
         
         Args:
             inputs: List of time series dictionaries with 'target' and optional covariates
@@ -274,9 +210,61 @@ class Chronos2ForForecasting(nn.Module, VllmModelForPooling):
             **kwargs: Additional arguments passed to pipeline.predict_quantiles()
 
         Returns:
-            List of prediction dictionaries with quantile forecasts in fev-compatible format
+            List of prediction dictionaries with quantile forecasts in SageMaker-compatible format
         """
-        # Convert inputs to Chronos2 format
+        # Set default quantile levels if not provided
+        if quantile_levels is None:
+            quantile_levels = [0.1, 0.5, 0.9]
+
+        # Prepare model inputs - convert to Chronos2 format
+        model_inputs = self._prepare_model_inputs(inputs)
+
+        # Use pipeline's predict_quantiles method
+        quantile_predictions, mean_predictions = self.pipeline.predict_quantiles(
+            inputs=model_inputs,
+            prediction_length=prediction_length,
+            quantile_levels=quantile_levels,
+            batch_size=batch_size,
+            cross_learning=cross_learning,
+            **kwargs,
+        )
+
+        def to_list(tensor: torch.Tensor, flatten: bool) -> list:
+            if flatten:
+                tensor = tensor.view(-1)
+            return tensor.tolist()
+
+        predictions = []
+        for i, (item_quantiles, item_mean) in enumerate(zip(quantile_predictions, mean_predictions)):
+            # Determine if target is 1D (univariate) or multi-dimensional
+            is_1d_target = len(inputs[i]["target"]) > 0 and not isinstance(inputs[i]["target"][0], (list, tuple))
+            
+            pred = {"mean": to_list(item_mean, flatten=is_1d_target)}
+            for q_idx, q_level in enumerate(quantile_levels):
+                quantile_values = item_quantiles[..., q_idx]
+                pred[str(q_level)] = to_list(quantile_values, flatten=is_1d_target)
+
+            # Add metadata from original input if present
+            input_ts = inputs[i]
+            if "item_id" in input_ts:
+                pred["item_id"] = input_ts["item_id"]
+            if "start" in input_ts:
+                pred["start"] = input_ts["start"]
+                
+            predictions.append(pred)
+
+        return predictions
+
+    def _prepare_model_inputs(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        Convert inputs to Chronos2Pipeline format.
+        
+        Args:
+            inputs: List of time series dictionaries
+            
+        Returns:
+            Converted inputs in Chronos2Pipeline format
+        """
         chronos_inputs = []
         for ts in inputs:
             input_dict = {
@@ -308,39 +296,8 @@ class Chronos2ForForecasting(nn.Module, VllmModelForPooling):
                 input_dict["future_covariates"] = future_cov
 
             chronos_inputs.append(input_dict)
-
-        # Use pipeline's predict_quantiles method
-        quantiles, mean = self.pipeline.predict_quantiles(
-            inputs=chronos_inputs,
-            prediction_length=prediction_length,
-            quantile_levels=quantile_levels or [0.1, 0.5, 0.9],
-            batch_size=batch_size,
-            cross_learning=cross_learning,
-            **kwargs,
-        )
-
-        # Formatting changes
-        target_quantiles = quantile_levels or [0.1, 0.5, 0.9]
-        predictions = []
         
-        for quantile_tensor, mean_tensor in zip(quantiles, mean):
-            pred = {}
-            
-            # Extract quantile data: shape (n_variates, prediction_length, n_quantiles)
-            # Take first variate for univariate case
-            q_data = quantile_tensor[0].cpu().numpy()  # (prediction_length, n_quantiles)
-            m_data = mean_tensor[0].cpu().numpy()  # (prediction_length,)
-            
-            # Add each quantile as a column
-            for q_idx, q_level in enumerate(target_quantiles):
-                pred[str(q_level)] = q_data[:, q_idx].tolist()
-            
-            # Add mean column  
-            pred["mean"] = m_data.tolist()
-            
-            predictions.append(pred)
-
-        return predictions
+        return chronos_inputs
 
     def forward(
         self,
