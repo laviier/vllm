@@ -418,6 +418,10 @@ class SpecDecodeBaseProposer:
             )
         )
 
+        # Mirage fused kernels (if enabled) will be installed directly on
+        # the EAGLE model's decoder layers at load time. Pending upstream
+        # Mirage fixes for KNGraph.cuda_call and onepass mode.
+
         assert self.runner is not None
 
         if self.attn_metadata_builder is None:
@@ -1378,6 +1382,10 @@ class SpecDecodeBaseProposer:
                 if self.eagle3_use_aux_hidden_state
                 else self.model.mask_hidden.view(self.hidden_size)
             )
+
+        # Optionally compile the draft model into a Mirage megakernel
+        from vllm.v1.spec_decode.mirage_eagle import maybe_enable_mirage_eagle
+        maybe_enable_mirage_eagle(self, self.vllm_config, self.device)
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """

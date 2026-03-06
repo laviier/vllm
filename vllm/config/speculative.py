@@ -132,6 +132,13 @@ class SpeculativeConfig:
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
 
+    use_mirage_draft: bool = False
+    """Enable Mirage Persistent Kernel (MPK) megakernel execution for the
+    draft model forward pass. Fuses embedding, FC, norms, projections, MLP,
+    and LM head into a single GPU kernel, eliminating kernel launch overhead
+    and enabling cross-operator pipelining. Requires the mirage package.
+    Only supported for EAGLE/MTP methods on single-GPU (TP=1) setups."""
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
