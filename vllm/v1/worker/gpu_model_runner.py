@@ -569,6 +569,11 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_disagg_draft():
+                # Disagg draft uses a disaggregated draft worker on a separate GPU.
+                # No local drafter is needed — the Disagg draft speculator proxy
+                # handles communication with the draft worker via NCCL.
+                self.drafter = None  # type: ignore[assignment]
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -4191,8 +4196,9 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and not spec_config.use_disagg_draft():
             # Decide whether to run the drafter or zero out draft tokens.
+            # Disagg draft handles its own draft token generation separately.
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
@@ -4286,6 +4292,11 @@ class GPUModelRunner(
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
+
+        # Disagg draft speculative decoding: generate draft tokens after bookkeeping.
+        # Draft tokens come from the disaggregated draft worker via NCCL.
+        if spec_config is not None and spec_config.use_disagg_draft():
+            self._disagg_propose_drafts(valid_sampled_token_ids)
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -4386,6 +4397,145 @@ class GPUModelRunner(
             if (req_state := self.requests.get(req_id)) is not None:
                 req_state.output_token_ids.append(-1)
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
+    def _disagg_propose_drafts(self, valid_sampled_token_ids):
+        """Generate draft tokens via the Disagg draft disaggregated draft worker.
+
+        Called after bookkeeping when Disagg draft spec decode is enabled.
+        Communicates with the draft worker via NCCL to get draft tokens.
+        """
+        spec_config = self.speculative_config
+        num_reqs = self.input_batch.num_reqs
+        vocab_size = spec_config.draft_model_config.get_vocab_size()
+
+        # Lazily create DisaggDraftSpeculator on first use.
+        if not hasattr(self, '_disagg_speculator'):
+            from vllm.distributed.parallel_state import get_tp_group
+            tp_rank = get_tp_group().rank_in_group
+            if tp_rank == 0:
+                from vllm.v1.worker.gpu.spec_decode.disagg_draft.speculator import (
+                    DisaggDraftSpeculator,
+                )
+                self._disagg_speculator = DisaggDraftSpeculator(
+                    self.vllm_config, self.device
+                )
+                self._disagg_speculator._lazy_connect()
+            else:
+                self._disagg_speculator = None
+
+        if not hasattr(self, '_disagg_prefilled_reqs'):
+            self._disagg_prefilled_reqs: set[str] = set()
+            self._disagg_req_to_seq_id: dict[str, int] = {}
+            self._disagg_next_seq_id: int = 0
+
+        if self._disagg_speculator is not None and self._disagg_speculator.is_connected:
+            try:
+                # Clean up finished requests
+                active_rids = set(self.input_batch.req_ids)
+                stale = self._disagg_prefilled_reqs - active_rids
+                if stale:
+                    self._disagg_prefilled_reqs -= stale
+                    stale_seq_ids = []
+                    for rid in stale:
+                        sid = self._disagg_req_to_seq_id.pop(rid, None)
+                        if sid is not None:
+                            stale_seq_ids.append(sid)
+                    if stale_seq_ids:
+                        free_ids = torch.tensor(
+                            stale_seq_ids, dtype=torch.int64,
+                            device=self.device,
+                        )
+                        self._disagg_speculator._target_interface \
+                            .request_free_seq(free_ids)
+
+                # Prefill new requests on the draft worker
+                new_req_ids = [
+                    rid for rid in self.input_batch.req_ids
+                    if rid not in self._disagg_prefilled_reqs
+                ]
+                if new_req_ids:
+                    for rid in new_req_ids:
+                        if rid not in self._disagg_req_to_seq_id:
+                            self._disagg_req_to_seq_id[rid] = (
+                                self._disagg_next_seq_id
+                            )
+                            self._disagg_next_seq_id += 1
+                    all_prompt_ids = []
+                    num_tokens_list = []
+                    new_seq_ids_list = []
+                    for rid in new_req_ids:
+                        req = self.requests[rid]
+                        n_prompt = req.num_prompt_tokens
+                        req_idx = self.input_batch.req_id_to_index[rid]
+                        prompt_ids = self.input_batch.token_ids_cpu[
+                            req_idx, :n_prompt
+                        ].tolist()
+                        all_prompt_ids.extend(prompt_ids)
+                        num_tokens_list.append(n_prompt)
+                        new_seq_ids_list.append(
+                            self._disagg_req_to_seq_id[rid]
+                        )
+                    input_ids_t = torch.tensor(
+                        all_prompt_ids, dtype=torch.int64,
+                        device=self.device,
+                    )
+                    num_tokens_t = torch.tensor(
+                        num_tokens_list, dtype=torch.int32,
+                        device=self.device,
+                    )
+                    new_seq_ids_t = torch.tensor(
+                        new_seq_ids_list, dtype=torch.int64,
+                        device=self.device,
+                    )
+                    self._disagg_speculator._target_interface \
+                        .request_prefill(
+                            input_ids_t, num_tokens_t,
+                            seq_ids=new_seq_ids_t,
+                        )
+                    self._disagg_prefilled_reqs.update(new_req_ids)
+
+                # Build verification outcome and request speculation
+                seq_ids = torch.tensor(
+                    [self._disagg_req_to_seq_id[rid]
+                     for rid in self.input_batch.req_ids],
+                    dtype=torch.int64, device=self.device,
+                )
+                k_accepted = torch.tensor(
+                    [max(0, len(ids) - 1)
+                     for ids in valid_sampled_token_ids],
+                    dtype=torch.int64, device=self.device,
+                )
+                bonus = torch.tensor(
+                    [ids[-1] if ids else 0
+                     for ids in valid_sampled_token_ids],
+                    dtype=torch.int64, device=self.device,
+                )
+                _, draft_toks, _ = (
+                    self._disagg_speculator._target_interface
+                    .request_speculation(
+                        seq_ids=seq_ids,
+                        k_accepted=k_accepted,
+                        bonus_tokens=bonus,
+                        batch_size=num_reqs,
+                    )
+                )
+                self._draft_token_ids = draft_toks.tolist()
+            except Exception as e:
+                logger.warning(
+                    "Disagg draft NCCL draft failed: %s. Random fallback.", e
+                )
+                self._draft_token_ids = [
+                    [int(torch.randint(0, vocab_size, (1,)).item())
+                     for _ in range(self.num_spec_tokens)]
+                    for _ in range(num_reqs)
+                ]
+        else:
+            self._draft_token_ids = [
+                [int(torch.randint(0, vocab_size, (1,)).item())
+                 for _ in range(self.num_spec_tokens)]
+                for _ in range(num_reqs)
+            ]
+        self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:

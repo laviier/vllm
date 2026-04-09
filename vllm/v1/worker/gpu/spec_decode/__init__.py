@@ -12,4 +12,8 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
         return EagleSpeculator(vllm_config, device)
+    if speculative_config.use_disagg_draft():
+        from vllm.v1.worker.gpu.spec_decode.disagg_draft.speculator import DisaggDraftSpeculator
+
+        return DisaggDraftSpeculator(vllm_config, device)
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")

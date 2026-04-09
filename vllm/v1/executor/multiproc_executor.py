@@ -154,6 +154,20 @@ class MultiprocExecutor(Executor):
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         # Create workers
         context = get_mp_context()
+
+        # Pre-generate Disagg draft NCCL init method BEFORE spawning workers,
+        # so workers inherit it in their copy of vllm_config.
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is not None and spec_config.use_disagg_draft():
+            if not spec_config.disagg_draft_nccl_init_method:
+                spec_config.disagg_draft_nccl_init_method = (
+                    f"tcp://{get_loopback_ip()}:{get_open_port()}"
+                )
+                logger.info(
+                    "Disagg draft: Pre-generated NCCL init method: %s",
+                    spec_config.disagg_draft_nccl_init_method,
+                )
+
         shared_worker_lock = context.Lock()
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
@@ -267,7 +281,36 @@ class MultiprocExecutor(Executor):
         return tp_size, pp_size, pcp_size
 
     def _post_init_executor(self) -> None:
-        pass
+        # Launch Disagg draft draft worker if Disagg draft speculative decoding is enabled.
+        # The NCCL init method was pre-generated in _init_executor before
+        # workers were spawned, so workers already have it in their config.
+        # NOTE: We launch the draft worker in a background thread to avoid
+        # blocking the executor init, which would cause TP worker health
+        # check timeouts.
+        self.disagg_draft_handle = None
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is not None and spec_config.use_disagg_draft():
+            from vllm.v1.worker.gpu.spec_decode.disagg_draft.executor import (
+                maybe_launch_disagg_draft_worker,
+            )
+
+            try:
+                self.disagg_draft_handle = maybe_launch_disagg_draft_worker(
+                    self.vllm_config
+                )
+            except Exception:
+                logger.warning(
+                    "Disagg draft draft worker failed to launch. "
+                    "Disagg draft will use JIT fallback only.",
+                    exc_info=True,
+                )
+                self.disagg_draft_handle = None
+
+            if self.disagg_draft_handle is not None:
+                logger.info(
+                    "Disagg draft draft worker launched. NCCL init: %s",
+                    spec_config.disagg_draft_nccl_init_method,
+                )
 
     def _is_driver_worker(self, rank: int) -> bool:
         return rank % self.parallel_config.tensor_parallel_size == 0
@@ -451,6 +494,20 @@ class MultiprocExecutor(Executor):
         if not getattr(self, "shutting_down", False):
             logger.debug("Triggering shutdown of workers")
             self.shutting_down = True
+
+            # Shutdown Disagg draft draft worker if running — do this FIRST
+            # before killing TP workers, since the draft worker may be
+            # blocked on NCCL recv waiting for a TP worker.
+            if ssd_handle := getattr(self, "disagg_draft_handle", None):
+                try:
+                    ssd_handle.shutdown()
+                except Exception:
+                    pass
+                # Force kill if still alive after shutdown()
+                if (ssd_handle.proc is not None
+                        and ssd_handle.proc.is_alive()):
+                    ssd_handle.proc.kill()
+                self.disagg_draft_handle = None
 
             # Make sure all the worker processes are terminated first.
             if workers := getattr(self, "workers", None):

@@ -1744,7 +1744,9 @@ class VllmConfig:
 
         if (
             self.speculative_config is not None
-            and self.speculative_config.method not in ("eagle", "eagle3", "mtp")
+            and self.speculative_config.method not in (
+                "eagle", "eagle3", "mtp", "disagg_draft"
+            )
         ):
             unsupported.append(f"speculative method '{self.speculative_config.method}'")
 

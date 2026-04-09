@@ -190,6 +190,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
         )
+
+        # Wire up req_states to Disagg draft speculator for prompt token access.
+        if (self.speculator is not None
+                and hasattr(self.speculator, 'set_req_states')):
+            self.speculator.set_req_states(self.req_states)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -628,6 +633,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
             )
             req_index = self.req_states.req_id_to_index[req_id]
+
+            # Cache prompt tokens for Disagg draft speculator prefill.
+            if (self.speculator is not None
+                    and hasattr(self.speculator, 'cache_new_request_tokens')):
+                self.speculator.cache_new_request_tokens(
+                    req_id, new_req_data.prompt_token_ids
+                )
 
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
@@ -1226,6 +1238,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+
+            # Disagg draft: broadcast draft tokens from TP rank 0 to all ranks.
+            # Only rank 0 communicates with the draft worker; other ranks
+            # get zeros. But all ranks need identical draft tokens because
+            # they're written into input_ids for the next target forward pass,
+            # and TP all-reduce requires consistent inputs.
+            if (hasattr(self.speculator, '_tp_rank')
+                    and self.parallel_config.tensor_parallel_size > 1):
+                from vllm.distributed.parallel_state import get_tp_group
+                tp_group = get_tp_group()
+                # draft_tokens is [num_reqs, K] — broadcast in-place
+                draft_buf = self.req_states.draft_tokens[
+                    input_batch.idx_mapping
+                ]
+                torch.distributed.broadcast(
+                    draft_buf, src=tp_group.first_rank,
+                    group=tp_group.device_group,
+                )
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping
+                ] = draft_buf
+
             self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
 
         if self.use_async_scheduling:

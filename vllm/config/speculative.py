@@ -58,6 +58,7 @@ SpeculativeMethod = Literal[
     "mlp_speculator",
     "draft_model",
     "suffix",
+    "disagg_draft",
     EagleModelTypes,
     NgramGPUTypes,
 ]
@@ -193,6 +194,27 @@ class SpeculativeConfig:
     geometrically, calibrated so that the mean rate across all speculative
     positions equals this value. Only used when rejection_sample_method
     is 'synthetic'. Must be in [0, 1]."""
+
+    # Disaggregated draft (Speculative Speculative Decoding) configuration
+    disagg_draft_nccl_init_method: str | None = None
+    """Pre-generated NCCL init method (tcp://host:port) for the disaggregated
+    draft-target process group. Set by the executor before worker spawn
+    so all workers see it through vllm_config."""
+
+    disagg_draft_fan_out: int = 3
+    """Fan-out F for the Disaggregated draft speculation cache. At each acceptance position,
+    the draft pre-computes speculations for the top-F bonus token candidates.
+    Paper default: F=3, achieving ~88% cache hit rate at T=0."""
+
+    disagg_draft_saguaro_c: float | None = None
+    """Saguaro sampling C parameter (0-1). Controls suppression of cached
+    token probabilities in the draft model to increase cache hit rate.
+    1.0 = no modification (standard sampling)."""
+
+    disagg_draft_jit_fallback: bool = True
+    """Enable just-in-time fallback speculation for cache misses. When True,
+    the draft model generates tokens sequentially on cache miss. When False,
+    random tokens are used for misses."""
 
     def compute_hash(self) -> str:
         """
@@ -399,6 +421,12 @@ class SpeculativeConfig:
                 self.model = "suffix"
             elif self.method == "extract_hidden_states":
                 self.model = "extract_hidden_states"
+            elif self.method == "disagg_draft":
+                # Disaggregated draft requires a draft model to be specified
+                raise ValueError(
+                    "Disaggregated draft method requires a draft model. "
+                    "Provide the model parameter."
+                )
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -497,7 +525,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "disagg_draft"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -882,6 +910,14 @@ class SpeculativeConfig:
     def use_ngram_gpu(self) -> bool:
         return self.method == "ngram_gpu"
 
+    def use_disagg_draft(self) -> bool:
+        """Check if Disaggregated draft (Speculative Speculative Decoding) is enabled.
+
+        Disaggregated draft uses a disaggregated draft worker on a separate GPU with
+        a speculation cache for async draft-verify overlap.
+        """
+        return self.method == "disagg_draft"
+
     def __repr__(self) -> str:
         method = self.method
         model = (
@@ -890,4 +926,9 @@ class SpeculativeConfig:
             else self.draft_model_config.model
         )
         num_spec_tokens = self.num_speculative_tokens
+        if method == "disagg_draft":
+            return (
+                f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=}, "
+                f"disagg_draft_fan_out={self.disagg_draft_fan_out})"
+            )
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"
