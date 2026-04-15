@@ -9,7 +9,7 @@ dedicated GPU. Sets up an NCCL process group between the target
 outcome / speculation exchange.
 
 Usage:
-    The disagg draft executor is activated when `speculative_config.use_disagg_draft()` is True.
+    The disagg draft executor is activated when `speculative_config.use_disagg()` is True.
     It extends MultiprocExecutor by overriding `_post_init_executor()` to
     spawn the draft worker process after the TP group is initialized.
 
@@ -163,7 +163,7 @@ def launch_disagg_draft_worker(
 
         # Signal readiness BEFORE NCCL init to avoid deadlock.
         # The NCCL PG will be initialized lazily when the target side
-        # is ready to rendezvous (after DisaggDraftSpeculator._lazy_connect()).
+        # is ready to rendezvous (after DisaggSpeculatorProxy._lazy_connect()).
         ready_pipe.send({"status": "READY", "nccl_init_method": nccl_init_method})
         ready_pipe.close()
         ready_pipe = None
@@ -220,6 +220,22 @@ def launch_disagg_draft_worker(
         # Create communicator
         from vllm.v1.worker.gpu.spec_decode.disagg_draft.communication import DisaggDraftCommunicator
 
+        # For EAGLE3, the transfer hidden size is num_aux_layers * target_hidden_size
+        # (concatenated aux hidden states). For EAGLE/MTP, it's just hidden_size.
+        base_hidden_size = vllm_config.model_config.get_hidden_size()
+        if spec_config.method == "eagle3":
+            from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+                get_eagle3_aux_layers_from_config,
+            )
+            aux_layers = get_eagle3_aux_layers_from_config(spec_config)
+            num_aux = len(aux_layers) if aux_layers else 3
+            draft_hf = spec_config.draft_model_config.hf_config
+            target_hs = getattr(draft_hf, 'target_hidden_size',
+                                base_hidden_size)
+            transfer_hidden_size = num_aux * target_hs
+        else:
+            transfer_hidden_size = base_hidden_size
+
         communicator = DisaggDraftCommunicator(
             process_group=disagg_pg,
             peer_rank=0,
@@ -228,6 +244,8 @@ def launch_disagg_draft_worker(
             vocab_size=spec_config.draft_model_config.get_vocab_size(),
             device=device,
             dtype=vllm_config.model_config.dtype,
+            needs_hidden_states=spec_config.disagg_needs_hidden_states,
+            hidden_size=transfer_hidden_size,
         )
 
         # Create the draft worker
@@ -363,6 +381,8 @@ class DisaggDraftWorkerHandle:
             vocab_size=spec_config.draft_model_config.get_vocab_size(),
             device=device,
             dtype=vllm_config.model_config.dtype,
+            needs_hidden_states=spec_config.disagg_needs_hidden_states,
+            hidden_size=vllm_config.model_config.get_hidden_size(),
         )
 
         self._target_interface = DisaggDraftTargetInterface(
@@ -435,7 +455,7 @@ def maybe_launch_disagg_draft_worker(
         DisaggDraftWorkerHandle if disagg draft is enabled, None otherwise.
     """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_disagg_draft():
+    if spec_config is None or not spec_config.use_disagg():
         return None
 
     # Determine draft GPU device
@@ -459,7 +479,7 @@ def maybe_launch_disagg_draft_worker(
 
     # Use the pre-generated NCCL init method from config (set before
     # workers were spawned so all processes share it).
-    nccl_init_method = spec_config.disagg_draft_nccl_init_method
+    nccl_init_method = spec_config.disagg_nccl_init_method
     if not nccl_init_method:
         # Fallback: generate fresh if not pre-generated
         nccl_init_method = f"tcp://{get_loopback_ip()}:{get_open_port()}"

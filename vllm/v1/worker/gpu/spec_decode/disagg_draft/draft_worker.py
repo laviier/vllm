@@ -97,14 +97,43 @@ class DisaggDraftWorker:
 
         self.K = spec_config.num_speculative_tokens
         self.vocab_size = spec_config.draft_model_config.get_vocab_size()
+        self.target_vocab_size = vllm_config.model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
 
-        # Disagg-draft-specific config (from speculative_config extensions)
-        self.fan_out = getattr(spec_config, "disagg_draft_fan_out", 3)
-        self.saguaro_c = getattr(spec_config, "disagg_draft_saguaro_c", None)
-        self.jit_fallback = getattr(spec_config, "disagg_draft_jit_fallback", True)
+        # Disagg-specific config (renamed from disagg_draft_* in Task 1.1)
+        self.fan_out = spec_config.disagg_fan_out
+        self.saguaro_c = spec_config.disagg_saguaro_c
+        self.jit_fallback = spec_config.disagg_jit_fallback
+
+        # Method detection: does this method need hidden states from target?
+        self.needs_hidden_states = spec_config.disagg_needs_hidden_states
 
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
+
+        # Pre-allocate hidden state buffer for EAGLE/EAGLE3/MTP methods
+        if self.needs_hidden_states:
+            hidden_size = vllm_config.model_config.get_hidden_size()
+            # For EAGLE3, the transfer size is num_aux_layers * target_hidden_size
+            if spec_config.method == "eagle3":
+                from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+                    get_eagle3_aux_layers_from_config,
+                )
+                aux_layers = get_eagle3_aux_layers_from_config(spec_config)
+                num_aux = len(aux_layers) if aux_layers else 3
+                draft_hf = spec_config.draft_model_config.hf_config
+                target_hs = getattr(draft_hf, 'target_hidden_size',
+                                    hidden_size)
+                transfer_hidden_size = num_aux * target_hs
+            else:
+                transfer_hidden_size = hidden_size
+            self._target_hidden_states = torch.zeros(
+                max_batch_size,
+                transfer_hidden_size,
+                dtype=self.dtype,
+                device=device,
+            )
+        else:
+            self._target_hidden_states = None
 
         # Initialize components
         self.cache = SpeculationCache(
@@ -147,6 +176,12 @@ class DisaggDraftWorker:
         self._last_draft_logits: torch.Tensor | None = None  # [B, K, V]
         self._last_bonus_tokens: torch.Tensor | None = None  # [B]
 
+        # Per-step self-conditioning hidden states from the last JIT round.
+        # Used for "glue decode" — filling KV cache gaps when tokens are
+        # accepted by the target.
+        self._last_step_hidden_states: torch.Tensor | None = None  # [B, K, hs]
+        self._last_jit_tokens: torch.Tensor | None = None  # [B, K]
+
         # Base sequence lengths at the START of each speculation round
         # (before JIT or cache-hit tokens modify _seq_lens).
         # Used by _build_next_cache to compute correct rollback positions.
@@ -157,11 +192,30 @@ class DisaggDraftWorker:
         # correct _seq_lens reset and block ownership management.
         self._swap_states: dict[int, SeqSwapRecord] = {}
 
+        # EAGLE prefix cache: stores EAGLE KV cache blocks for completed
+        # requests, keyed by a hash of the prompt token IDs. When a new
+        # request arrives with a prefix cache hit on the target side
+        # (partial hidden states), the draft worker checks if it has
+        # cached EAGLE KV blocks for the same prompt. If so, it copies
+        # the blocks instead of running eagle_prefill.
+        # Key: hash of prompt token IDs tuple
+        # Value: (block_ids list, seq_len after prefill)
+        self._eagle_prefix_cache: dict[int, tuple[list[int], int]] = {}
+        # Map seq_id → prompt token hash (for storing on completion)
+        self._seq_prompt_hash: dict[int, int] = {}
+        # Max entries to keep in the prefix cache
+        self._eagle_prefix_cache_max = 64
+
         logger.info(
-            "Disagg draft Draft Worker initialized: K=%d, fan_out=%d, device=%s",
+            "Disagg draft Draft Worker initialized: K=%d, fan_out=%d, "
+            "needs_hidden_states=%s, device=%s, "
+            "draft_vocab=%d, target_vocab=%d",
             self.K,
             self.fan_out,
+            self.needs_hidden_states,
             device,
+            self.vocab_size,
+            self.target_vocab_size,
         )
 
     def load_model(self) -> None:
@@ -202,7 +256,30 @@ class DisaggDraftWorker:
 
             elif cmd == DisaggDraftCommand.SPECULATE:
                 t0 = time.perf_counter()
-                self._handle_speculation()
+                try:
+                    self._handle_speculation()
+                except Exception as e:
+                    logger.error(
+                        "Disagg draft _handle_speculation failed: %s",
+                        e, exc_info=True,
+                    )
+                    # Send a fallback response so the target doesn't hang
+                    try:
+                        fallback_hits = torch.zeros(
+                            1, dtype=torch.int64, device=self.device)
+                        fallback_tokens = torch.zeros(
+                            1, self.K, dtype=torch.int64, device=self.device)
+                        fallback_logits = torch.zeros(
+                            1, self.K, self.vocab_size,
+                            dtype=self.dtype, device=self.device)
+                        self.comm.send_speculation(
+                            cache_hits=fallback_hits,
+                            draft_tokens=fallback_tokens,
+                            draft_logits=fallback_logits,
+                        )
+                    except Exception:
+                        logger.error("Failed to send fallback response",
+                                     exc_info=True)
                 dt = time.perf_counter() - t0
                 self._step_times.append(dt)
                 continue
@@ -219,9 +296,30 @@ class DisaggDraftWorker:
                 raise RuntimeError(f"Disagg draft draft worker: unknown command {cmd}")
 
     def _handle_prefill(self) -> None:
-        """Handle PREFILL command: process prefix for new sequences."""
-        input_ids, num_tokens, recv_seq_ids = self.comm.recv_prefill_data()
+        """Handle PREFILL command: process prefix for new sequences.
+
+        For standalone draft models, this runs a standard prefill to
+        populate the draft model's KV cache with prompt tokens.
+
+        For EAGLE/EAGLE3/MTP methods (``needs_hidden_states=True``),
+        the target side additionally sends the last hidden state for
+        the final prompt token of each sequence.  After the standard
+        prefill, we run an ``eagle_forward`` pass with those hidden
+        states so the EAGLE head's KV cache is properly initialised
+        and speculation can begin immediately.
+        """
+        input_ids, num_tokens, recv_seq_ids, hidden_states, _ = (
+            self.comm.recv_prefill_data()
+        )
         B = num_tokens.shape[0]
+
+        logger.info(
+            "Disagg draft prefill: B=%d, num_tokens=%s, "
+            "needs_hidden_states=%s, has_hidden_states=%s",
+            B, num_tokens.tolist(),
+            self.needs_hidden_states,
+            hidden_states is not None,
+        )
 
         # Run draft model prefill if model runner is available
         if (
@@ -233,20 +331,151 @@ class DisaggDraftWorker:
                 if recv_seq_ids is not None
                 else torch.arange(B, dtype=torch.int64, device=self.device)
             )
-            try:
-                self.draft_model_runner.prefill(
-                    input_ids=input_ids,
-                    num_tokens_per_seq=num_tokens,
-                    seq_ids=seq_ids,
-                )
-            except (RuntimeError, ValueError) as e:
-                # Gracefully handle KV cache exhaustion or block table
-                # overflow. The sequence will use JIT fallback.
-                logger.warning("Disagg draft prefill failed: %s", e)
-                return
+
+            if self.needs_hidden_states:
+                # EAGLE/EAGLE3/MTP: run EAGLE prefill with available
+                # hidden states. With prefix caching, hidden_states
+                # may cover only the suffix tokens (not the full prompt).
+                if hidden_states is not None:
+                    processed_hs = hidden_states
+                    if hasattr(self.draft_model_runner.model,
+                               'combine_hidden_states'):
+                        processed_hs = (
+                            self.draft_model_runner.model
+                            .combine_hidden_states(hidden_states)
+                        )
+
+                    total_tokens = int(input_ids.shape[0])
+                    hs_tokens = int(processed_hs.shape[0])
+
+                    if hs_tokens >= total_tokens:
+                        # Full prefill — all hidden states available
+                        prefill_ids = input_ids
+                        prefill_hs = processed_hs
+                        prefill_ntok = num_tokens
+                        pos_offsets = None
+                    else:
+                        # Prefix cache hit — only suffix hidden states.
+                        # Check if we have cached EAGLE KV blocks for
+                        # this prompt from a previous request.
+                        prompt_hash = hash(tuple(input_ids.tolist()))
+                        cached = self._eagle_prefix_cache.get(prompt_hash)
+                        if cached is not None:
+                            cached_blocks, _cached_seq_len = cached
+                            # Copy cached blocks to the new seq_id
+                            sid = int(seq_ids[0].item())
+                            n = int(num_tokens[0].item())
+                            self.draft_model_runner.allocate_blocks(
+                                sid, n + 256)
+                            # Copy KV data from cached blocks
+                            runner = self.draft_model_runner
+                            new_blocks = runner._block_tables.get(sid, [])
+                            n_copy = min(len(cached_blocks), len(new_blocks))
+                            if n_copy > 0 and runner.kv_caches is not None:
+                                src = torch.tensor(
+                                    cached_blocks[:n_copy],
+                                    dtype=torch.int64, device=self.device)
+                                dst = torch.tensor(
+                                    new_blocks[:n_copy],
+                                    dtype=torch.int64, device=self.device)
+                                for layer_kv in runner.kv_caches:
+                                    layer_kv[:, dst] = layer_kv[:, src]
+                            # Set seq_len to prompt_len - 1 (EAGLE shift)
+                            runner._seq_lens[sid] = n - 1
+                            self._seq_prompt_hash[sid] = prompt_hash
+                            logger.info(
+                                "Disagg EAGLE prefix cache HIT: "
+                                "hash=%d, copied %d blocks, "
+                                "seq_len=%d",
+                                prompt_hash, n_copy, cached_seq_len,
+                            )
+                        else:
+                            # No cached EAGLE KV — just allocate and
+                            # set _seq_lens. First glue decode will
+                            # start building context.
+                            for i in range(B):
+                                sid = int(seq_ids[i].item())
+                                n = int(num_tokens[i].item())
+                                self.draft_model_runner.allocate_blocks(
+                                    sid, n + 256)
+                                self.draft_model_runner._seq_lens[sid] = n - 1
+                            # Store prompt hash for caching on completion
+                            for i in range(B):
+                                sid = int(seq_ids[i].item())
+                                self._seq_prompt_hash[sid] = prompt_hash
+                            logger.info(
+                                "Disagg EAGLE prefix cache MISS: "
+                                "hash=%d, skipping EAGLE prefill.",
+                                prompt_hash,
+                            )
+                        prefill_ids = None  # signal to skip
+
+                    if prefill_ids is not None:
+                        try:
+                            self.draft_model_runner.eagle_prefill(
+                                input_ids=prefill_ids,
+                                num_tokens_per_seq=prefill_ntok,
+                                seq_ids=seq_ids,
+                                hidden_states=prefill_hs,
+                                position_offsets=pos_offsets,
+                            )
+                            torch.cuda.synchronize(self.device)
+
+                            logger.info(
+                                "Disagg draft EAGLE prefill OK: "
+                                "seq_lens=%s, hs shape=%s, "
+                                "prefix_cached=%s",
+                                {int(s): self.draft_model_runner._seq_lens.get(
+                                    int(s), -1) for s in seq_ids.tolist()},
+                                processed_hs.shape,
+                                hs_tokens < total_tokens,
+                            )
+                            # Store prompt hash for prefix caching
+                            prompt_hash = hash(tuple(input_ids.tolist()))
+                            for i in range(B):
+                                sid = int(seq_ids[i].item())
+                                self._seq_prompt_hash[sid] = prompt_hash
+                        except Exception as e:
+                            logger.warning(
+                                "Disagg draft EAGLE prefill failed: %s", e)
+                            for i, sid in enumerate(seq_ids.tolist()):
+                                n = int(num_tokens[i].item())
+                                try:
+                                    self.draft_model_runner.allocate_blocks(
+                                        int(sid), n)
+                                except Exception:
+                                    pass
+                                self.draft_model_runner._seq_lens[int(sid)] = 0
+                else:
+                    # No hidden states — just allocate blocks
+                    for i, sid in enumerate(seq_ids.tolist()):
+                        n = int(num_tokens[i].item())
+                        try:
+                            self.draft_model_runner.allocate_blocks(
+                                int(sid), n)
+                        except (RuntimeError, ValueError) as e:
+                            logger.warning(
+                                "Disagg draft EAGLE prefill block alloc "
+                                "failed for seq %d: %s", sid, e)
+                        self.draft_model_runner._seq_lens[int(sid)] = 0
+            else:
+                # Standalone draft model: run standard prefill.
+                try:
+                    self.draft_model_runner.prefill(
+                        input_ids=input_ids,
+                        num_tokens_per_seq=num_tokens,
+                        seq_ids=seq_ids,
+                    )
+                except (RuntimeError, ValueError) as e:
+                    logger.warning("Disagg draft prefill failed: %s", e)
+                    return
             # Clear stale round base lengths for freshly prefilled sequences.
             for sid in seq_ids.tolist():
                 self._round_base_lens.pop(int(sid), None)
+                self._swap_states.pop(int(sid), None)
+            # Clear glue decode state from previous request
+            self._glue_prenorm = None
+            self._glue_logits = None
 
     def _handle_speculation(self) -> None:
         """Handle SPECULATE command with hybrid swap+JIT strategy.
@@ -261,16 +490,44 @@ class DisaggDraftWorker:
         """
         _profile = os.environ.get("DISAGG_DRAFT_PROFILE", "0") == "1"
 
+        _t_start = time.perf_counter()
+
         # Step 1: Receive verification outcome
-        B, seq_ids, k_accepted, bonus_tokens, temperatures = (
+        (B, seq_ids, k_accepted, bonus_tokens, temperatures,
+         hidden_states, aux_hidden_states,
+         extend_counts, extend_hidden_states, extend_token_ids) = (
             self.comm.recv_verification_outcome()
         )
+
+        _t_recv = time.perf_counter()
+
+        # Store received hidden states for EAGLE/EAGLE3/MTP methods
+        if self.needs_hidden_states and hidden_states is not None:
+            self._target_hidden_states[:B] = hidden_states
+
+            # Debug: log received hidden states on first few calls
+            if not hasattr(self, '_recv_hs_log_count'):
+                self._recv_hs_log_count = 0
+            if self._recv_hs_log_count < 5:
+                self._recv_hs_log_count += 1
+                logger.info(
+                    "Disagg draft recv hidden_states: B=%d, "
+                    "shape=%s, norm=%.4f, hs[0,:3]=%s, "
+                    "all_zero=%s, k_accepted=%s, bonus=%s",
+                    B, hidden_states.shape,
+                    hidden_states.float().norm().item(),
+                    hidden_states[0, :3].tolist()
+                    if B > 0 else "empty",
+                    (hidden_states.abs().sum() == 0).item(),
+                    k_accepted.tolist()[:3],
+                    bonus_tokens.tolist()[:3],
+                )
 
         if _profile:
             torch.cuda.synchronize(self.device)
             t_recv = time.perf_counter()
 
-        # Step 1b: Reset _seq_lens accounting for swap state.
+        # Step 1b: Reset _seq_lens and run glue decode for EAGLE methods.
         if self.draft_model_runner is not None:
             runner = self.draft_model_runner
             seq_ids_list = seq_ids.tolist()
@@ -286,22 +543,63 @@ class DisaggDraftWorker:
                     )
                     runner._seq_lens[sid] = correct_len
                 elif sid in self._round_base_lens:
-                    correct_len = (
-                        self._round_base_lens[sid]
-                        + 1
-                        + int(k_accepted_list[i])
-                    )
-                    runner._seq_lens[sid] = correct_len
+                    k_acc = int(k_accepted_list[i])
+                    if self.needs_hidden_states:
+                        # EAGLE: reset to base. Glue decode will advance
+                        # _seq_lens by processing extend + recovery tokens.
+                        runner._seq_lens[sid] = self._round_base_lens[sid]
+                    else:
+                        # Standalone draft: advance by 1 + k_accepted
+                        # (recovery token + accepted draft tokens).
+                        # The JIT wrote KV at all K positions, so
+                        # there are no gaps even when k_accepted = K.
+                        runner._seq_lens[sid] = (
+                            self._round_base_lens[sid] + 1 + k_acc)
+
+            # Pre-allocate blocks for the full speculation round
+            # (glue decode + K JIT steps) to avoid per-step ensure_blocks.
+            for sid in seq_ids_list:
+                cur_len = runner._seq_lens.get(sid, 0)
+                # Need space for: extend tokens + recovery + K JIT steps
+                needed = cur_len + self.K + self.K + 2  # generous headroom
+                runner.ensure_blocks(sid, needed)
+
+            # --- Glue decode: fill KV cache gaps for EAGLE methods ---
+            # Only run glue decode when there are extend tokens to
+            # process (k_accepted > 0 for at least one sequence).
+            # When k_accepted=0 for all sequences, the glue decode
+            # would just process the recovery token, which is the
+            # same as JIT step 0. Skip it to save a forward pass.
+            has_extend = (extend_counts is not None
+                          and int(extend_counts.sum().item()) > 0)
+            if (self.needs_hidden_states
+                    and has_extend
+                    and hidden_states is not None):
+                self._run_glue_decode(
+                    B=B,
+                    seq_ids=seq_ids,
+                    k_accepted=k_accepted,
+                    bonus_tokens=bonus_tokens,
+                    hidden_states=hidden_states,
+                    extend_counts=extend_counts,
+                    extend_hidden_states=extend_hidden_states,
+                    extend_token_ids=extend_token_ids,
+                )
+            else:
+                self._glue_prenorm = None
+                self._glue_logits = None
 
             # Save base lens BEFORE any JIT or swap modifies _seq_lens
             for sid in seq_ids_list:
                 self._round_base_lens[sid] = runner._seq_lens.get(sid, 0)
 
         # Step 2: Cache lookup
-        cached_tokens, cached_logits, cache_hits = self.cache.lookup(
-            seq_ids=seq_ids,
-            k_accepted=k_accepted,
-            bonus_tokens=bonus_tokens,
+        cached_tokens, cached_logits, cache_hits, _cached_hs = (
+            self.cache.lookup(
+                seq_ids=seq_ids,
+                k_accepted=k_accepted,
+                bonus_tokens=bonus_tokens,
+            )
         )
 
         # Step 3: Hybrid swap+JIT
@@ -363,10 +661,41 @@ class DisaggDraftWorker:
             miss_temps = (temperatures[miss_mask]
                           if temperatures is not None else None)
 
-            jit_tokens, jit_logits = self._jit_speculate(
-                miss_seq_ids, miss_bonus, B_miss=B_miss,
-                temperatures=miss_temps,
-            )
+            if self.needs_hidden_states:
+                # EAGLE/EAGLE3/MTP: use hidden-state-aware JIT path
+                miss_hidden = self._target_hidden_states[
+                    miss_mask.nonzero(as_tuple=True)[0]
+                ]
+                # Use glue decode's prenorm output as the starting
+                # hidden state for JIT step 0. This matches the
+                # co-located EAGLE flow where the EAGLE model's
+                # step-0 output (from processing all query tokens)
+                # feeds into the decode steps.
+                glue_prenorm = getattr(self, '_glue_prenorm', None)
+                miss_glue_prenorm = None
+                if glue_prenorm is not None:
+                    miss_glue_prenorm = glue_prenorm[
+                        miss_mask.nonzero(as_tuple=True)[0]
+                    ]
+                glue_logits = getattr(self, '_glue_logits', None)
+                miss_glue_logits = None
+                if glue_logits is not None:
+                    miss_glue_logits = glue_logits[
+                        miss_mask.nonzero(as_tuple=True)[0]
+                    ]
+                jit_tokens, jit_logits = self._eagle_jit_speculate(
+                    miss_seq_ids, miss_bonus, B_miss=B_miss,
+                    temperatures=miss_temps,
+                    hidden_states=miss_hidden,
+                    glue_prenorm=miss_glue_prenorm,
+                    glue_logits=miss_glue_logits,
+                )
+            else:
+                # Standalone draft model: token-only JIT path
+                jit_tokens, jit_logits = self._jit_speculate(
+                    miss_seq_ids, miss_bonus, B_miss=B_miss,
+                    temperatures=miss_temps,
+                )
             draft_tokens[miss_mask] = jit_tokens
             if jit_logits is not None:
                 draft_logits[miss_mask] = jit_logits
@@ -395,6 +724,8 @@ class DisaggDraftWorker:
 
         used_swap = (B_miss == 0)  # all-swap for profiling
 
+        _t_compute = time.perf_counter()
+
         # Step 4: Send speculation to target
         self.comm.send_speculation(
             cache_hits=cache_hits,
@@ -402,14 +733,52 @@ class DisaggDraftWorker:
             draft_logits=draft_logits,
         )
 
+        _t_send = time.perf_counter()
+
+        # Log timing breakdown periodically
+        if not hasattr(self, '_timing_count'):
+            self._timing_count = 0
+            self._timing_recv = 0.0
+            self._timing_compute = 0.0
+            self._timing_send = 0.0
+        self._timing_count += 1
+        self._timing_recv += (_t_recv - _t_start) * 1000
+        self._timing_compute += (_t_compute - _t_recv) * 1000
+        self._timing_send += (_t_send - _t_compute) * 1000
+        if self._timing_count % 200 == 0:
+            n = 200
+            logger.info(
+                "Draft TIMING [%d]: recv=%.2fms compute=%.2fms "
+                "send=%.2fms total=%.2fms",
+                self._timing_count,
+                self._timing_recv / n,
+                self._timing_compute / n,
+                self._timing_send / n,
+                (self._timing_recv + self._timing_compute
+                 + self._timing_send) / n,
+            )
+            self._timing_recv = 0.0
+            self._timing_compute = 0.0
+            self._timing_send = 0.0
+
         if _profile:
             torch.cuda.synchronize(self.device)
             t_send = time.perf_counter()
 
         # Step 5: Build speculation cache for NEXT round (async overlap)
+        # Skip cache building for hidden-state methods (EAGLE/EAGLE3/MTP)
+        # because glue_decode and tree_decode call the model without
+        # hidden_states, which EAGLE models require.  These methods
+        # rely purely on JIT speculation until a proper EAGLE-aware
+        # cache building path is implemented.
         if self.draft_model_runner is not None:
             saved_seq_lens = dict(self.draft_model_runner._seq_lens)
-        self._build_next_cache(B, seq_ids)
+        if not self.needs_hidden_states:
+            self._build_next_cache(B, seq_ids)
+        # Restore _seq_lens — JIT speculation advances positions by K
+        # steps, but the target only accepted k_accepted tokens.  The
+        # correct seq_len will be set at the start of the next
+        # _handle_speculation based on k_accepted.
         if self.draft_model_runner is not None:
             self.draft_model_runner._seq_lens = saved_seq_lens
 
@@ -435,6 +804,344 @@ class DisaggDraftWorker:
                     cache_stats["disagg_cache_hit_rate"] * 100,
                     cache_stats["disagg_cache_entries"],
                 )
+        # End of _handle_speculation — return to main loop
+
+    def _run_glue_decode(
+        self,
+        B: int,
+        seq_ids: torch.Tensor,
+        k_accepted: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        extend_counts: torch.Tensor,
+        extend_hidden_states: torch.Tensor | None,
+        extend_token_ids: torch.Tensor | None,
+    ) -> None:
+        """Run glue decode to fill EAGLE KV cache gaps.
+
+        When the target accepts draft tokens (k_accepted > 0), the
+        EAGLE head's KV cache has gaps at positions that were never
+        written. This method fills those gaps by running a single
+        batched forward pass with extend + recovery tokens, following
+        SSD's prepare_glue_decode_ctxt_eagle pattern.
+
+        The token layout per sequence is:
+            [ext_0, ..., ext_{n-1}, recovery_token]
+        where n = extend_counts[i] = number of accepted draft tokens.
+
+        Hidden states:
+        - Extend tokens use target-conditioned hidden states (projected
+          through fc from extend_hidden_states)
+        - Recovery token uses target-conditioned hidden states (projected
+          through fc from hidden_states)
+
+        After glue decode, _seq_lens is set to the correct value.
+
+        Stores the EAGLE model's prenorm output at the recovery token
+        position in self._glue_prenorm. This is used by JIT as the
+        starting hidden state (matching the co-located EAGLE flow where
+        the EAGLE model's step-0 output feeds into the decode steps).
+        """
+        runner = self.draft_model_runner
+        if runner is None or not runner._model_loaded:
+            return
+
+        K = self.K
+        seq_ids_list = seq_ids.tolist()
+        k_accepted_list = k_accepted.tolist()
+
+        # Compute per-sequence token counts for glue decode:
+        # n_ext + 1 (recovery token)
+        ext_counts = extend_counts.tolist() if extend_counts is not None else [0] * B
+        seqlens_q = []  # number of query tokens per sequence
+        for i in range(B):
+            n_ext = int(ext_counts[i])
+            seqlens_q.append(n_ext + 1)  # extend tokens + recovery
+
+        total_tokens = sum(seqlens_q)
+        if total_tokens == 0:
+            return
+
+        # Build packed input_ids and hidden_states
+        fused_ids = torch.zeros(
+            total_tokens, dtype=torch.int64, device=self.device)
+        fused_hs = torch.zeros(
+            total_tokens, hidden_states.shape[-1],
+            dtype=hidden_states.dtype, device=self.device)
+
+        offset = 0
+        for i in range(B):
+            n_ext = int(ext_counts[i])
+            # Extend tokens (accepted draft tokens from previous round)
+            if n_ext > 0 and extend_token_ids is not None and extend_hidden_states is not None:
+                fused_ids[offset:offset + n_ext] = extend_token_ids[i, :n_ext]
+                fused_hs[offset:offset + n_ext] = extend_hidden_states[i, :n_ext]
+            # Recovery token
+            fused_ids[offset + n_ext] = bonus_tokens[i]
+            fused_hs[offset + n_ext] = hidden_states[i]
+            offset += n_ext + 1
+
+        # Project all hidden states through combine_hidden_states (fc)
+        # All tokens are target-conditioned (extend + recovery)
+        if hasattr(runner.model, 'combine_hidden_states'):
+            processed_hs = runner.model.combine_hidden_states(fused_hs)
+        else:
+            processed_hs = fused_hs
+
+        # Build positions: extend starts at base_pos, then sequential
+        # base_pos = _seq_lens[sid] (which is round_base after reset above)
+        # For EAGLE shift: the recovery token at position p gets
+        # conditioning from hidden state at position p (target's output).
+        # SSD uses: base_pos = num_tokens - 2 - extend_counts
+        # In our case: base_pos = _seq_lens[sid] (already at the right
+        # position after reset to round_base)
+        positions = torch.zeros(
+            total_tokens, dtype=torch.long, device=self.device)
+        expanded_seq_ids = []
+        offset = 0
+        for i in range(B):
+            sid = seq_ids_list[i]
+            n_ext = int(ext_counts[i])
+            n_q = n_ext + 1
+            start_pos = runner._seq_lens.get(sid, 0)
+            positions[offset:offset + n_q] = torch.arange(
+                n_q, device=self.device) + start_pos
+            expanded_seq_ids.extend([sid] * n_q)
+            offset += n_q
+
+        # Compute slot mapping
+        slot_mapping = runner._compute_slot_mapping(positions, expanded_seq_ids)
+
+        # Build block tables
+        block_tables = runner._get_block_table_tensor(seq_ids)
+
+        # Build FlashAttention metadata for varlen batched forward
+        # seq_lens for attention: each seq attends to start_pos + n_q
+        seq_lens_list = []
+        for i in range(B):
+            sid = seq_ids_list[i]
+            n_ext = int(ext_counts[i])
+            n_q = n_ext + 1
+            start_pos = runner._seq_lens.get(sid, 0)
+            seq_lens_list.append(start_pos + n_q)
+        seq_lens_t = torch.tensor(
+            seq_lens_list, dtype=torch.int32, device=self.device)
+        max_seq_len = int(seq_lens_t.max().item())
+
+        seqlens_q_t = torch.tensor(
+            seqlens_q, dtype=torch.int32, device=self.device)
+        max_query_len = max(seqlens_q)
+        query_start_loc = torch.zeros(
+            B + 1, dtype=torch.int32, device=self.device)
+        torch.cumsum(seqlens_q_t, dim=0, out=query_start_loc[1:])
+
+        from vllm.forward_context import BatchDescriptor, set_forward_context
+        attn_metadata = runner._build_flash_attn_metadata(
+            num_tokens=total_tokens,
+            seq_lens_tensor=seq_lens_t,
+            max_seq_len=max_seq_len,
+            max_query_len=max_query_len,
+            query_start_loc=query_start_loc,
+            block_table=block_tables,
+            slot_mapping=slot_mapping,
+        )
+        slot_mapping_dict = runner._build_slot_mapping_dict(slot_mapping)
+
+        # Run EAGLE model forward with all glue decode tokens
+        batch_descriptor = BatchDescriptor(num_tokens=total_tokens)
+        with set_forward_context(
+            attn_metadata=attn_metadata,
+            vllm_config=runner._draft_vllm_config,
+            num_tokens=total_tokens,
+            slot_mapping=slot_mapping_dict,
+            batch_descriptor=batch_descriptor,
+        ):
+            output = runner.model(
+                input_ids=fused_ids,
+                positions=positions,
+                hidden_states=processed_hs,
+            )
+
+        # Extract prenorm and logits at the recovery token position
+        # (last token per sequence). The prenorm feeds into JIT as the
+        # starting hidden state. The logits are used to sample the
+        # first draft token (matching the co-located EAGLE flow where
+        # step 0 processes all query tokens and samples from the last).
+        seqlens_q_t = torch.tensor(
+            seqlens_q, dtype=torch.long, device=self.device)
+        last_indices = torch.cumsum(seqlens_q_t, dim=0) - 1
+        if runner.method != "mtp":
+            last_hs, out_hs = output
+            self._glue_prenorm = out_hs[last_indices]  # [B, hidden_size]
+            # Compute logits at recovery position for first draft token
+            sample_hs = last_hs[last_indices]
+            if hasattr(runner.model, 'compute_logits'):
+                self._glue_logits = runner.model.compute_logits(sample_hs)
+            elif hasattr(runner.model, 'lm_head'):
+                self._glue_logits = runner.model.lm_head(sample_hs)
+            else:
+                self._glue_logits = None
+            if self._glue_logits is not None:
+                self._glue_logits = self._glue_logits[:, :runner.vocab_size]
+        else:
+            self._glue_prenorm = output[last_indices]
+            self._glue_logits = None
+
+        # Update _seq_lens to reflect the glue decode
+        for i in range(B):
+            sid = seq_ids_list[i]
+            n_ext = int(ext_counts[i])
+            n_q = n_ext + 1
+            start_pos = runner._seq_lens.get(sid, 0)
+            runner._seq_lens[sid] = start_pos + n_q
+
+        # Debug logging
+        if not hasattr(self, '_glue_log_count'):
+            self._glue_log_count = 0
+        if self._glue_log_count < 5:
+            self._glue_log_count += 1
+            logger.info(
+                "Glue decode: B=%d, total_tokens=%d, "
+                "ext_counts=%s, k_accepted=%s, "
+                "new_seq_lens=%s, prenorm_norm=%.4f",
+                B, total_tokens,
+                ext_counts[:3],
+                k_accepted_list[:3],
+                {sid: runner._seq_lens.get(sid, -1)
+                 for sid in seq_ids_list[:3]},
+                self._glue_prenorm.float().norm().item(),
+            )
+            if self._glue_logits is not None:
+                top5v, top5i = self._glue_logits[0].topk(5)
+                logger.info(
+                    "Glue logits: argmax=%d, top5=%s, top5v=%s, "
+                    "fused_ids=%s, fused_hs_norm=%.4f, "
+                    "positions=%s",
+                    self._glue_logits[0].argmax().item(),
+                    top5i.tolist(), top5v.tolist(),
+                    fused_ids.tolist()[:8],
+                    fused_hs.float().norm().item(),
+                    positions.tolist()[:8],
+                )
+
+    def _eagle_jit_speculate(
+        self,
+        seq_ids: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        B_miss: int,
+        temperatures: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        seeds: torch.Tensor | None = None,
+        glue_prenorm: torch.Tensor | None = None,
+        glue_logits: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """JIT speculation for EAGLE/EAGLE3/MTP methods (cache misses).
+
+        Uses the DraftModelRunner's ``eagle_sequential_speculate`` which
+        feeds target hidden states into the EAGLE head at step 0 and
+        then feeds the head's own output hidden states for subsequent
+        autoregressive steps.
+
+        When ``glue_prenorm`` and ``glue_logits`` are provided (from
+        the glue decode pass), the first draft token is sampled from
+        ``glue_logits`` and subsequent steps use ``glue_prenorm`` as
+        the starting hidden state. This matches the co-located EAGLE
+        flow where step 0 processes all query tokens and samples from
+        the last position's logits.
+
+        Falls back to random tokens when the draft model is not loaded.
+
+        Args:
+            seq_ids: [B_miss] — sequence IDs for cache misses.
+            bonus_tokens: [B_miss] — bonus tokens (recovery tokens).
+            B_miss: Number of cache misses.
+            temperatures: [B_miss] — per-request temperatures.
+            hidden_states: [B_miss, hidden_size] — target hidden states.
+            seeds: [B_miss] — per-request seeds for Gumbel sampling.
+            glue_prenorm: [B_miss, hidden_size] — EAGLE model's prenorm
+                output from glue decode.
+            glue_logits: [B_miss, V] — logits from glue decode at the
+                recovery token position. Used to sample the first draft
+                token.
+
+        Returns:
+            tokens: [B_miss, K] — draft tokens.
+            logits: [B_miss, K, V] — draft logits.
+        """
+        if (
+            self.draft_model_runner is not None
+            and self.draft_model_runner._model_loaded
+        ):
+            positions = torch.tensor(
+                [
+                    self.draft_model_runner._seq_lens.get(int(sid), 0)
+                    for sid in seq_ids.tolist()
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            # For EAGLE3, project concatenated aux hidden states through
+            # combine_hidden_states (fc layer) to match the standard
+            # EagleSpeculator flow.  The received hidden_states are
+            # cat(aux_hidden_states) from the target, which need to be
+            # projected to the EAGLE model's hidden_size before being
+            # fed into the EAGLE head.
+            processed_hs = hidden_states
+            if hasattr(self.draft_model_runner.model, 'combine_hidden_states'):
+                processed_hs = (
+                    self.draft_model_runner.model.combine_hidden_states(
+                        hidden_states
+                    )
+                )
+
+            # --- Run JIT speculation ---
+            # Use eagle_sequential_speculate which processes the
+            # recovery token at step 0 with target hidden states,
+            # then self-conditions for steps 1..K-1.
+            # Note: The glue decode already wrote correct KV entries
+            # for extend + recovery tokens. eagle_sequential_speculate
+            # will overwrite the recovery KV entry (harmless — same
+            # input produces same output).
+            tokens, logits_out = (
+                self.draft_model_runner.eagle_sequential_speculate(
+                    recovery_tokens=bonus_tokens,
+                    positions=positions,
+                    seq_ids=seq_ids,
+                    num_steps=self.K,
+                    hidden_states=processed_hs,
+                    temperatures=temperatures,
+                    seeds=seeds,
+                )
+            )
+
+            # Clamp draft token IDs to the target model's vocab range.
+            # The EAGLE model may have a larger vocab than the target,
+            # causing out-of-bounds embedding lookups on the target GPU.
+            if self.target_vocab_size < self.vocab_size:
+                tokens = tokens.clamp(max=self.target_vocab_size - 1)
+
+            return tokens, logits_out
+
+        # Random token fallback (when model not loaded)
+        tokens = torch.randint(
+            0,
+            self.vocab_size,
+            (B_miss, self.K),
+            device=self.device,
+            dtype=torch.int64,
+        )
+        tokens[:, 0] = bonus_tokens
+
+        logits = torch.zeros(
+            B_miss,
+            self.K,
+            self.vocab_size,
+            dtype=self.dtype,
+            device=self.device,
+        ).uniform_()
+
+        return tokens, logits
 
     def _jit_speculate(
         self,
@@ -484,6 +1191,9 @@ class DisaggDraftWorker:
                 temperature=temperatures,
                 saguaro_sampler=self.saguaro_sampler if self.saguaro_c is not None else None,
             )
+            # Clamp to target vocab range
+            if self.target_vocab_size < self.vocab_size:
+                tokens = tokens.clamp(max=self.target_vocab_size - 1)
             return tokens, logits
 
         # Random token fallback (when model not loaded)
@@ -716,18 +1426,44 @@ class DisaggDraftWorker:
         max_prefix = int(prefix_lens.max().item())
         max_context_hint = max_prefix + K + 1
 
+        # For EAGLE methods, initialize per-branch hidden states from
+        # the target hidden states received in the last SPECULATE command.
+        # Each branch inherits the hidden state of its parent sequence.
+        if self.needs_hidden_states and self._target_hidden_states is not None:
+            branch_hidden_states = self._target_hidden_states[
+                entry_batch_ids
+            ].clone()  # [N, hidden_size]
+        else:
+            branch_hidden_states = None
+
         for depth in range(K):
             positions = prefix_lens + depth
             context_lens = prefix_lens + depth + 1
 
-            logits = runner.tree_decode_step(
-                input_ids=current_ids,
-                positions=positions,
-                seq_lens=context_lens,
-                seq_ids_expanded=seq_ids_expanded,
-                block_tables=branch_block_tables,
-                max_seq_len_hint=max_context_hint,
-            )
+            if branch_hidden_states is not None:
+                # EAGLE tree decode: pass hidden states and get updated
+                # hidden states for the next depth level.
+                logits, branch_hidden_states = (
+                    runner.eagle_tree_decode_step(
+                        input_ids=current_ids,
+                        positions=positions,
+                        seq_lens=context_lens,
+                        seq_ids_expanded=seq_ids_expanded,
+                        block_tables=branch_block_tables,
+                        hidden_states=branch_hidden_states,
+                        max_seq_len_hint=max_context_hint,
+                    )
+                )
+            else:
+                # Standalone draft model: token-only tree decode.
+                logits = runner.tree_decode_step(
+                    input_ids=current_ids,
+                    positions=positions,
+                    seq_lens=context_lens,
+                    seq_ids_expanded=seq_ids_expanded,
+                    block_tables=branch_block_tables,
+                    max_seq_len_hint=max_context_hint,
+                )
 
             all_logits[:, depth] = logits
             next_tokens = logits.argmax(dim=-1)
@@ -778,22 +1514,45 @@ class DisaggDraftWorker:
     def _handle_free_seq(self) -> None:
         """Handle FREE_SEQ command: release resources for completed sequences.
 
-        Frees KV cache blocks, sequence length tracking, round base
-        lengths, and swap state for sequences that have finished.
+        Before freeing, caches the EAGLE KV blocks for prefix reuse.
         """
         seq_ids = self.comm.recv_free_seq()
         freed = 0
         for sid in seq_ids.tolist():
             sid = int(sid)
             self._round_base_lens.pop(sid, None)
-
-            # Clear swap state. Don't call release_owned_blocks here
-            # because the owned blocks are already in _block_tables[sid]
-            # (swap_block_tables puts them there) and free_blocks will
-            # recycle them.
             self._swap_states.pop(sid, None)
 
             if self.draft_model_runner is not None:
+                # Cache EAGLE KV blocks before freeing
+                prompt_hash = self._seq_prompt_hash.pop(sid, None)
+                if (prompt_hash is not None
+                        and prompt_hash not in self._eagle_prefix_cache):
+                    blocks = self.draft_model_runner._block_tables.get(sid)
+                    seq_len = self.draft_model_runner._seq_lens.get(sid)
+                    if blocks and seq_len:
+                        # Only cache the prefill portion (not JIT tokens).
+                        # The prefill covers positions 0..seq_len_at_prefill.
+                        # We don't know the exact prefill seq_len, but we
+                        # can cache all blocks — the extra JIT blocks are
+                        # harmless (they'll be overwritten on reuse).
+                        self._eagle_prefix_cache[prompt_hash] = (
+                            list(blocks), seq_len,
+                        )
+                        # Don't free these blocks — they're now owned
+                        # by the prefix cache. Remove from _block_tables
+                        # so free_blocks doesn't recycle them.
+                        self.draft_model_runner._block_tables.pop(sid, None)
+                        self.draft_model_runner._seq_lens.pop(sid, None)
+                        if sid < self.draft_model_runner._block_table_gpu.shape[0]:
+                            self.draft_model_runner._block_table_gpu[sid].zero_()
+                        # Evict oldest if cache is full
+                        if len(self._eagle_prefix_cache) > self._eagle_prefix_cache_max:
+                            oldest_key = next(iter(self._eagle_prefix_cache))
+                            evicted_blocks, _ = self._eagle_prefix_cache.pop(oldest_key)
+                            self.draft_model_runner._free_list.extend(evicted_blocks)
+                        freed += 1
+                        continue
                 self.draft_model_runner.free_blocks(sid)
                 freed += 1
         if freed:
@@ -852,6 +1611,7 @@ class DisaggDraftTargetInterface:
         input_ids: torch.Tensor,
         num_tokens: torch.Tensor,
         seq_ids: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> None:
         """Request the draft worker to prefill new sequences.
 
@@ -859,9 +1619,17 @@ class DisaggDraftTargetInterface:
             input_ids: [total_tokens] — flattened input tokens.
             num_tokens: [B_new] — per-sequence token counts.
             seq_ids: [B_new] — stable sequence IDs (optional).
+            hidden_states: [B_new, hidden_size] — target model hidden
+                states for the last prompt token of each new sequence.
+                Only provided when the method requires hidden states
+                (EAGLE, EAGLE3, MTP).
         """
         self.comm.send_command(DisaggDraftCommand.PREFILL)
-        self.comm.send_prefill_data(input_ids, num_tokens, seq_ids=seq_ids)
+        self.comm.send_prefill_data(
+            input_ids, num_tokens,
+            seq_ids=seq_ids,
+            hidden_states=hidden_states,
+        )
 
     def request_speculation(
         self,
@@ -870,25 +1638,20 @@ class DisaggDraftTargetInterface:
         bonus_tokens: torch.Tensor,
         batch_size: int,
         temperatures: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        extend_counts: torch.Tensor | None = None,
+        extend_hidden_states: torch.Tensor | None = None,
+        extend_token_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Send verification outcome and receive draft tokens (synchronous).
-
-        Args:
-            seq_ids: [B] — sequence IDs.
-            k_accepted: [B] — tokens accepted per sequence.
-            bonus_tokens: [B] — bonus token per sequence.
-            batch_size: B.
-            temperatures: [B] — per-request sampling temperatures.
-
-        Returns:
-            cache_hits: [B] — boolean cache hit mask.
-            draft_tokens: [B, K] — speculated tokens.
-            draft_logits: [B, K, V] — draft logits (zeros if not cached).
-        """
+        """Send verification outcome and receive draft tokens."""
         self.comm.send_command(DisaggDraftCommand.SPECULATE)
         self.comm.send_verification_outcome(
             seq_ids, k_accepted, bonus_tokens,
             temperatures=temperatures,
+            hidden_states=hidden_states,
+            extend_counts=extend_counts,
+            extend_hidden_states=extend_hidden_states,
+            extend_token_ids=extend_token_ids,
         )
         return self.comm.recv_speculation(batch_size)
 

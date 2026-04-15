@@ -67,6 +67,7 @@ class DraftModelRunner:
         self.vocab_size = self.draft_config.get_vocab_size()
         self.hidden_size = self.draft_config.get_hidden_size()
         self.dtype = vllm_config.model_config.dtype
+        self.method = spec_config.method
         self.max_model_len = self.draft_config.max_model_len
         self._num_spec_tokens = spec_config.num_speculative_tokens
 
@@ -132,6 +133,10 @@ class DraftModelRunner:
         self._decode_graphs: dict[int, dict] = {}  # bs → graph + buffers
         self._decode_graph_pool = None
         self._decode_graphs_captured = False
+
+        # CUDA graph state for eagle_forward (with hidden_states input)
+        self._eagle_graphs: dict[int, dict] = {}  # bs → graph + buffers
+        self._eagle_graphs_captured = False
 
     # ---------------------------------------------------------------
     # KV cache snapshot / rollback for tree decode
@@ -291,6 +296,104 @@ class DraftModelRunner:
 
         return logits[:, :self.vocab_size]
 
+    def eagle_tree_decode_step(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_ids_expanded: torch.Tensor,
+        block_tables: torch.Tensor,
+        hidden_states: torch.Tensor,
+        max_seq_len_hint: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one EAGLE tree decode step with hidden state feedback.
+
+        Like ``tree_decode_step`` but passes hidden states to the EAGLE
+        head and returns both logits and output hidden states for the
+        next depth level.  Does NOT use CUDA graphs (EAGLE forward
+        requires hidden_states input which graphs don't capture).
+
+        Args:
+            input_ids: [N] — input token IDs for each branch.
+            positions: [N] — position of each token.
+            seq_lens: [N] — context length for each branch.
+            seq_ids_expanded: [N] — sequence IDs (one per branch).
+            block_tables: [N, M] — per-branch block tables.
+            hidden_states: [N, hidden_size] — hidden states from the
+                target model (depth 0) or previous EAGLE step.
+            max_seq_len_hint: Optional hint for max sequence length.
+
+        Returns:
+            Tuple of (logits, out_hidden_states):
+              - logits: [N, V] — logits for each branch.
+              - out_hidden_states: [N, hidden_size] — hidden states to
+                feed into the next depth level.
+        """
+        assert self._model_loaded
+        N = input_ids.shape[0]
+
+        # Compute slot mapping from per-branch block tables
+        logical_blocks = (positions // self.block_size).to(torch.int64)
+        offsets = (positions % self.block_size).to(torch.int64)
+        physical_blocks = block_tables[
+            torch.arange(N, device=self.device), logical_blocks
+        ].to(torch.int64)
+        slot_mapping = physical_blocks * self.block_size + offsets
+
+        seq_lens_i32 = seq_lens.to(torch.int32)
+        if max_seq_len_hint is not None:
+            max_seq_len = max_seq_len_hint
+        else:
+            max_seq_len = int(seq_lens_i32.max().item())
+
+        # Eager path only — CUDA graphs don't support hidden_states input
+        query_start_loc = torch.arange(
+            N + 1, dtype=torch.int32, device=self.device
+        )
+        attn_metadata = self._build_flash_attn_metadata(
+            num_tokens=N,
+            seq_lens_tensor=seq_lens_i32,
+            max_seq_len=max_seq_len,
+            max_query_len=1,
+            query_start_loc=query_start_loc,
+            block_table=block_tables,
+            slot_mapping=slot_mapping,
+        )
+        slot_mapping_dict = self._build_slot_mapping_dict(slot_mapping)
+        batch_descriptor = BatchDescriptor(num_tokens=N)
+        with set_forward_context(
+            attn_metadata=attn_metadata,
+            vllm_config=self._draft_vllm_config,
+            num_tokens=N,
+            slot_mapping=slot_mapping_dict,
+            batch_descriptor=batch_descriptor,
+        ):
+            output = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+
+        # MTP returns a single tensor; EAGLE/EAGLE3 returns a tuple.
+        if self.method == "mtp":
+            last_hs = output
+            out_hs = output
+        else:
+            last_hs, out_hs = output
+
+        # Compute logits from last_hidden_states
+        if hasattr(self.model, "compute_logits"):
+            logits = self.model.compute_logits(last_hs)
+        elif hasattr(self.model, "lm_head"):
+            logits = self.model.lm_head(last_hs)
+        else:
+            logits = torch.matmul(
+                last_hs,
+                self.model.get_input_embeddings().weight.T,
+            )
+
+        return logits[:, :self.vocab_size], out_hs
+
     def tree_decode_step(
         self,
         input_ids: torch.Tensor,
@@ -445,6 +548,20 @@ class DraftModelRunner:
         )
         self.model.eval()
 
+        # In the standard EAGLE flow, embed_tokens and lm_head are
+        # shared from the target model via load_eagle_model().  In
+        # disagg mode, the EAGLE model is loaded independently on a
+        # separate GPU, so we must load the target's embed_tokens and
+        # lm_head weights from the target model files to match the
+        # co-located behavior exactly.
+        try:
+            self._load_target_embed_and_lm_head()
+        except Exception as e:
+            logger.warning(
+                "Failed to load target embed/lm_head: %s", e,
+                exc_info=True,
+            )
+
         # Store the draft vllm_config — attention layers register
         # themselves in compilation_config.static_forward_context
         # during model construction, so we must use this config
@@ -453,6 +570,34 @@ class DraftModelRunner:
 
         dt = time.perf_counter() - t0
         logger.info("Draft model loaded in %.1f seconds.", dt)
+
+        # Verify embedding weights were loaded (not random).
+        # In the standard EAGLE flow, embed_tokens is shared from the
+        # target model. In disagg, we load from the model files.
+        # If the model files don't include embed_tokens, the weights
+        # would be uninitialized.
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+            embed_w = self.model.model.embed_tokens.weight
+            logger.info(
+                "Draft model embed_tokens: shape=%s, norm=%.4f, "
+                "mean=%.6f, std=%.6f",
+                embed_w.shape,
+                embed_w.float().norm().item(),
+                embed_w.float().mean().item(),
+                embed_w.float().std().item(),
+            )
+        if hasattr(self.model, 'lm_head'):
+            lm_w = self.model.lm_head.weight
+            logger.info(
+                "Draft model lm_head: shape=%s, norm=%.4f",
+                lm_w.shape, lm_w.float().norm().item(),
+            )
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'fc'):
+            fc_w = self.model.model.fc.weight
+            logger.info(
+                "Draft model fc: shape=%s, norm=%.4f",
+                fc_w.shape, fc_w.float().norm().item(),
+            )
 
         self._allocate_kv_cache()
         self._bind_kv_cache_to_attention_layers()
@@ -478,6 +623,170 @@ class DraftModelRunner:
                 "Tree decode CUDA graph capture failed: %s. Using eager.", e
             )
             self._tree_decode_captured = False
+
+        # EAGLE forward graphs (with hidden_states input)
+        if self.method in ("eagle", "eagle3", "mtp"):
+            try:
+                self._capture_eagle_graphs()
+            except Exception as e:
+                logger.warning(
+                    "EAGLE CUDA graph capture failed: %s. Using eager.", e
+                )
+                self._eagle_graphs_captured = False
+
+    def _load_target_embed_and_lm_head(self) -> None:
+        """Load target model's embed_tokens and lm_head onto the draft GPU.
+
+        In the co-located EAGLE flow, ``load_eagle_model()`` replaces
+        the EAGLE model's ``embed_tokens`` and ``lm_head`` with the
+        target model's versions (shared references).  In disagg mode
+        the EAGLE model lives on a separate GPU, so we cannot share
+        references.  Instead we load the weights from the target
+        model's safetensors files and copy them into the EAGLE model's
+        parameters.
+
+        This is critical for acceptance rate: the EAGLE head must use
+        the exact same embedding and output projection as the target
+        model.  Even small precision differences (e.g. the EAGLE
+        model files storing float16 while the target uses bfloat16)
+        can halve the acceptance rate.
+        """
+        import glob
+        import os
+
+        target_model_path = self.vllm_config.model_config.model
+        logger.info(
+            "Loading target embed_tokens/lm_head from: %s",
+            target_model_path,
+        )
+        if not os.path.isdir(target_model_path):
+            logger.warning(
+                "Target model path %s is not a directory, "
+                "skipping target embed/lm_head load.",
+                target_model_path,
+            )
+            return
+
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            logger.warning("safetensors not available, "
+                           "skipping target embed/lm_head load.")
+            return
+
+        st_files = sorted(glob.glob(
+            os.path.join(target_model_path, "*.safetensors")))
+        if not st_files:
+            logger.warning("No safetensors files in %s", target_model_path)
+            return
+
+        logger.info("Found %d safetensors files in target model dir.",
+                     len(st_files))
+
+        # Collect all target weight tensors we need
+        need_embed = (hasattr(self.model, 'model')
+                      and hasattr(self.model.model, 'embed_tokens'))
+        need_lm_head = hasattr(self.model, 'lm_head')
+        logger.info("Need embed_tokens=%s, need lm_head=%s",
+                     need_embed, need_lm_head)
+
+        loaded_embed = False
+        loaded_lm_head = False
+
+        for st_file in st_files:
+            if loaded_embed and loaded_lm_head:
+                break
+            try:
+                with safe_open(st_file, framework="pt",
+                               device="cpu") as f:
+                    keys = list(f.keys())
+                    # Log keys from first file for debugging
+                    if st_file == st_files[0]:
+                        embed_keys = [k for k in keys
+                                      if "embed" in k.lower()]
+                        lm_keys = [k for k in keys
+                                   if "lm_head" in k.lower()]
+                        logger.info(
+                            "First shard %s: %d keys, "
+                            "embed-related=%s, lm_head-related=%s",
+                            os.path.basename(st_file), len(keys),
+                            embed_keys[:5], lm_keys[:5],
+                        )
+
+                    for key in keys:
+                        # --- embed_tokens ---
+                        if (not loaded_embed and need_embed
+                                and "embed_tokens" in key
+                                and "weight" in key):
+                            tensor = f.get_tensor(key)
+                            dst = self.model.model.embed_tokens.weight
+                            nr = min(dst.shape[0], tensor.shape[0])
+                            nc = min(dst.shape[1], tensor.shape[1])
+                            dst.data[:nr, :nc] = (
+                                tensor[:nr, :nc]
+                                .to(dst.dtype).to(dst.device)
+                            )
+                            loaded_embed = True
+                            logger.info(
+                                "Loaded target embed_tokens from %s/%s "
+                                "(%s → %s): rows=%d cols=%d",
+                                os.path.basename(st_file), key,
+                                tensor.shape, dst.shape, nr, nc,
+                            )
+
+                        # --- lm_head ---
+                        if (not loaded_lm_head and need_lm_head
+                                and "lm_head" in key
+                                and "weight" in key):
+                            tensor = f.get_tensor(key)
+                            dst = self.model.lm_head.weight
+                            nr = min(dst.shape[0], tensor.shape[0])
+                            nc = min(dst.shape[1], tensor.shape[1])
+                            dst.data[:nr, :nc] = (
+                                tensor[:nr, :nc]
+                                .to(dst.dtype).to(dst.device)
+                            )
+                            loaded_lm_head = True
+                            logger.info(
+                                "Loaded target lm_head from %s/%s "
+                                "(%s → %s): rows=%d cols=%d",
+                                os.path.basename(st_file), key,
+                                tensor.shape, dst.shape, nr, nc,
+                            )
+            except Exception as e:
+                logger.warning("Error reading %s: %s",
+                               os.path.basename(st_file), e)
+
+        if need_embed and not loaded_embed:
+            logger.warning("Could not find embed_tokens in target files.")
+        if need_lm_head and not loaded_lm_head:
+            # lm_head might be tied to embed_tokens (weight tying).
+            # Try copying embed_tokens weights to lm_head.
+            if loaded_embed and need_embed:
+                src = self.model.model.embed_tokens.weight
+                dst = self.model.lm_head.weight
+                if src.shape == dst.shape:
+                    dst.data.copy_(src.data)
+                    loaded_lm_head = True
+                    logger.info(
+                        "lm_head not found in target files; "
+                        "copied from embed_tokens (weight tying)."
+                    )
+                else:
+                    logger.warning(
+                        "lm_head not found and shapes don't match "
+                        "for weight tying: embed=%s, lm_head=%s",
+                        src.shape, dst.shape,
+                    )
+            else:
+                logger.warning(
+                    "Could not find lm_head in target files."
+                )
+
+        logger.info(
+            "Target weight load complete: embed=%s, lm_head=%s",
+            loaded_embed, loaded_lm_head,
+        )
 
     def _capture_decode_graphs(self) -> None:
         """Capture CUDA graphs for decode_step at common batch sizes.
@@ -507,6 +816,109 @@ class DraftModelRunner:
         self._capture_graphs_for_sizes(sizes, self._tree_graphs)
         self._tree_decode_captured = True
         logger.info("CUDA graphs captured for %d tree sizes.", len(sizes))
+
+    def _capture_eagle_graphs(self) -> None:
+        """Capture CUDA graphs for eagle_forward (with hidden_states).
+
+        Unlike decode_step graphs, these include hidden_states as an
+        additional input buffer. Captured for common batch sizes.
+        """
+        max_bs = min(self.max_num_seqs, 8)
+        sizes = [bs for bs in [1, 2, 4, 8] if bs <= max_bs]
+        logger.info("Capturing CUDA graphs for eagle_forward: bs=%s", sizes)
+
+        max_n = max(sizes)
+        g_input_ids = torch.zeros(max_n, dtype=torch.int64, device=self.device)
+        g_positions = torch.zeros(max_n, dtype=torch.long, device=self.device)
+        g_slot_mapping = torch.zeros(max_n, dtype=torch.int64, device=self.device)
+        g_seq_lens = torch.ones(max_n, dtype=torch.int32, device=self.device)
+        g_block_tables = torch.zeros(
+            max_n, self.max_num_blocks, dtype=torch.int32, device=self.device)
+        g_hidden_states = torch.zeros(
+            max_n, self.hidden_size, dtype=self.dtype, device=self.device)
+        g_query_start_loc = torch.arange(
+            max_n + 1, dtype=torch.int32, device=self.device)
+        # Output buffers
+        g_out_last_hs = torch.zeros(
+            max_n, self.hidden_size, dtype=self.dtype, device=self.device)
+        g_out_prenorm = torch.zeros(
+            max_n, self.hidden_size, dtype=self.dtype, device=self.device)
+
+        for n in reversed(sizes):
+            attn_metadata = self._build_flash_attn_metadata(
+                num_tokens=n,
+                seq_lens_tensor=g_seq_lens[:n],
+                max_seq_len=self.max_model_len,
+                max_query_len=1,
+                query_start_loc=g_query_start_loc[:n + 1],
+                block_table=g_block_tables[:n],
+                slot_mapping=g_slot_mapping[:n],
+            )
+            slot_mapping_dict = self._build_slot_mapping_dict(g_slot_mapping[:n])
+            batch_descriptor = BatchDescriptor(num_tokens=n)
+
+            # Warmup
+            with set_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=self._draft_vllm_config,
+                num_tokens=n,
+                slot_mapping=slot_mapping_dict,
+                batch_descriptor=batch_descriptor,
+            ):
+                output = self.model(
+                    input_ids=g_input_ids[:n],
+                    positions=g_positions[:n],
+                    hidden_states=g_hidden_states[:n],
+                )
+            if self.method != "mtp":
+                g_out_last_hs[:n], g_out_prenorm[:n] = output
+            else:
+                g_out_last_hs[:n] = output
+                g_out_prenorm[:n] = output
+
+            # Capture
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._decode_graph_pool):
+                with set_forward_context(
+                    attn_metadata=attn_metadata,
+                    vllm_config=self._draft_vllm_config,
+                    num_tokens=n,
+                    slot_mapping=slot_mapping_dict,
+                    batch_descriptor=batch_descriptor,
+                ):
+                    output = self.model(
+                        input_ids=g_input_ids[:n],
+                        positions=g_positions[:n],
+                        hidden_states=g_hidden_states[:n],
+                    )
+                if self.method != "mtp":
+                    g_out_last_hs[:n], g_out_prenorm[:n] = output
+                else:
+                    g_out_last_hs[:n] = output
+                    g_out_prenorm[:n] = output
+
+            if self._decode_graph_pool is None:
+                self._decode_graph_pool = graph.pool()
+
+            self._eagle_graphs[n] = {
+                "graph": graph,
+                "input_ids": g_input_ids,
+                "positions": g_positions,
+                "slot_mapping": g_slot_mapping,
+                "seq_lens": g_seq_lens,
+                "block_tables": g_block_tables,
+                "hidden_states": g_hidden_states,
+                "query_start_loc": g_query_start_loc,
+                "out_last_hs": g_out_last_hs,
+                "out_prenorm": g_out_prenorm,
+                "attn_metadata": attn_metadata,
+                "slot_mapping_dict": slot_mapping_dict,
+                "batch_descriptor": batch_descriptor,
+            }
+            torch.cuda.synchronize()
+
+        self._eagle_graphs_captured = True
+        logger.info("CUDA graphs captured for %d eagle sizes.", len(sizes))
 
     def _capture_graphs_for_sizes(
         self,
@@ -752,6 +1164,40 @@ class DraftModelRunner:
         # Zero out GPU-resident block table row
         if seq_id < self._block_table_gpu.shape[0]:
             self._block_table_gpu[seq_id].zero_()
+
+    def ensure_blocks(self, seq_id: int, num_tokens: int) -> None:
+        """Grow block allocation for a sequence if needed.
+
+        Called during decode to ensure enough blocks are allocated for
+        the current sequence length. Only allocates NEW blocks beyond
+        what's already allocated — does NOT free or reallocate existing
+        blocks.
+
+        Args:
+            seq_id: Sequence ID.
+            num_tokens: Total number of tokens the sequence needs
+                (prompt + generated so far + headroom).
+        """
+        if seq_id not in self._block_tables:
+            # No blocks allocated yet — use allocate_blocks instead
+            self.allocate_blocks(seq_id, num_tokens)
+            return
+
+        current_blocks = len(self._block_tables[seq_id])
+        needed_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        if needed_blocks <= current_blocks:
+            return  # Already have enough
+
+        # Allocate additional blocks
+        extra = needed_blocks - current_blocks
+        new_blocks = [self._alloc_one_block() for _ in range(extra)]
+        self._block_tables[seq_id].extend(new_blocks)
+
+        # Update GPU-resident block table with the new blocks
+        start = current_blocks
+        self._block_table_gpu[seq_id, start:start + extra] = torch.tensor(
+            new_blocks, dtype=torch.int32, device=self.device
+        )
 
     def swap_block_tables(
         self,
@@ -1011,17 +1457,14 @@ class DraftModelRunner:
         total = input_ids.shape[0]
         seq_ids_list = seq_ids.tolist()
 
-        # Allocate blocks and track sequence lengths
-        # Allocate enough for prompt + K speculative tokens + tree decode buffer.
-        # Don't allocate max_num_blocks per sequence — that would exhaust
-        # the KV cache with large batches.
-        K = getattr(self, '_num_spec_tokens', 7)
-        extra_blocks = (K * 3 + self.block_size - 1) // self.block_size + 2
+        # Allocate blocks for prompt + initial headroom.
+        # Additional blocks are grown on-demand via ensure_blocks()
+        # during decode, so we only need a small buffer here.
+        initial_headroom = 256  # tokens
         for i in range(B):
             n = int(num_tokens_per_seq[i].item())
             sid = int(seq_ids[i].item())
-            num_blocks = (n + self.block_size - 1) // self.block_size + extra_blocks
-            self.allocate_blocks(sid, num_blocks * self.block_size)
+            self.allocate_blocks(sid, n + initial_headroom)
             self._seq_lens[sid] = n
 
         # Build positions: [total_tokens]
@@ -1102,6 +1545,168 @@ class DraftModelRunner:
         return last_logits[:, :self.vocab_size]
 
     @torch.inference_mode()
+    def eagle_prefill(
+        self,
+        input_ids: torch.Tensor,
+        num_tokens_per_seq: torch.Tensor,
+        seq_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_offsets: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run EAGLE head prefill with prompt tokens and hidden states.
+
+        Applies the EAGLE token-conditioning shift: token at position j
+        gets conditioning from the target's hidden state at position j-1.
+        So we skip the first token per sequence and drop the last hidden
+        state per sequence, processing n-1 tokens per sequence.
+
+        Args:
+            input_ids: [total_tokens] — flattened input token IDs.
+            num_tokens_per_seq: [B] — per-sequence token counts.
+            seq_ids: [B] — sequence IDs for block allocation.
+            hidden_states: [total_tokens, hidden_size] — target model
+                hidden states (already projected through fc for EAGLE3).
+            position_offsets: Optional per-sequence position offsets.
+                When prefix caching is active, the suffix tokens start
+                at position prefix_len, not 0. Each entry is the
+                prefix_len for that sequence (0 for full prefill).
+            input_ids: [total_tokens] — flattened input token IDs.
+            num_tokens_per_seq: [B] — per-sequence token counts.
+            seq_ids: [B] — sequence IDs for block allocation.
+            hidden_states: [total_tokens, hidden_size] — target model
+                hidden states for all prompt tokens (already projected
+                through combine_hidden_states for EAGLE3).
+
+        Returns:
+            Tuple of (last_hidden_states, out_hidden_states) from the
+            EAGLE model's last token per sequence.
+        """
+        assert self._model_loaded, "Call load_model() first"
+        B = num_tokens_per_seq.shape[0]
+        total_orig = input_ids.shape[0]
+        seq_ids_list = seq_ids.tolist()
+
+        # EAGLE token-conditioning shift:
+        # Token at position j gets conditioning from target hidden state
+        # at position j-1.  So we:
+        #   - Skip the first input token per sequence
+        #   - Drop the last hidden state per sequence
+        # This gives us n-1 tokens per sequence.
+        shifted_ids_parts = []
+        shifted_hs_parts = []
+        shifted_num_tokens = []
+        offset = 0
+        for i in range(B):
+            n = int(num_tokens_per_seq[i].item())
+            # Skip first token, take tokens[1:n]
+            shifted_ids_parts.append(input_ids[offset + 1:offset + n])
+            # Drop last hidden state, take hs[0:n-1]
+            shifted_hs_parts.append(hidden_states[offset:offset + n - 1])
+            shifted_num_tokens.append(n - 1)
+            offset += n
+
+        shifted_input_ids = torch.cat(shifted_ids_parts, dim=0)
+        shifted_hidden_states = torch.cat(shifted_hs_parts, dim=0)
+        shifted_num_tokens_t = torch.tensor(
+            shifted_num_tokens, dtype=torch.int32, device=self.device)
+        total = shifted_input_ids.shape[0]
+
+        # Allocate blocks for the full prompt + headroom.
+        initial_headroom = 256
+        for i in range(B):
+            n = int(num_tokens_per_seq[i].item())
+            sid = int(seq_ids[i].item())
+            pos_off = position_offsets[i] if position_offsets else 0
+            full_len = n + pos_off
+            self.allocate_blocks(sid, full_len + initial_headroom)
+
+        # Build positions: [total_shifted_tokens]
+        # Positions are offset..offset+n-2 for each sequence
+        # (n-1 tokens after shift, starting at position_offset)
+        positions = torch.zeros(total, dtype=torch.long, device=self.device)
+        offset = 0
+        expanded_seq_ids = []
+        for i in range(B):
+            n_shifted = shifted_num_tokens[i]
+            pos_off = position_offsets[i] if position_offsets else 0
+            positions[offset:offset + n_shifted] = torch.arange(
+                n_shifted, device=self.device) + pos_off
+            expanded_seq_ids.extend([int(seq_ids[i].item())] * n_shifted)
+            offset += n_shifted
+
+        # Compute slot mapping
+        slot_mapping = self._compute_slot_mapping(positions, expanded_seq_ids)
+
+        # Build block table
+        block_tables = self._get_block_table_tensor(seq_ids)
+
+        # Build FlashAttention metadata for prefill.
+        # seq_lens_tensor: the total KV context each sequence can attend to.
+        # With position offsets (prefix caching), this is offset + n_shifted
+        # because the token at position offset+j attends to KV[0..offset+j].
+        # Note: KV[0..offset-1] are uninitialized (prefix not in EAGLE cache),
+        # but FlashAttention with causal masking only reads KV up to the
+        # query position, and the query tokens start at offset.
+        if position_offsets:
+            seq_lens_with_offset = torch.tensor(
+                [position_offsets[i] + shifted_num_tokens[i] for i in range(B)],
+                dtype=torch.int32, device=self.device)
+            max_seq_len = int(seq_lens_with_offset.max().item())
+        else:
+            seq_lens_with_offset = shifted_num_tokens_t
+            max_seq_len = max(shifted_num_tokens)
+        max_query_len = max(shifted_num_tokens)
+        query_start_loc = torch.zeros(
+            B + 1, dtype=torch.int32, device=self.device)
+        torch.cumsum(
+            shifted_num_tokens_t, dim=0, out=query_start_loc[1:])
+
+        attn_metadata = self._build_flash_attn_metadata(
+            num_tokens=total,
+            seq_lens_tensor=seq_lens_with_offset,
+            max_seq_len=max_seq_len,
+            max_query_len=max_query_len,
+            query_start_loc=query_start_loc,
+            block_table=block_tables,
+            slot_mapping=slot_mapping,
+        )
+        slot_mapping_dict = self._build_slot_mapping_dict(slot_mapping)
+
+        # Run EAGLE model forward with shifted inputs
+        batch_descriptor = BatchDescriptor(num_tokens=total)
+        with set_forward_context(
+            attn_metadata=attn_metadata,
+            vllm_config=self._draft_vllm_config,
+            num_tokens=total,
+            slot_mapping=slot_mapping_dict,
+            batch_descriptor=batch_descriptor,
+        ):
+            output = self.model(
+                input_ids=shifted_input_ids,
+                positions=positions,
+                hidden_states=shifted_hidden_states,
+            )
+
+        if self.method == "mtp":
+            last_hs = output
+            out_hs = output
+        else:
+            last_hs, out_hs = output
+
+        # Set _seq_lens to offset + n-1 (number of KV entries after
+        # shifted prefill). For prefix-cached requests, this accounts
+        # for the prefix offset so the next JIT starts at the correct
+        # position.
+        for i in range(B):
+            sid = int(seq_ids[i].item())
+            pos_off = position_offsets[i] if position_offsets else 0
+            self._seq_lens[sid] = pos_off + shifted_num_tokens[i]
+
+        # Extract last token per sequence
+        last_indices = torch.cumsum(shifted_num_tokens_t, dim=0) - 1
+        return last_hs[last_indices], out_hs[last_indices]
+
+    @torch.inference_mode()
     def decode_step(
         self,
         input_ids: torch.Tensor,
@@ -1111,6 +1716,12 @@ class DraftModelRunner:
         """Run a single decode step, using CUDA graphs when available."""
         assert self._model_loaded, "Call load_model() first"
         B = input_ids.shape[0]
+
+        # Ensure enough blocks for current positions (needed for
+        # standalone draft model which doesn't pre-allocate via
+        # _handle_speculation's ensure_blocks call).
+        for i, sid in enumerate(seq_ids.tolist()):
+            self.ensure_blocks(int(sid), int(positions[i].item()) + 1)
 
         # Vectorized slot mapping (GPU, no Python loops)
         logical_blocks = (positions // self.block_size).to(torch.int64)
@@ -1184,6 +1795,248 @@ class DraftModelRunner:
             self._seq_lens[int(sid)] = int(positions[i].item()) + 1
 
         return logits[:, :self.vocab_size], hidden_states
+
+    @torch.inference_mode()
+    def eagle_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        seq_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single EAGLE head forward pass.
+
+        Runs the EAGLE/EAGLE3/MTP model with target (or previous-step)
+        hidden states as input.  The model's KV cache is updated via
+        the same paged-attention path used by ``decode_step``.
+
+        Args:
+            input_ids: [B] — input token IDs for this step.
+            positions: [B] — position of each token in its sequence.
+            hidden_states: [B, hidden_size] — hidden states from the
+                target model (step 0) or from the previous EAGLE step.
+            seq_ids: [B] — sequence IDs (used for KV cache slot mapping
+                and sequence length tracking).
+
+        Returns:
+            Tuple of (last_hidden_states, hidden_states):
+              - last_hidden_states: [B, hidden_size] — used for logit
+                computation.
+              - hidden_states: [B, hidden_size] — fed back as input to
+                the next autoregressive step.
+            For MTP method both elements are the same tensor.
+        """
+        assert self._model_loaded, "Call load_model() first"
+        B = input_ids.shape[0]
+
+        # --- Build attention metadata (same as decode_step) ---
+        logical_blocks = (positions // self.block_size).to(torch.int64)
+        offsets = (positions % self.block_size).to(torch.int64)
+        seq_ids_long = seq_ids.to(torch.int64)
+        physical_blocks = self._block_table_gpu[
+            seq_ids_long, logical_blocks
+        ].to(torch.int64)
+        slot_mapping = physical_blocks * self.block_size + offsets
+
+        block_tables = self._block_table_gpu[seq_ids_long]
+
+        seq_lens = (positions + 1).to(torch.int32)
+        max_seq_len = int(seq_lens.max().item())
+
+        # Try CUDA graph replay for eagle_forward
+        if self._eagle_graphs_captured and B in self._eagle_graphs:
+            g = self._eagle_graphs[B]
+            g["input_ids"][:B].copy_(input_ids)
+            g["positions"][:B].copy_(positions)
+            g["slot_mapping"][:B].copy_(slot_mapping)
+            g["seq_lens"][:B].copy_(seq_lens)
+            g["block_tables"][:B].copy_(block_tables)
+            g["hidden_states"][:B].copy_(hidden_states)
+            g["attn_metadata"].max_seq_len = max_seq_len
+            for layer_name in g["slot_mapping_dict"]:
+                g["slot_mapping_dict"][layer_name] = g["slot_mapping"][:B]
+            g["graph"].replay()
+            last_hidden_states = g["out_last_hs"][:B]
+            out_hidden_states = g["out_prenorm"][:B]
+        else:
+            # Eager fallback
+            query_start_loc = self._decode_query_start_loc[:B + 1]
+            attn_metadata = self._build_flash_attn_metadata(
+                num_tokens=B,
+                seq_lens_tensor=seq_lens,
+                max_seq_len=max_seq_len,
+                max_query_len=1,
+                query_start_loc=query_start_loc,
+                block_table=block_tables,
+                slot_mapping=slot_mapping,
+            )
+            slot_mapping_dict = self._build_slot_mapping_dict(slot_mapping)
+
+            batch_descriptor = BatchDescriptor(num_tokens=B)
+            with set_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=self._draft_vllm_config,
+                num_tokens=B,
+                slot_mapping=slot_mapping_dict,
+                batch_descriptor=batch_descriptor,
+            ):
+                output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+
+            if self.method == "mtp":
+                last_hidden_states = output
+                out_hidden_states = output
+            else:
+                last_hidden_states, out_hidden_states = output
+
+        # Note: _seq_lens is NOT updated here to avoid per-step
+        # Python overhead. The caller (eagle_sequential_speculate)
+        # updates _seq_lens after all K steps complete.
+
+        return last_hidden_states, out_hidden_states
+
+    @torch.inference_mode()
+    def eagle_sequential_speculate(
+        self,
+        recovery_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        seq_ids: torch.Tensor,
+        num_steps: int,
+        hidden_states: torch.Tensor,
+        temperatures: torch.Tensor | None = None,
+        seeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run K-step autoregressive EAGLE speculation.
+
+        Step 0 feeds the target model's hidden states into the EAGLE
+        head.  Steps 1..K-1 feed the EAGLE head's own output hidden
+        states back as input, forming an autoregressive chain.
+
+        Sampling strategy:
+        - T > 0: Gumbel sampling with position-based seeds (correlated
+          with the target model's Gumbel noise for higher acceptance).
+        - T == 0: Greedy argmax.
+
+        Args:
+            recovery_tokens: [B] — first input tokens (bonus tokens
+                from verification).
+            positions: [B] — starting positions in each sequence.
+            seq_ids: [B] — sequence IDs.
+            num_steps: K — number of draft tokens to generate.
+            hidden_states: [B, hidden_size] — target model hidden
+                states for step 0.
+            temperatures: [B] — per-request sampling temperatures.
+                ``None`` means greedy for all requests.
+            seeds: [B] — per-request random seeds for Gumbel noise.
+                Required when any temperature > 0.
+
+        Returns:
+            draft_tokens: [B, K] — generated draft token IDs.
+            draft_logits: [B, K, V] — logits at each step.
+        """
+        B = recovery_tokens.shape[0]
+        V = self.vocab_size
+
+        draft_tokens = torch.zeros(
+            B, num_steps, dtype=torch.int64, device=self.device,
+        )
+        draft_logits = torch.zeros(
+            B, num_steps, V, dtype=self.dtype, device=self.device,
+        )
+
+        current_ids = recovery_tokens
+        current_pos = positions.clone()
+        current_hs = hidden_states  # target hidden states for step 0
+
+        # Determine if we need Gumbel sampling (any temperature > 0).
+        use_gumbel = (
+            temperatures is not None
+            and seeds is not None
+            and (temperatures > 0).any()
+        )
+
+        if use_gumbel:
+            from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+            idx_mapping = torch.arange(
+                B, dtype=torch.int64, device=self.device,
+            )
+
+        # Pre-compute slot mappings for all K positions to avoid
+        # per-step Python overhead.
+        seq_ids_long = seq_ids.to(torch.int64)
+        all_positions = [positions + step for step in range(num_steps)]
+
+        for step in range(num_steps):
+            pos = all_positions[step]
+
+            # Compute slot mapping (vectorized, no Python loop)
+            logical_blocks = (pos // self.block_size).to(torch.int64)
+            offsets = (pos % self.block_size).to(torch.int64)
+            physical_blocks = self._block_table_gpu[
+                seq_ids_long, logical_blocks
+            ].to(torch.int64)
+            slot_mapping = physical_blocks * self.block_size + offsets
+            block_tables = self._block_table_gpu[seq_ids_long]
+            seq_lens = (pos + 1).to(torch.int32)
+            max_seq_len = int(seq_lens.max().item())
+
+            # Try CUDA graph replay
+            if self._eagle_graphs_captured and B in self._eagle_graphs:
+                g = self._eagle_graphs[B]
+                g["input_ids"][:B].copy_(current_ids)
+                g["positions"][:B].copy_(pos)
+                g["slot_mapping"][:B].copy_(slot_mapping)
+                g["seq_lens"][:B].copy_(seq_lens)
+                g["block_tables"][:B].copy_(block_tables)
+                g["hidden_states"][:B].copy_(current_hs)
+                g["attn_metadata"].max_seq_len = max_seq_len
+                for ln in g["slot_mapping_dict"]:
+                    g["slot_mapping_dict"][ln] = g["slot_mapping"][:B]
+                g["graph"].replay()
+                last_hs = g["out_last_hs"][:B]
+                current_hs = g["out_prenorm"][:B]
+            else:
+                last_hs, current_hs = self.eagle_forward(
+                    current_ids, pos, current_hs, seq_ids,
+                )
+
+            # Compute logits and sample
+            if hasattr(self.model, "compute_logits"):
+                logits = self.model.compute_logits(last_hs)
+            elif hasattr(self.model, "lm_head"):
+                logits = self.model.lm_head(last_hs)
+            else:
+                logits = torch.matmul(
+                    last_hs,
+                    self.model.get_input_embeddings().weight.T,
+                )
+            logits = logits[:, :V]
+            draft_logits[:, step] = logits
+
+            if use_gumbel:
+                next_tokens = gumbel_sample(
+                    logits=logits,
+                    expanded_idx_mapping=idx_mapping,
+                    temperature=temperatures,
+                    seed=seeds,
+                    pos=pos,
+                    apply_temperature=True,
+                )
+            else:
+                next_tokens = logits.argmax(dim=-1)
+
+            draft_tokens[:, step] = next_tokens
+            current_ids = next_tokens
+
+        # Update _seq_lens after all K steps (deferred from eagle_forward)
+        final_pos = all_positions[-1]
+        for i, sid in enumerate(seq_ids.tolist()):
+            self._seq_lens[int(sid)] = int(final_pos[i].item()) + 1
+
+        return draft_tokens, draft_logits
 
     @torch.inference_mode()
     def sequential_speculate(

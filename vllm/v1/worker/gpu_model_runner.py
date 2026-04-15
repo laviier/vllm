@@ -569,9 +569,9 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
-            elif self.speculative_config.use_disagg_draft():
-                # Disagg draft uses a disaggregated draft worker on a separate GPU.
-                # No local drafter is needed — the Disagg draft speculator proxy
+            elif self.speculative_config.use_disagg():
+                # Disagg uses a disaggregated draft worker on a separate GPU.
+                # No local drafter is needed — the speculator proxy
                 # handles communication with the draft worker via NCCL.
                 self.drafter = None  # type: ignore[assignment]
             else:
@@ -4196,9 +4196,9 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None and not spec_config.use_disagg_draft():
+        if spec_config is not None and not spec_config.use_disagg():
             # Decide whether to run the drafter or zero out draft tokens.
-            # Disagg draft handles its own draft token generation separately.
+            # Disagg handles its own draft token generation separately.
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
@@ -4295,8 +4295,12 @@ class GPUModelRunner(
 
         # Disagg draft speculative decoding: generate draft tokens after bookkeeping.
         # Draft tokens come from the disaggregated draft worker via NCCL.
-        if spec_config is not None and spec_config.use_disagg_draft():
-            self._disagg_propose_drafts(valid_sampled_token_ids)
+        if spec_config is not None and spec_config.use_disagg():
+            self._disagg_propose_drafts(
+                valid_sampled_token_ids,
+                hidden_states=hidden_states,
+                aux_hidden_states=aux_hidden_states,
+            )
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -4398,25 +4402,57 @@ class GPUModelRunner(
                 req_state.output_token_ids.append(-1)
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
-    def _disagg_propose_drafts(self, valid_sampled_token_ids):
+    def _disagg_propose_drafts(
+        self,
+        valid_sampled_token_ids,
+        hidden_states: torch.Tensor | None = None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
+    ):
         """Generate draft tokens via the Disagg draft disaggregated draft worker.
 
         Called after bookkeeping when Disagg draft spec decode is enabled.
         Communicates with the draft worker via NCCL to get draft tokens.
+
+        Args:
+            valid_sampled_token_ids: Sampled token IDs from the target model.
+            hidden_states: Target model last hidden states tensor,
+                shape [num_tokens, hidden_size]. Passed to the draft worker
+                for EAGLE/EAGLE3/MTP methods.
+            aux_hidden_states: Intermediate layer hidden states for EAGLE3,
+                list of tensors each shape [num_tokens, hidden_size].
         """
         spec_config = self.speculative_config
         num_reqs = self.input_batch.num_reqs
         vocab_size = spec_config.draft_model_config.get_vocab_size()
 
-        # Lazily create DisaggDraftSpeculator on first use.
+        # Debug: log hidden_states availability on first few calls
+        if not hasattr(self, '_disagg_propose_log_count'):
+            self._disagg_propose_log_count = 0
+        if self._disagg_propose_log_count < 5:
+            self._disagg_propose_log_count += 1
+            logger.info(
+                "Disagg propose debug: num_reqs=%d, "
+                "hidden_states=%s, "
+                "aux_hidden_states=%s, "
+                "valid_sampled_token_ids[:3]=%s",
+                num_reqs,
+                f"shape={hidden_states.shape}, norm={hidden_states.float().norm().item():.4f}"
+                if hidden_states is not None else "None",
+                f"len={len(aux_hidden_states)}"
+                if aux_hidden_states is not None else "None",
+                [ids[:3] for ids in valid_sampled_token_ids[:3]],
+            )
+
+        # Lazily create DisaggSpeculatorProxy on first use.
         if not hasattr(self, '_disagg_speculator'):
             from vllm.distributed.parallel_state import get_tp_group
             tp_rank = get_tp_group().rank_in_group
+            self._disagg_tp_rank = tp_rank
             if tp_rank == 0:
                 from vllm.v1.worker.gpu.spec_decode.disagg_draft.speculator import (
-                    DisaggDraftSpeculator,
+                    DisaggSpeculatorProxy,
                 )
-                self._disagg_speculator = DisaggDraftSpeculator(
+                self._disagg_speculator = DisaggSpeculatorProxy(
                     self.vllm_config, self.device
                 )
                 self._disagg_speculator._lazy_connect()
@@ -4463,6 +4499,7 @@ class GPUModelRunner(
                     all_prompt_ids = []
                     num_tokens_list = []
                     new_seq_ids_list = []
+                    new_req_batch_indices = []
                     for rid in new_req_ids:
                         req = self.requests[rid]
                         n_prompt = req.num_prompt_tokens
@@ -4475,6 +4512,14 @@ class GPUModelRunner(
                         new_seq_ids_list.append(
                             self._disagg_req_to_seq_id[rid]
                         )
+                        # Track batch index for hidden state extraction
+                        try:
+                            batch_idx = list(
+                                self.input_batch.req_ids
+                            ).index(rid)
+                            new_req_batch_indices.append(batch_idx)
+                        except ValueError:
+                            new_req_batch_indices.append(-1)
                     input_ids_t = torch.tensor(
                         all_prompt_ids, dtype=torch.int64,
                         device=self.device,
@@ -4487,10 +4532,55 @@ class GPUModelRunner(
                         new_seq_ids_list, dtype=torch.int64,
                         device=self.device,
                     )
+
+                    # Extract hidden states for new requests if needed.
+                    # In the V2 runner, hidden_states is packed
+                    # contiguously: [total_tokens, hidden_size].
+                    # For prefill requests, we need the last token's
+                    # hidden state per request.  We compute the offset
+                    # of each new request's last token using the
+                    # cumulative sum of num_tokens_list.
+                    prefill_hs = None
+                    needs_hs = (
+                        self._disagg_speculator.needs_hidden_states
+                    )
+                    if (needs_hs
+                            and hidden_states is not None
+                            and new_req_batch_indices):
+                        # During prefill, hidden_states covers all
+                        # scheduled tokens.  Each new request's tokens
+                        # are at a known offset in the packed tensor.
+                        # We use the batch index to find the request's
+                        # position in the packed hidden_states.
+                        # For decode (1 token/req), batch_idx == token
+                        # index directly.
+                        token_indices = torch.tensor(
+                            [bi for bi in new_req_batch_indices
+                             if bi >= 0],
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        if token_indices.numel() > 0:
+                            if (aux_hidden_states is not None
+                                    and len(aux_hidden_states) > 0):
+                                all_states = (
+                                    [hidden_states]
+                                    + list(aux_hidden_states)
+                                )
+                                combined = torch.cat(
+                                    all_states, dim=-1
+                                )
+                                prefill_hs = combined[token_indices]
+                            else:
+                                prefill_hs = hidden_states[
+                                    token_indices
+                                ]
+
                     self._disagg_speculator._target_interface \
                         .request_prefill(
                             input_ids_t, num_tokens_t,
                             seq_ids=new_seq_ids_t,
+                            hidden_states=prefill_hs,
                         )
                     self._disagg_prefilled_reqs.update(new_req_ids)
 
@@ -4510,6 +4600,47 @@ class GPUModelRunner(
                      for ids in valid_sampled_token_ids],
                     dtype=torch.int64, device=self.device,
                 )
+
+                # Extract per-request hidden states for EAGLE/EAGLE3/MTP.
+                # In the V2 runner during decode, hidden_states has
+                # shape [num_reqs, hidden_size] — one token per request,
+                # in the same order as input_batch.req_ids.  We can use
+                # it directly (first num_reqs rows).
+                hs = None
+                needs_hs = (
+                    self._disagg_speculator.needs_hidden_states
+                )
+                if needs_hs and hidden_states is not None:
+                    if (aux_hidden_states is not None
+                            and len(aux_hidden_states) > 0):
+                        all_states = (
+                            [hidden_states] + list(aux_hidden_states)
+                        )
+                        combined = torch.cat(all_states, dim=-1)
+                        hs = combined[:num_reqs]
+                    else:
+                        hs = hidden_states[:num_reqs]
+
+                    # Debug: log hidden state stats on first few calls
+                    if not hasattr(self, '_disagg_hs_log_count'):
+                        self._disagg_hs_log_count = 0
+                    if self._disagg_hs_log_count < 5:
+                        self._disagg_hs_log_count += 1
+                        logger.info(
+                            "Disagg EAGLE debug: hs shape=%s, "
+                            "hs norm=%.4f, hs[:3]=%s, "
+                            "hidden_states shape=%s, num_reqs=%d, "
+                            "k_accepted=%s, bonus=%s",
+                            hs.shape,
+                            hs.float().norm().item(),
+                            hs[0, :3].tolist() if hs.shape[0] > 0
+                            else "empty",
+                            hidden_states.shape,
+                            num_reqs,
+                            k_accepted.tolist()[:3],
+                            bonus.tolist()[:3],
+                        )
+
                 _, draft_toks, _ = (
                     self._disagg_speculator._target_interface
                     .request_speculation(
@@ -4517,12 +4648,14 @@ class GPUModelRunner(
                         k_accepted=k_accepted,
                         bonus_tokens=bonus,
                         batch_size=num_reqs,
+                        hidden_states=hs,
                     )
                 )
                 self._draft_token_ids = draft_toks.tolist()
             except Exception as e:
                 logger.warning(
-                    "Disagg draft NCCL draft failed: %s. Random fallback.", e
+                    "Disagg draft NCCL draft failed: %s. Random fallback.",
+                    e, exc_info=True,
                 )
                 self._draft_token_ids = [
                     [int(torch.randint(0, vocab_size, (1,)).item())
@@ -4530,11 +4663,33 @@ class GPUModelRunner(
                     for _ in range(num_reqs)
                 ]
         else:
+            # Non-rank-0 TP workers: initialize with zeros; real tokens
+            # will arrive via the TP broadcast below.
             self._draft_token_ids = [
-                [int(torch.randint(0, vocab_size, (1,)).item())
-                 for _ in range(self.num_spec_tokens)]
+                [0] * self.num_spec_tokens
                 for _ in range(num_reqs)
             ]
+
+        # Broadcast draft tokens from TP rank 0 to all ranks.
+        # Only rank 0 communicates with the draft worker; other ranks
+        # get zeros. But all ranks need identical draft tokens because
+        # they're written into input_ids for the next target forward pass,
+        # and TP all-reduce requires consistent inputs.
+        if self.parallel_config.tensor_parallel_size > 1:
+            from vllm.distributed.parallel_state import get_tp_group
+            tp_group = get_tp_group()
+            # Convert to tensor for broadcast
+            draft_buf = torch.tensor(
+                self._draft_token_ids,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            torch.distributed.broadcast(
+                draft_buf, src=tp_group.first_rank,
+                group=tp_group.device_group,
+            )
+            self._draft_token_ids = draft_buf.tolist()
+
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

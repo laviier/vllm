@@ -43,6 +43,10 @@ class SpeculationCache:
         vocab_size: Vocabulary size for logit storage.
         device: CUDA device for all cache tensors.
         dtype: Data type for logit tensors (default: bfloat16).
+        needs_hidden_states: Whether to store EAGLE head output hidden states
+            alongside draft tokens (for Hidden_State_Methods).
+        hidden_size: Size of hidden state vectors. Required when
+            needs_hidden_states is True.
     """
 
     def __init__(
@@ -53,6 +57,8 @@ class SpeculationCache:
         vocab_size: int,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
+        needs_hidden_states: bool = False,
+        hidden_size: int = 0,
     ):
         self.max_batch_size = max_batch_size
         self.K = num_speculative_tokens
@@ -60,6 +66,8 @@ class SpeculationCache:
         self.vocab_size = vocab_size
         self.device = device
         self.dtype = dtype
+        self.needs_hidden_states = needs_hidden_states
+        self.hidden_size = hidden_size
 
         # Total cache entries per batch: B × (K+1) × F
         # Each acceptance position k ∈ [0, K] has F bonus token candidates.
@@ -82,6 +90,23 @@ class SpeculationCache:
         # We use lazy allocation to only allocate what's needed per round.
         self._logits: torch.Tensor | None = None
         self._logits_allocated = 0
+
+        # Optional hidden states for EAGLE/EAGLE3/MTP methods.
+        # Stores the EAGLE head's output hidden states per cache entry,
+        # enabling hidden state restoration on cache hit.
+        self._hidden_states: torch.Tensor | None = None
+        if needs_hidden_states:
+            if hidden_size <= 0:
+                raise ValueError(
+                    "hidden_size must be positive when "
+                    "needs_hidden_states=True"
+                )
+            self._hidden_states = torch.zeros(
+                self.max_entries,
+                hidden_size,
+                dtype=dtype,
+                device=device,
+            )
 
         # Number of valid entries currently in the cache
         self.num_entries = 0
@@ -128,6 +153,7 @@ class SpeculationCache:
         draft_logits: torch.Tensor,
         branch_block_tables: torch.Tensor | None = None,
         prefix_lens: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> None:
         """Populate the cache with pre-computed speculations.
 
@@ -139,6 +165,8 @@ class SpeculationCache:
             draft_logits: [N, K, V] — draft logits for each speculated position.
             branch_block_tables: [N, M] — per-branch block tables for swapping.
             prefix_lens: [N] — prefix length for each branch (for _seq_lens update).
+            hidden_states: [N, hidden_size] — EAGLE head output hidden states
+                per entry. Only used when needs_hidden_states=True.
         """
         N = seq_ids.shape[0]
         assert N <= self.max_entries, (
@@ -153,6 +181,10 @@ class SpeculationCache:
         logits_buf = self._ensure_logits(N)
         logits_buf[:N] = draft_logits
 
+        # Store hidden states for EAGLE/EAGLE3/MTP methods
+        if self._hidden_states is not None and hidden_states is not None:
+            self._hidden_states[:N] = hidden_states
+
         # Store block tables for block table swapping on cache hit
         self._branch_block_tables = branch_block_tables
         self._prefix_lens = prefix_lens
@@ -164,11 +196,12 @@ class SpeculationCache:
         seq_ids: torch.Tensor,
         k_accepted: torch.Tensor,
         bonus_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor,
+               torch.Tensor | None]:
         """Look up verification outcomes in the cache.
 
-        Returns pre-computed draft tokens and logits for cache hits,
-        and a boolean mask indicating which sequences hit the cache.
+        Returns pre-computed draft tokens, logits, and optionally hidden states
+        for cache hits, and a boolean mask indicating which sequences hit.
 
         Args:
             seq_ids: [B] — sequence IDs to look up.
@@ -180,6 +213,8 @@ class SpeculationCache:
             draft_logits: [B, K, V] or None — pre-computed logits (None if no
                 logits were stored).
             cache_hits: [B] — boolean mask, True where the outcome was cached.
+            hidden_states: [B, hidden_size] or None — cached EAGLE head output
+                hidden states (None if needs_hidden_states is False or no hits).
         """
         B = seq_ids.shape[0]
         assert k_accepted.shape == (B,)
@@ -193,6 +228,7 @@ class SpeculationCache:
                 torch.zeros(B, self.K, dtype=torch.int64, device=self.device),
                 None,
                 torch.zeros(B, dtype=torch.bool, device=self.device),
+                None,
             )
 
         # Build query keys: [B, 3]
@@ -213,6 +249,7 @@ class SpeculationCache:
             B, self.K, dtype=torch.int64, device=self.device
         )
         draft_logits_out = None
+        hidden_states_out = None
         # match_idx for block table swapping (stored even if no logits)
         self._last_match_idx = None
 
@@ -233,7 +270,19 @@ class SpeculationCache:
                 )
                 draft_logits_out[hit_mask] = self._logits[match_idx[hit_mask]]
 
-        return draft_tokens_out, draft_logits_out, cache_hits
+            # Return cached hidden states for EAGLE/EAGLE3/MTP methods
+            if self._hidden_states is not None:
+                hidden_states_out = torch.zeros(
+                    B,
+                    self.hidden_size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                hidden_states_out[hit_mask] = (
+                    self._hidden_states[match_idx[hit_mask]]
+                )
+
+        return draft_tokens_out, draft_logits_out, cache_hits, hidden_states_out
 
     def get_hit_block_tables(
         self, hit_mask: torch.Tensor

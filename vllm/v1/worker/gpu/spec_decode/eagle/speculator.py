@@ -351,10 +351,10 @@ class EagleSpeculator:
         # seq_lens) of the target model.
         if aux_hidden_states:
             assert self.method == "eagle3"
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            _raw_aux = torch.cat(aux_hidden_states, dim=-1)
+            hidden_states = self.model.combine_hidden_states(_raw_aux)
         else:
+            _raw_aux = None
             hidden_states = last_hidden_states
         num_tokens = input_batch.num_tokens_after_padding
         self.hidden_states[:num_tokens] = hidden_states
@@ -471,6 +471,37 @@ class EagleSpeculator:
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=decode_batch_desc.cg_mode,
             )
+
+        # Diagnostic: log draft tokens for comparison with disagg
+        if not hasattr(self, '_colocated_log_count'):
+            self._colocated_log_count = 0
+        if self._colocated_log_count < 15:
+            self._colocated_log_count += 1
+            from vllm.logger import init_logger as _il
+            _logger = _il(__name__)
+            # Log hidden states for comparison with disagg
+            _last_idx = int(last_token_indices[0].item()) if num_reqs > 0 else 0
+            _hs_at_last = hidden_states[_last_idx] if hidden_states is not None else None
+            _hs_norm = _hs_at_last.float().norm().item() if _hs_at_last is not None else 0
+            _hs_first3 = _hs_at_last[:3].tolist() if _hs_at_last is not None else []
+            _raw_at_last = _raw_aux[_last_idx] if _raw_aux is not None else None
+            _raw_norm = _raw_at_last.float().norm().item() if _raw_at_last is not None else 0
+            _raw_first3 = _raw_at_last[:3].tolist() if _raw_at_last is not None else []
+            _logger.info(
+                "COLOCATED EAGLE: draft=%s, ns=%s, bonus=%s, "
+                "raw_hs_norm=%.4f, raw_first3=%s, "
+                "fc_hs_norm=%.4f, fc_first3=%s, "
+                "last_idx=%d, num_tokens=%d",
+                self.draft_tokens[0, :self.num_speculative_steps].tolist()
+                if num_reqs > 0 else "empty",
+                num_sampled[:num_reqs].tolist(),
+                last_sampled[input_batch.idx_mapping[:num_reqs]].squeeze(-1).tolist(),
+                _raw_norm, _raw_first3,
+                _hs_norm, _hs_first3,
+                _last_idx,
+                input_batch.num_tokens_after_padding,
+            )
+
         return self.draft_tokens[:num_reqs]
 
 

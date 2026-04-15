@@ -155,17 +155,17 @@ class MultiprocExecutor(Executor):
         # Create workers
         context = get_mp_context()
 
-        # Pre-generate Disagg draft NCCL init method BEFORE spawning workers,
+        # Pre-generate Disagg NCCL init method BEFORE spawning workers,
         # so workers inherit it in their copy of vllm_config.
         spec_config = self.vllm_config.speculative_config
-        if spec_config is not None and spec_config.use_disagg_draft():
-            if not spec_config.disagg_draft_nccl_init_method:
-                spec_config.disagg_draft_nccl_init_method = (
+        if spec_config is not None and spec_config.use_disagg():
+            if not spec_config.disagg_nccl_init_method:
+                spec_config.disagg_nccl_init_method = (
                     f"tcp://{get_loopback_ip()}:{get_open_port()}"
                 )
                 logger.info(
-                    "Disagg draft: Pre-generated NCCL init method: %s",
-                    spec_config.disagg_draft_nccl_init_method,
+                    "Disagg: Pre-generated NCCL init method: %s",
+                    spec_config.disagg_nccl_init_method,
                 )
 
         shared_worker_lock = context.Lock()
@@ -281,7 +281,7 @@ class MultiprocExecutor(Executor):
         return tp_size, pp_size, pcp_size
 
     def _post_init_executor(self) -> None:
-        # Launch Disagg draft draft worker if Disagg draft speculative decoding is enabled.
+        # Launch Disagg draft worker if disaggregated speculative decoding is enabled.
         # The NCCL init method was pre-generated in _init_executor before
         # workers were spawned, so workers already have it in their config.
         # NOTE: We launch the draft worker in a background thread to avoid
@@ -289,7 +289,7 @@ class MultiprocExecutor(Executor):
         # check timeouts.
         self.disagg_draft_handle = None
         spec_config = self.vllm_config.speculative_config
-        if spec_config is not None and spec_config.use_disagg_draft():
+        if spec_config is not None and spec_config.use_disagg():
             from vllm.v1.worker.gpu.spec_decode.disagg_draft.executor import (
                 maybe_launch_disagg_draft_worker,
             )
@@ -300,16 +300,16 @@ class MultiprocExecutor(Executor):
                 )
             except Exception:
                 logger.warning(
-                    "Disagg draft draft worker failed to launch. "
-                    "Disagg draft will use JIT fallback only.",
+                    "Disagg draft worker failed to launch. "
+                    "Disagg will use JIT fallback only.",
                     exc_info=True,
                 )
                 self.disagg_draft_handle = None
 
             if self.disagg_draft_handle is not None:
                 logger.info(
-                    "Disagg draft draft worker launched. NCCL init: %s",
-                    spec_config.disagg_draft_nccl_init_method,
+                    "Disagg draft worker launched. NCCL init: %s",
+                    spec_config.disagg_nccl_init_method,
                 )
 
     def _is_driver_worker(self, rank: int) -> bool:

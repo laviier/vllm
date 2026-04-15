@@ -733,7 +733,22 @@ class VllmConfig:
 
         from vllm.v1.executor.abstract import Executor
 
+        # Disaggregated speculation requires a separate process for the
+        # draft worker, so we need MultiprocExecutor even at TP=1.
         executor_backend = self.parallel_config.distributed_executor_backend
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_disagg()
+            and executor_backend == "uni"
+        ):
+            self.parallel_config.distributed_executor_backend = "mp"
+            executor_backend = "mp"
+            logger.info(
+                "Disagg speculation enabled: overriding executor "
+                "backend from 'uni' to 'mp' to support draft worker "
+                "process."
+            )
+
         executor_class = Executor.get_class(self)
         executor_supports_async_sched = executor_class.supports_async_scheduling()
 
@@ -1745,7 +1760,7 @@ class VllmConfig:
         if (
             self.speculative_config is not None
             and self.speculative_config.method not in (
-                "eagle", "eagle3", "mtp", "disagg_draft"
+                "eagle", "eagle3", "mtp"
             )
         ):
             unsupported.append(f"speculative method '{self.speculative_config.method}'")
