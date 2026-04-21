@@ -43,6 +43,8 @@ from vllm.v1.worker.gpu.spec_decode.disagg_draft.speculation_cache import Specul
 
 logger = init_logger(__name__)
 
+_DISAGG_DEBUG = os.environ.get("DISAGG_EAGLE_DEBUG", "0") == "1"
+
 
 @dataclass
 class SeqSwapRecord:
@@ -181,6 +183,10 @@ class DisaggDraftWorker:
         # accepted by the target.
         self._last_step_hidden_states: torch.Tensor | None = None  # [B, K, hs]
         self._last_jit_tokens: torch.Tensor | None = None  # [B, K]
+        # Per-step prenorms from the last JIT round, used by
+        # _build_next_cache for the fused glue decode's spec token
+        # hidden states (self-conditioned, no fc projection).
+        self._last_jit_prenorms: torch.Tensor | None = None  # [B, K, hs]
 
         # Base sequence lengths at the START of each speculation round
         # (before JIT or cache-hit tokens modify _seq_lens).
@@ -421,6 +427,15 @@ class DisaggDraftWorker:
                             )
                             torch.cuda.synchronize(self.device)
 
+                            # Don't save prefill prenorm — the EAGLE
+                            # prefill processes shifted tokens and its
+                            # output doesn't match what the co-located
+                            # step 0 produces. The first round will
+                            # fall back to the original JIT path.
+                            self._glue_prenorm = None
+                            self._glue_logits = None
+                            self._prefill_prenorm_valid = False
+
                             logger.info(
                                 "Disagg draft EAGLE prefill OK: "
                                 "seq_lens=%s, hs shape=%s, "
@@ -438,6 +453,8 @@ class DisaggDraftWorker:
                         except Exception as e:
                             logger.warning(
                                 "Disagg draft EAGLE prefill failed: %s", e)
+                            self._glue_prenorm = None
+                            self._glue_logits = None
                             for i, sid in enumerate(seq_ids.tolist()):
                                 n = int(num_tokens[i].item())
                                 try:
@@ -448,6 +465,8 @@ class DisaggDraftWorker:
                                 self.draft_model_runner._seq_lens[int(sid)] = 0
                 else:
                     # No hidden states — just allocate blocks
+                    self._glue_prenorm = None
+                    self._glue_logits = None
                     for i, sid in enumerate(seq_ids.tolist()):
                         n = int(num_tokens[i].item())
                         try:
@@ -460,6 +479,8 @@ class DisaggDraftWorker:
                         self.draft_model_runner._seq_lens[int(sid)] = 0
             else:
                 # Standalone draft model: run standard prefill.
+                self._glue_prenorm = None
+                self._glue_logits = None
                 try:
                     self.draft_model_runner.prefill(
                         input_ids=input_ids,
@@ -473,9 +494,10 @@ class DisaggDraftWorker:
             for sid in seq_ids.tolist():
                 self._round_base_lens.pop(int(sid), None)
                 self._swap_states.pop(int(sid), None)
-            # Clear glue decode state from previous request
-            self._glue_prenorm = None
-            self._glue_logits = None
+            # Note: _glue_prenorm and _glue_logits are set by
+            # eagle_prefill above (if successful) or cleared on error.
+            # Don't clear them here — they're needed for the first
+            # speculation round.
 
     def _handle_speculation(self) -> None:
         """Handle SPECULATE command with hybrid swap+JIT strategy.
@@ -523,6 +545,22 @@ class DisaggDraftWorker:
                     bonus_tokens.tolist()[:3],
                 )
 
+            # Checkpoint 2: Enhanced NCCL Receive diagnostic logging
+            if _DISAGG_DEBUG:
+                logger.info(
+                    "[DISAGG_DIAG][CP2] NCCL recv hidden_states: "
+                    "shape=%s, dtype=%s",
+                    hidden_states.shape, hidden_states.dtype,
+                )
+                for i in range(B):
+                    logger.info(
+                        "[DISAGG_DIAG][CP2] req %d: norm=%.6f, "
+                        "first3=%s",
+                        i,
+                        hidden_states[i].float().norm().item(),
+                        hidden_states[i, :3].tolist(),
+                    )
+
         if _profile:
             torch.cuda.synchronize(self.device)
             t_recv = time.perf_counter()
@@ -564,17 +602,25 @@ class DisaggDraftWorker:
                 needed = cur_len + self.K + self.K + 2  # generous headroom
                 runner.ensure_blocks(sid, needed)
 
-            # --- Glue decode: fill KV cache gaps for EAGLE methods ---
-            # Only run glue decode when there are extend tokens to
-            # process (k_accepted > 0 for at least one sequence).
-            # When k_accepted=0 for all sequences, the glue decode
-            # would just process the recovery token, which is the
-            # same as JIT step 0. Skip it to save a forward pass.
-            has_extend = (extend_counts is not None
-                          and int(extend_counts.sum().item()) > 0)
+            # --- Glue decode: ALWAYS run for EAGLE methods ---
+            # Even when k_accepted=0 (no extend tokens), we must run
+            # glue decode with just the recovery token to produce a
+            # proper EAGLE prenorm for JIT step 0.  Without this, JIT
+            # feeds raw fc-projected hidden states into the EAGLE head,
+            # which have ~280x higher norms than the co-located flow's
+            # EAGLE model output, degrading acceptance rate by ~10%.
+            #
+            # SSD reference always runs a fused glue decode (extend +
+            # recovery + spec tokens) regardless of k_accepted.  Our
+            # minimal version processes extend + recovery only, but
+            # critically ensures the EAGLE model always produces the
+            # prenorm that feeds into JIT step 0.
             if (self.needs_hidden_states
-                    and has_extend
                     and hidden_states is not None):
+                # Ensure extend_counts is valid (default to zeros)
+                if extend_counts is None:
+                    extend_counts = torch.zeros(
+                        B, dtype=torch.int64, device=self.device)
                 self._run_glue_decode(
                     B=B,
                     seq_ids=seq_ids,
@@ -586,6 +632,7 @@ class DisaggDraftWorker:
                     extend_token_ids=extend_token_ids,
                 )
             else:
+                # Non-EAGLE method or no hidden states available.
                 self._glue_prenorm = None
                 self._glue_logits = None
 
@@ -615,43 +662,57 @@ class DisaggDraftWorker:
             B, self.K, self.vocab_size, dtype=self.dtype, device=self.device,
         )
 
-        # --- Handle cache hits: swap block tables ---
+        # --- Handle cache hits ---
         used_swap_for_hits = False
         if num_hits > 0 and cached_logits is not None:
-            hit_tables, hit_prefix_lens = self.cache.get_hit_block_tables(
-                cache_hits
-            )
-            if hit_tables is not None and hit_prefix_lens is not None:
-                # Swap only for hit sequences
-                hit_seq_ids = seq_ids[hit_mask]
-                owned, displaced = runner.swap_block_tables(
-                    seq_ids=hit_seq_ids,
-                    branch_block_tables=hit_tables,
-                    prefix_lens=hit_prefix_lens,
-                    K=self.K,
-                )
-                for blocks in owned.values():
-                    runner.exclude_from_dedicated(blocks)
-                if displaced:
-                    runner._free_list.extend(displaced)
-
-                # Update _seq_lens and swap state for hits
-                hit_indices = hit_mask.nonzero(as_tuple=True)[0]
-                for compact_i, idx in enumerate(hit_indices):
-                    i = int(idx.item())
-                    sid = seq_ids_list[i]
-                    prefix_len = int(hit_prefix_lens[compact_i].item())
-                    runner._seq_lens[sid] = prefix_len + self.K
-                    self._swap_states[sid] = SeqSwapRecord(
-                        last_round_was_swap=True,
-                        swap_prefix_len=prefix_len,
-                        owned_dedicated_blocks=owned.get(sid, []),
-                    )
-
-                # Fill hit results
+            if self.needs_hidden_states:
+                # EAGLE: no block swapping needed. The tree decode wrote
+                # to positions beyond the sequence in the main block
+                # table. Just return cached tokens. The next round's
+                # glue decode + JIT will write correct KV entries.
                 draft_tokens[hit_mask] = cached_tokens[hit_mask]
                 draft_logits[hit_mask] = cached_logits[hit_mask]
                 used_swap_for_hits = True
+
+                # Clear swap state for hits (no swap happened)
+                hit_indices = hit_mask.nonzero(as_tuple=True)[0]
+                for idx in hit_indices:
+                    sid = seq_ids_list[int(idx.item())]
+                    self._swap_states[sid] = SeqSwapRecord(
+                        last_round_was_swap=False)
+            else:
+                # Standalone: swap dedicated block tables into main
+                hit_tables, hit_prefix_lens = (
+                    self.cache.get_hit_block_tables(cache_hits))
+                if hit_tables is not None and hit_prefix_lens is not None:
+                    hit_seq_ids = seq_ids[hit_mask]
+                    owned, displaced = runner.swap_block_tables(
+                        seq_ids=hit_seq_ids,
+                        branch_block_tables=hit_tables,
+                        prefix_lens=hit_prefix_lens,
+                        K=self.K,
+                    )
+                    for blocks in owned.values():
+                        runner.exclude_from_dedicated(blocks)
+                    if displaced:
+                        runner._free_list.extend(displaced)
+
+                    hit_indices = hit_mask.nonzero(as_tuple=True)[0]
+                    for compact_i, idx in enumerate(hit_indices):
+                        i = int(idx.item())
+                        sid = seq_ids_list[i]
+                        prefix_len = int(
+                            hit_prefix_lens[compact_i].item())
+                        runner._seq_lens[sid] = prefix_len + self.K
+                        self._swap_states[sid] = SeqSwapRecord(
+                            last_round_was_swap=True,
+                            swap_prefix_len=prefix_len,
+                            owned_dedicated_blocks=owned.get(sid, []),
+                        )
+
+                    draft_tokens[hit_mask] = cached_tokens[hit_mask]
+                    draft_logits[hit_mask] = cached_logits[hit_mask]
+                    used_swap_for_hits = True
 
         # --- Handle cache misses: JIT only on misses ---
         B_miss = int(miss_mask.sum().item())
@@ -683,6 +744,16 @@ class DisaggDraftWorker:
                     miss_glue_logits = glue_logits[
                         miss_mask.nonzero(as_tuple=True)[0]
                     ]
+                if _DISAGG_DEBUG:
+                    logger.info(
+                        "[DISAGG_DIAG] glue_shortcut: "
+                        "has_prenorm=%s has_logits=%s "
+                        "miss_prenorm=%s miss_logits=%s",
+                        glue_prenorm is not None,
+                        glue_logits is not None,
+                        miss_glue_prenorm is not None,
+                        miss_glue_logits is not None,
+                    )
                 jit_tokens, jit_logits = self._eagle_jit_speculate(
                     miss_seq_ids, miss_bonus, B_miss=B_miss,
                     temperatures=miss_temps,
@@ -700,6 +771,19 @@ class DisaggDraftWorker:
             if jit_logits is not None:
                 draft_logits[miss_mask] = jit_logits
 
+            # Expand JIT prenorms to full batch size for _build_eagle_cache.
+            # For cache hit sequences, prenorms are left as zeros (the
+            # fused glue decode in _build_eagle_cache handles this by
+            # using fc-projected target hs as fallback).
+            if (self.needs_hidden_states
+                    and self._last_jit_prenorms is not None):
+                full_prenorms = torch.zeros(
+                    B, self.K, self._last_jit_prenorms.shape[-1],
+                    dtype=self._last_jit_prenorms.dtype,
+                    device=self.device)
+                full_prenorms[miss_mask] = self._last_jit_prenorms
+                self._last_jit_prenorms = full_prenorms
+
             # Clear swap state for JIT sequences
             miss_indices = miss_mask.nonzero(as_tuple=True)[0]
             for idx in miss_indices:
@@ -707,6 +791,10 @@ class DisaggDraftWorker:
                 self._swap_states[sid] = SeqSwapRecord(
                     last_round_was_swap=False
                 )
+        else:
+            # All cache hits — no JIT ran, clear stale prenorms
+            if self.needs_hidden_states:
+                self._last_jit_prenorms = None
 
         # If no hits were swapped, clear swap state for all
         if not used_swap_for_hits:
@@ -766,20 +854,12 @@ class DisaggDraftWorker:
             t_send = time.perf_counter()
 
         # Step 5: Build speculation cache for NEXT round (async overlap)
-        # Skip cache building for hidden-state methods (EAGLE/EAGLE3/MTP)
-        # because glue_decode and tree_decode call the model without
-        # hidden_states, which EAGLE models require.  These methods
-        # rely purely on JIT speculation until a proper EAGLE-aware
-        # cache building path is implemented.
-        if self.draft_model_runner is not None:
+        # _build_eagle_cache handles its own _seq_lens save/restore.
+        # For standalone, we save/restore here.
+        if self.draft_model_runner is not None and not self.needs_hidden_states:
             saved_seq_lens = dict(self.draft_model_runner._seq_lens)
-        if not self.needs_hidden_states:
-            self._build_next_cache(B, seq_ids)
-        # Restore _seq_lens — JIT speculation advances positions by K
-        # steps, but the target only accepted k_accepted tokens.  The
-        # correct seq_len will be set at the start of the next
-        # _handle_speculation based on k_accepted.
-        if self.draft_model_runner is not None:
+        self._build_next_cache(B, seq_ids)
+        if self.draft_model_runner is not None and not self.needs_hidden_states:
             self.draft_model_runner._seq_lens = saved_seq_lens
 
         if _profile:
@@ -881,12 +961,48 @@ class DisaggDraftWorker:
             fused_hs[offset + n_ext] = hidden_states[i]
             offset += n_ext + 1
 
+        # Checkpoint 3: Log glue decode inputs after building fused tensors
+        if _DISAGG_DEBUG:
+            logger.info(
+                "[DISAGG_DIAG][CP3] fused_ids=%s",
+                fused_ids.tolist(),
+            )
+            for t in range(total_tokens):
+                logger.info(
+                    "[DISAGG_DIAG][CP3] token %d: hs_norm=%.6f",
+                    t,
+                    fused_hs[t].float().norm().item(),
+                )
+            logger.info(
+                "[DISAGG_DIAG][CP3] extend_counts=%s",
+                ext_counts,
+            )
+
         # Project all hidden states through combine_hidden_states (fc)
         # All tokens are target-conditioned (extend + recovery)
         if hasattr(runner.model, 'combine_hidden_states'):
             processed_hs = runner.model.combine_hidden_states(fused_hs)
         else:
             processed_hs = fused_hs
+
+        # Checkpoint 4: Log post-fc projection norms
+        if _DISAGG_DEBUG:
+            for t in range(processed_hs.shape[0]):
+                logger.info(
+                    "[DISAGG_DIAG][CP4] token %d: post_fc_norm=%.6f",
+                    t,
+                    processed_hs[t].float().norm().item(),
+                )
+            # Pre vs post norm comparison
+            for t in range(min(fused_hs.shape[0], processed_hs.shape[0])):
+                pre_norm = fused_hs[t].float().norm().item()
+                post_norm = processed_hs[t].float().norm().item()
+                logger.info(
+                    "[DISAGG_DIAG][CP4] token %d: pre_fc_norm=%.6f "
+                    "post_fc_norm=%.6f ratio=%.6f",
+                    t, pre_norm, post_norm,
+                    post_norm / pre_norm if pre_norm > 0 else float('inf'),
+                )
 
         # Build positions: extend starts at base_pos, then sequential
         # base_pos = _seq_lens[sid] (which is round_base after reset above)
@@ -908,6 +1024,13 @@ class DisaggDraftWorker:
                 n_q, device=self.device) + start_pos
             expanded_seq_ids.extend([sid] * n_q)
             offset += n_q
+
+        # Checkpoint 3 (continued): Log positions after building
+        if _DISAGG_DEBUG:
+            logger.info(
+                "[DISAGG_DIAG][CP3] positions=%s",
+                positions.tolist(),
+            )
 
         # Compute slot mapping
         slot_mapping = runner._compute_slot_mapping(positions, expanded_seq_ids)
@@ -986,6 +1109,25 @@ class DisaggDraftWorker:
         else:
             self._glue_prenorm = output[last_indices]
             self._glue_logits = None
+
+        # Checkpoint 5: Log glue decode outputs at recovery positions
+        if _DISAGG_DEBUG:
+            for i in range(B):
+                logger.info(
+                    "[DISAGG_DIAG][CP5] req %d: prenorm_norm=%.6f",
+                    i,
+                    self._glue_prenorm[i].float().norm().item(),
+                )
+            if self._glue_logits is not None:
+                for i in range(B):
+                    top5v, top5i = self._glue_logits[i].topk(5)
+                    logger.info(
+                        "[DISAGG_DIAG][CP5] req %d: top5_ids=%s "
+                        "top5_vals=%s",
+                        i,
+                        top5i.tolist(),
+                        top5v.tolist(),
+                    )
 
         # Update _seq_lens to reflect the glue decode
         for i in range(B):
@@ -1095,6 +1237,26 @@ class DisaggDraftWorker:
                     )
                 )
 
+            # Checkpoint 6: Log JIT inputs after fc projection
+            if _DISAGG_DEBUG:
+                logger.info(
+                    "[DISAGG_DIAG][CP6] JIT input: shape=%s, dtype=%s, "
+                    "glue_prenorm=%s, glue_logits=%s",
+                    processed_hs.shape, processed_hs.dtype,
+                    glue_prenorm is not None,
+                    glue_logits is not None,
+                )
+                for i in range(B_miss):
+                    logger.info(
+                        "[DISAGG_DIAG][CP6] req %d: "
+                        "processed_hs norm=%.6f, "
+                        "position=%d, bonus_token=%d",
+                        i,
+                        processed_hs[i].float().norm().item(),
+                        int(positions[i].item()),
+                        int(bonus_tokens[i].item()),
+                    )
+
             # --- Run JIT speculation ---
             # Use eagle_sequential_speculate which processes the
             # recovery token at step 0 with target hidden states,
@@ -1103,7 +1265,7 @@ class DisaggDraftWorker:
             # for extend + recovery tokens. eagle_sequential_speculate
             # will overwrite the recovery KV entry (harmless — same
             # input produces same output).
-            tokens, logits_out = (
+            tokens, logits_out, jit_prenorms = (
                 self.draft_model_runner.eagle_sequential_speculate(
                     recovery_tokens=bonus_tokens,
                     positions=positions,
@@ -1112,8 +1274,16 @@ class DisaggDraftWorker:
                     hidden_states=processed_hs,
                     temperatures=temperatures,
                     seeds=seeds,
+                    glue_prenorm=glue_prenorm,
+                    glue_logits=glue_logits,
                 )
             )
+
+            # Store per-step prenorms for _build_next_cache tree decode.
+            # These are the self-conditioned hidden states from each JIT
+            # step, used as hidden_states input for spec token positions
+            # in the fused glue decode during cache building.
+            self._last_jit_prenorms = jit_prenorms
 
             # Clamp draft token IDs to the target model's vocab range.
             # The EAGLE model may have a larger vocab than the target,
@@ -1226,10 +1396,16 @@ class DisaggDraftWorker:
         Called after sending the response to the target. Runs while
         the target is verifying — this is the core async overlap.
 
-        Uses glue decode to get K+1 logits (K from JIT + 1 from glue),
-        enabling prediction at K+1 positions including the "all accepted"
-        outcome. Tree decode runs K steps for all N = B×(K+1)×F branches
-        using dedicated block tables.
+        For EAGLE methods, follows SSD's approach:
+        1. Run a fused glue decode (recovery + spec tokens) to get K+1
+           prenorms and logits.
+        2. Fork bonus candidates from K+1 logits.
+        3. Tree decode K steps using the main block table (no dedicated
+           blocks). Tree decode writes to positions beyond the current
+           sequence — these are speculative and overwritten next round.
+        4. Populate cache with tokens/logits.
+
+        For standalone draft models, uses dedicated blocks with KV copy.
 
         Args:
             batch_size: B, number of sequences.
@@ -1246,77 +1422,197 @@ class DisaggDraftWorker:
         if self._last_draft_tokens is None or self._last_draft_logits is None:
             return
 
-        # Adaptive fan-out: reduce branches at high batch sizes to keep
-        # cache build time bounded. Tree decode cost is O(B × (K+1) × F × K).
-        # At B>32, reduce F to keep total branches under ~500.
-        max_branches = 504  # ~500, divisible by common K+1 values
+        max_branches = 504
         F = self.fan_out
         if B * (K + 1) * F > max_branches:
             F = max(1, max_branches // (B * (K + 1)))
-
         N = B * (K + 1) * F
-        # Skip cache build if N is too large — the logits tensor alone
-        # would be [N, V] which can OOM on the draft GPU.
-        # Budget: ~500 branches max to keep memory under ~250MB for logits.
         if N > max_branches:
             return
-        if B * (K + 1) * F > max_branches:
-            F = max(1, max_branches // (B * (K + 1)))
 
-        # Recycle dedicated blocks from the previous round's tree decode.
-        runner.recycle_dedicated_blocks()
-
-        draft_tokens = self._last_draft_tokens  # [B, K]
-        draft_logits = self._last_draft_logits  # [B, K, V]
-        rec_tokens = self._last_bonus_tokens    # [B]
+        draft_tokens = self._last_draft_tokens
+        draft_logits = self._last_draft_logits
+        rec_tokens = self._last_bonus_tokens
 
         seq_ids_list = seq_ids.tolist()
 
         _profile = os.environ.get("DISAGG_DRAFT_PROFILE", "0") == "1"
+
+        if self.needs_hidden_states:
+            self._build_eagle_cache(
+                B, K, F, N, seq_ids, seq_ids_list, runner,
+                draft_tokens, draft_logits, rec_tokens, _profile,
+            )
+        else:
+            self._build_standalone_cache(
+                B, K, F, N, seq_ids, seq_ids_list, runner,
+                draft_tokens, draft_logits, rec_tokens, _profile,
+            )
+
+    def _build_eagle_cache(
+        self,
+        B: int, K: int, F: int, N: int,
+        seq_ids: torch.Tensor,
+        seq_ids_list: list[int],
+        runner: "DraftModelRunner",
+        draft_tokens: torch.Tensor,
+        draft_logits: torch.Tensor,
+        rec_tokens: torch.Tensor,
+        _profile: bool,
+    ) -> None:
+        """Build speculation cache for EAGLE methods.
+
+        Follows SSD's approach: fused glue decode → fork → tree decode
+        on the main block table (no dedicated blocks, no KV copy).
+        """
+        _tc0 = time.perf_counter() if _profile else 0.0
+
+        # Save _seq_lens before any modification so we can restore after.
+        saved_seq_lens = dict(runner._seq_lens)
+
+        Kp1 = K + 1
+        jit_prenorms = self._last_jit_prenorms
+        hidden_states = self._target_hidden_states
+
+        # ----- Step 1: Fused glue decode (recovery + spec tokens) -----
+        if hidden_states is None:
+            # Fallback: use JIT logits for K+1th position
+            glue_logits_kp1 = draft_logits[:, -1]
+            outcome_logits = torch.cat(
+                [draft_logits, glue_logits_kp1.unsqueeze(1)], dim=1)
+            glue_prenorm_kp1 = None
+        else:
+            total_tokens = B * Kp1
+            fused_ids = torch.zeros(
+                total_tokens, dtype=torch.int64, device=self.device)
+            fused_ids_2d = fused_ids.view(B, Kp1)
+            fused_ids_2d[:, 0] = rec_tokens
+            fused_ids_2d[:, 1:] = draft_tokens
+
+            # Hidden states: recovery uses fc-projected target hs,
+            # spec tokens use JIT prenorms (self-conditioned, no fc).
+            # For cache hit sequences (no JIT prenorms), use
+            # fc-projected target hs for all positions as fallback.
+            if hasattr(runner.model, 'combine_hidden_states'):
+                rec_hs = runner.model.combine_hidden_states(
+                    hidden_states[:B])
+                eagle_hs_dim = rec_hs.shape[-1]
+            else:
+                rec_hs = hidden_states[:B]
+                eagle_hs_dim = hidden_states.shape[-1]
+
+            fused_hs = torch.zeros(
+                total_tokens, eagle_hs_dim,
+                dtype=rec_hs.dtype, device=self.device)
+            fused_hs_2d = fused_hs.view(B, Kp1, eagle_hs_dim)
+            fused_hs_2d[:, 0] = rec_hs
+            if jit_prenorms is not None and jit_prenorms.shape[0] >= B:
+                # Use JIT prenorms for spec token positions.
+                # For cache hit sequences, jit_prenorms may be stale
+                # (from a previous round). This is acceptable — the
+                # fused glue decode will still produce reasonable
+                # prenorms for tree decode.
+                fused_hs_2d[:, 1:] = jit_prenorms[:B, :K]
+            else:
+                # No JIT prenorms available — use fc-projected target
+                # hs for all spec positions (less accurate but works).
+                fused_hs_2d[:, 1:] = rec_hs.unsqueeze(1).expand(
+                    B, K, eagle_hs_dim)
+
+            # Positions: recovery at round_base, spec at round_base + i
+            positions = torch.zeros(
+                total_tokens, dtype=torch.long, device=self.device)
+            positions_2d = positions.view(B, Kp1)
+            for i in range(B):
+                sid = seq_ids_list[i]
+                base = self._round_base_lens.get(sid, 0)
+                positions_2d[i] = torch.arange(
+                    Kp1, device=self.device) + base
+
+            expanded_seq_ids_flat = []
+            for i in range(B):
+                expanded_seq_ids_flat.extend([seq_ids_list[i]] * Kp1)
+            slot_mapping = runner._compute_slot_mapping(
+                positions, expanded_seq_ids_flat)
+            block_tables = runner._get_block_table_tensor(seq_ids)
+
+            seqlens_q = torch.full(
+                (B,), Kp1, dtype=torch.int32, device=self.device)
+            query_start_loc = torch.zeros(
+                B + 1, dtype=torch.int32, device=self.device)
+            torch.cumsum(seqlens_q, dim=0, out=query_start_loc[1:])
+
+            seq_lens_list = []
+            for i in range(B):
+                sid = seq_ids_list[i]
+                base = self._round_base_lens.get(sid, 0)
+                seq_lens_list.append(base + Kp1)
+            seq_lens_t = torch.tensor(
+                seq_lens_list, dtype=torch.int32, device=self.device)
+            max_seq_len = int(seq_lens_t.max().item())
+
+            from vllm.forward_context import (BatchDescriptor,
+                                              set_forward_context)
+            attn_metadata = runner._build_flash_attn_metadata(
+                num_tokens=total_tokens,
+                seq_lens_tensor=seq_lens_t,
+                max_seq_len=max_seq_len,
+                max_query_len=Kp1,
+                query_start_loc=query_start_loc,
+                block_table=block_tables,
+                slot_mapping=slot_mapping,
+            )
+            slot_mapping_dict = runner._build_slot_mapping_dict(
+                slot_mapping)
+
+            batch_descriptor = BatchDescriptor(num_tokens=total_tokens)
+            with set_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=runner._draft_vllm_config,
+                num_tokens=total_tokens,
+                slot_mapping=slot_mapping_dict,
+                batch_descriptor=batch_descriptor,
+            ):
+                output = runner.model(
+                    input_ids=fused_ids,
+                    positions=positions,
+                    hidden_states=fused_hs,
+                )
+
+            if runner.method != "mtp":
+                last_hs_flat, prenorm_flat = output
+            else:
+                last_hs_flat = output
+                prenorm_flat = output
+
+            glue_prenorm_kp1 = prenorm_flat.view(B, Kp1, -1)
+
+            if hasattr(runner.model, 'compute_logits'):
+                glue_logits_flat = runner.model.compute_logits(
+                    last_hs_flat)
+            elif hasattr(runner.model, 'lm_head'):
+                glue_logits_flat = runner.model.lm_head(last_hs_flat)
+            else:
+                glue_logits_flat = torch.matmul(
+                    last_hs_flat,
+                    runner.model.get_input_embeddings().weight.T)
+            glue_logits_flat = glue_logits_flat[:, :self.vocab_size]
+            outcome_logits = glue_logits_flat.view(B, Kp1, -1)
+
         if _profile:
             torch.cuda.synchronize(self.device)
-            _tc0 = time.perf_counter()
+            _tc1 = time.perf_counter()
 
-        # ----- Step 1: Glue decode for K+1th logits -----
-        # Feed the last JIT token to get logits at position K.
-        # This writes KV at position base+K in the main blocks, which is
-        # safe with block table swapping (swap overwrites those blocks on
-        # hit, JIT overwrites on miss).
-        glue_logits = runner.glue_decode(
-            tokens=draft_tokens[:, -1],
-            seq_ids=seq_ids,
-        )  # [B, V]
-
-        # Save post-glue _seq_lens so we can restore after tree decode
-        post_glue_lens = {
-            sid: runner._seq_lens.get(sid, 0) for sid in seq_ids_list
-        }
-
-        # ----- Step 2: Predict bonus token candidates at K+1 positions -----
-        # Combine JIT logits (K positions) + glue logits (1 position)
-        # outcome_logits: [B, K+1, V]
-        outcome_logits = torch.cat(
-            [draft_logits, glue_logits.unsqueeze(1)], dim=1
-        )
-        # outcome_tokens: [B, K+1] = [recovery, draft_0, ..., draft_{K-1}]
+        # ----- Step 2: Fork bonus candidates -----
         outcome_tokens = torch.cat(
-            [rec_tokens.unsqueeze(1), draft_tokens], dim=1
-        )
-
-        # Mask continuation token at each position and pick top-F
-        masked_logits = outcome_logits.clone()  # [B, K+1, V]
-        # At positions 0..K-1, mask the NEXT token (continuation)
+            [rec_tokens.unsqueeze(1), draft_tokens], dim=1)
+        masked_logits = outcome_logits.clone()
         masked_logits[:, :-1, :] = masked_logits[:, :-1, :].scatter(
             dim=2,
             index=outcome_tokens[:, 1:].unsqueeze(2),
-            value=float("-inf"),
-        )
-        # Position K: no masking (bonus is standard next-token prediction)
-        _, topk_indices = torch.topk(masked_logits, F, dim=-1)  # [B, K+1, F]
+            value=float("-inf"))
+        _, topk_indices = torch.topk(masked_logits, F, dim=-1)
 
-        # Flatten into N = B * (K+1) * F cache entries
-        Kp1 = K + 1
-        # N already computed above
         batch_ids_grid = torch.arange(
             B, device=self.device
         ).view(B, 1, 1).expand(B, Kp1, F)
@@ -1324,64 +1620,215 @@ class DisaggDraftWorker:
             Kp1, device=self.device, dtype=torch.int64
         ).view(1, Kp1, 1).expand(B, Kp1, F)
 
-        k_positions = k_pos_grid.reshape(-1)          # [N]
-        bonus_candidates = topk_indices.reshape(-1)    # [N]
-        entry_batch_ids = batch_ids_grid.reshape(-1)   # [N]
+        k_positions = k_pos_grid.reshape(-1)
+        bonus_candidates = topk_indices.reshape(-1)
+        entry_batch_ids = batch_ids_grid.reshape(-1)
+
+        if _profile:
+            torch.cuda.synchronize(self.device)
+            _tc2 = time.perf_counter()
+
+        # ----- Step 3: Ensure blocks for tree decode -----
+        branches_per_seq = Kp1 * F
+        max_tree_pos = Kp1 + branches_per_seq * K + K
+        for sid in seq_ids_list:
+            base = self._round_base_lens.get(sid, 0)
+            runner.ensure_blocks(sid, base + max_tree_pos + 1)
+
+        base_lens_t = torch.tensor(
+            [self._round_base_lens.get(int(seq_ids[b].item()), 0)
+             for b in range(B)],
+            dtype=torch.int64, device=self.device)
+
+        branch_within_seq = torch.arange(
+            branches_per_seq, device=self.device, dtype=torch.int64
+        ).unsqueeze(0).expand(B, -1).reshape(-1)
+
+        tree_start = (base_lens_t[entry_batch_ids]
+                      + Kp1
+                      + branch_within_seq * K)
+
+        seq_ids_expanded = seq_ids[entry_batch_ids]
+        tree_block_tables = runner._block_table_gpu[
+            seq_ids_expanded.to(torch.int64)
+        ].contiguous()
+
+        if _profile:
+            torch.cuda.synchronize(self.device)
+            _tc3 = time.perf_counter()
+
+        # ----- Step 4: Tree decode (K steps) -----
+        all_tokens = torch.zeros(
+            N, K, dtype=torch.int64, device=self.device)
+        all_logits = torch.zeros(
+            N, K, self.vocab_size, dtype=self.dtype, device=self.device)
+        current_ids = bonus_candidates.clone()
+
+        max_context_hint = int(tree_start.max().item()) + K + 1
+
+        # Initialize per-branch hidden states from glue prenorms
+        if glue_prenorm_kp1 is not None:
+            branch_hidden_states = glue_prenorm_kp1[
+                entry_batch_ids, k_positions]
+        else:
+            branch_hidden_states = None
+
+        for depth in range(K):
+            positions = tree_start + depth
+            context_lens = positions + 1
+
+            if branch_hidden_states is not None:
+                logits, branch_hidden_states = (
+                    runner.eagle_tree_decode_step(
+                        input_ids=current_ids,
+                        positions=positions,
+                        seq_lens=context_lens,
+                        seq_ids_expanded=seq_ids_expanded,
+                        block_tables=tree_block_tables,
+                        hidden_states=branch_hidden_states,
+                        max_seq_len_hint=max_context_hint,
+                    ))
+            else:
+                logits = runner.tree_decode_step(
+                    input_ids=current_ids,
+                    positions=positions,
+                    seq_lens=context_lens,
+                    seq_ids_expanded=seq_ids_expanded,
+                    block_tables=tree_block_tables,
+                    max_seq_len_hint=max_context_hint,
+                )
+
+            all_logits[:, depth] = logits
+            next_tokens = logits.argmax(dim=-1)
+            all_tokens[:, depth] = next_tokens
+            current_ids = next_tokens
+
+        if _profile:
+            torch.cuda.synchronize(self.device)
+            _tc4 = time.perf_counter()
+
+        # ----- Step 5: Populate cache (no block tables for EAGLE) -----
+        self.cache.populate(
+            seq_ids=seq_ids[entry_batch_ids],
+            k_positions=k_positions,
+            bonus_tokens=bonus_candidates,
+            draft_tokens=all_tokens,
+            draft_logits=all_logits,
+            branch_block_tables=tree_block_tables,
+            prefix_lens=tree_start,
+        )
+
+        # Restore _seq_lens to pre-cache-build state
+        runner._seq_lens = saved_seq_lens
+
+        if _profile:
+            _tc5 = time.perf_counter()
+            self._cache_build_count = getattr(
+                self, '_cache_build_count', 0) + 1
+            if self._cache_build_count % 100 == 1:
+                logger.info(
+                    "Disagg EAGLE CACHE_BUILD [%d] B=%d N=%d F=%d "
+                    "glue=%.2fms fork=%.2fms blocks=%.2fms "
+                    "tree=%.2fms pop=%.2fms total=%.2fms",
+                    self._cache_build_count, B, N, F,
+                    (_tc1 - _tc0) * 1000,
+                    (_tc2 - _tc1) * 1000,
+                    (_tc3 - _tc2) * 1000,
+                    (_tc4 - _tc3) * 1000,
+                    (_tc5 - _tc4) * 1000,
+                    (_tc5 - _tc0) * 1000,
+                )
+
+    def _build_standalone_cache(
+        self,
+        B: int, K: int, F: int, N: int,
+        seq_ids: torch.Tensor,
+        seq_ids_list: list[int],
+        runner: "DraftModelRunner",
+        draft_tokens: torch.Tensor,
+        draft_logits: torch.Tensor,
+        rec_tokens: torch.Tensor,
+        _profile: bool,
+    ) -> None:
+        """Build speculation cache for standalone draft models.
+
+        Uses dedicated blocks: allocate, copy KV from parent, run tree
+        decode on dedicated blocks, swap block tables on cache hit.
+        """
+        _tc0 = time.perf_counter() if _profile else 0.0
+
+        runner.recycle_dedicated_blocks()
+
+        # Glue decode for K+1th logits
+        glue_logits = runner.glue_decode(
+            tokens=draft_tokens[:, -1], seq_ids=seq_ids)
+
+        post_glue_lens = {
+            sid: runner._seq_lens.get(sid, 0) for sid in seq_ids_list}
+
+        Kp1 = K + 1
+        outcome_logits = torch.cat(
+            [draft_logits, glue_logits.unsqueeze(1)], dim=1)
+        outcome_tokens = torch.cat(
+            [rec_tokens.unsqueeze(1), draft_tokens], dim=1)
+
+        masked_logits = outcome_logits.clone()
+        masked_logits[:, :-1, :] = masked_logits[:, :-1, :].scatter(
+            dim=2,
+            index=outcome_tokens[:, 1:].unsqueeze(2),
+            value=float("-inf"))
+        _, topk_indices = torch.topk(masked_logits, F, dim=-1)
+
+        batch_ids_grid = torch.arange(
+            B, device=self.device
+        ).view(B, 1, 1).expand(B, Kp1, F)
+        k_pos_grid = torch.arange(
+            Kp1, device=self.device, dtype=torch.int64
+        ).view(1, Kp1, 1).expand(B, Kp1, F)
+
+        k_positions = k_pos_grid.reshape(-1)
+        bonus_candidates = topk_indices.reshape(-1)
+        entry_batch_ids = batch_ids_grid.reshape(-1)
 
         if _profile:
             torch.cuda.synchronize(self.device)
             _tc1 = time.perf_counter()
 
-        # ----- Step 2: Bounds check for dedicated blocks -----
-        blocks_per_branch = (K + runner.block_size) // runner.block_size + 1
+        # Bounds check for dedicated blocks
+        bs = runner.block_size
+        M = runner.max_num_blocks
+        blocks_per_branch = (K + bs) // bs + 1
         total_needed = N * blocks_per_branch
-        # Check total available blocks: bump headroom + free list.
-        available = (runner.num_kv_blocks - runner._next_free_block) + len(runner._free_list)
+        available = ((runner.num_kv_blocks - runner._next_free_block)
+                     + len(runner._free_list))
         if available < total_needed:
             for sid in seq_ids_list:
                 if sid in post_glue_lens:
                     runner._seq_lens[sid] = post_glue_lens[sid] - 1
             return
 
-        # Allocate dedicated blocks from free list first, then bump pointer.
-        dedicated_blocks = []
-        for _ in range(total_needed):
-            dedicated_blocks.append(runner._alloc_one_block())
-        branch_block_start = dedicated_blocks[0] if dedicated_blocks else 0
+        dedicated_blocks = [runner._alloc_one_block()
+                            for _ in range(total_needed)]
         runner.reserve_dedicated_blocks(dedicated_blocks)
 
-        # ----- Step 3: Build per-branch block tables (vectorized) -----
+        # Build per-branch block tables
         base_lens_t = torch.tensor(
             [self._round_base_lens.get(int(seq_ids[b].item()), 0)
              for b in range(B)],
-            dtype=torch.int64, device=self.device,
-        )
-        prefix_lens = base_lens_t[entry_batch_ids] + 1 + k_positions  # [N]
+            dtype=torch.int64, device=self.device)
+        prefix_lens = base_lens_t[entry_batch_ids] + 1 + k_positions
 
-        bs = runner.block_size
-        M = runner.max_num_blocks
-
-        # Start with parent block tables for each branch (GPU copy)
-        seq_ids_for_branches = seq_ids[entry_batch_ids].to(torch.int64)  # [N]
+        seq_ids_for_branches = seq_ids[entry_batch_ids].to(torch.int64)
         branch_block_tables = runner._block_table_gpu[
-            seq_ids_for_branches
-        ].contiguous()  # [N, M]
+            seq_ids_for_branches].contiguous()
 
-        # Compute write range per branch
-        first_write_blk = prefix_lens // bs  # [N]
-        last_write_blk = (prefix_lens + K - 1) // bs  # [N]
-
-        # Build per-branch dedicated block mapping from allocated blocks.
-        # dedicated_blocks is a flat list of total_needed blocks.
-        # Branch n gets blocks [n*blocks_per_branch : (n+1)*blocks_per_branch].
+        first_write_blk = prefix_lens // bs
         ded_tensor = torch.tensor(
             dedicated_blocks, dtype=torch.int64, device=self.device
-        ).view(N, blocks_per_branch)  # [N, blocks_per_branch]
+        ).view(N, blocks_per_branch)
 
-        # Replace write-range blocks with dedicated blocks
         j_range = torch.arange(
-            blocks_per_branch, device=self.device, dtype=torch.int64
-        )
+            blocks_per_branch, device=self.device, dtype=torch.int64)
         tbl_indices = first_write_blk.unsqueeze(1) + j_range.unsqueeze(0)
         valid = tbl_indices < M
         n_idx = torch.arange(
@@ -1391,19 +1838,16 @@ class DisaggDraftWorker:
             n_idx[valid], tbl_indices[valid].to(torch.int64)
         ] = ded_tensor[valid].to(torch.int32)
 
-        # ----- Step 4: Copy KV from parent to dedicated blocks -----
+        # Copy KV from parent to dedicated blocks
         if _profile:
             torch.cuda.synchronize(self.device)
             _tc2 = time.perf_counter()
 
-        parent_tables = runner._block_table_gpu[
-            seq_ids_for_branches
-        ]  # [N, M] — original parent tables
+        parent_tables = runner._block_table_gpu[seq_ids_for_branches]
         src_indices = tbl_indices.clamp(max=M - 1)
         src_block_ids = parent_tables[
-            n_idx, src_indices.to(torch.int64)
-        ].to(torch.int64)
-        dst_block_ids = ded_tensor  # [N, blocks_per_branch]
+            n_idx, src_indices.to(torch.int64)].to(torch.int64)
+        dst_block_ids = ded_tensor
         copy_mask = valid & (src_block_ids != dst_block_ids)
         if copy_mask.any() and runner.kv_caches is not None:
             src_flat = src_block_ids[copy_mask]
@@ -1411,66 +1855,37 @@ class DisaggDraftWorker:
             for layer_kv in runner.kv_caches:
                 layer_kv[:, dst_flat] = layer_kv[:, src_flat]
 
-        # ----- Step 5: Batched tree decode (K steps) -----
+        # Tree decode (K steps)
         if _profile:
             torch.cuda.synchronize(self.device)
             _tc3 = time.perf_counter()
 
         seq_ids_expanded = seq_ids[entry_batch_ids]
-        all_tokens = torch.zeros(N, K, dtype=torch.int64, device=self.device)
+        all_tokens = torch.zeros(
+            N, K, dtype=torch.int64, device=self.device)
         all_logits = torch.zeros(
-            N, K, self.vocab_size, dtype=self.dtype, device=self.device
-        )
+            N, K, self.vocab_size, dtype=self.dtype, device=self.device)
         current_ids = bonus_candidates.clone()
 
         max_prefix = int(prefix_lens.max().item())
         max_context_hint = max_prefix + K + 1
 
-        # For EAGLE methods, initialize per-branch hidden states from
-        # the target hidden states received in the last SPECULATE command.
-        # Each branch inherits the hidden state of its parent sequence.
-        if self.needs_hidden_states and self._target_hidden_states is not None:
-            branch_hidden_states = self._target_hidden_states[
-                entry_batch_ids
-            ].clone()  # [N, hidden_size]
-        else:
-            branch_hidden_states = None
-
         for depth in range(K):
             positions = prefix_lens + depth
             context_lens = prefix_lens + depth + 1
-
-            if branch_hidden_states is not None:
-                # EAGLE tree decode: pass hidden states and get updated
-                # hidden states for the next depth level.
-                logits, branch_hidden_states = (
-                    runner.eagle_tree_decode_step(
-                        input_ids=current_ids,
-                        positions=positions,
-                        seq_lens=context_lens,
-                        seq_ids_expanded=seq_ids_expanded,
-                        block_tables=branch_block_tables,
-                        hidden_states=branch_hidden_states,
-                        max_seq_len_hint=max_context_hint,
-                    )
-                )
-            else:
-                # Standalone draft model: token-only tree decode.
-                logits = runner.tree_decode_step(
-                    input_ids=current_ids,
-                    positions=positions,
-                    seq_lens=context_lens,
-                    seq_ids_expanded=seq_ids_expanded,
-                    block_tables=branch_block_tables,
-                    max_seq_len_hint=max_context_hint,
-                )
-
+            logits = runner.tree_decode_step(
+                input_ids=current_ids,
+                positions=positions,
+                seq_lens=context_lens,
+                seq_ids_expanded=seq_ids_expanded,
+                block_tables=branch_block_tables,
+                max_seq_len_hint=max_context_hint,
+            )
             all_logits[:, depth] = logits
             next_tokens = logits.argmax(dim=-1)
             all_tokens[:, depth] = next_tokens
             current_ids = next_tokens
 
-        # ----- Step 6: Populate cache -----
         if _profile:
             torch.cuda.synchronize(self.device)
             _tc4 = time.perf_counter()
@@ -1485,9 +1900,7 @@ class DisaggDraftWorker:
             prefix_lens=prefix_lens,
         )
 
-        # Restore _seq_lens to pre-glue values (undo glue's +1).
-        # The glue decode advanced _seq_lens by 1 for each sequence.
-        # We need to restore so the next round's reset is correct.
+        # Restore _seq_lens (undo glue's +1)
         for sid in seq_ids_list:
             if sid in post_glue_lens:
                 runner._seq_lens[sid] = post_glue_lens[sid] - 1
@@ -1495,8 +1908,7 @@ class DisaggDraftWorker:
         if _profile:
             _tc5 = time.perf_counter()
             self._cache_build_count = getattr(
-                self, '_cache_build_count', 0
-            ) + 1
+                self, '_cache_build_count', 0) + 1
             if self._cache_build_count % 100 == 1:
                 logger.info(
                     "Disagg draft CACHE_BUILD [%d] B=%d N=%d "

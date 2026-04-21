@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -33,6 +34,8 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+_DISAGG_DEBUG = os.environ.get("DISAGG_EAGLE_DEBUG", "0") == "1"
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -367,9 +370,30 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
             return hidden_states
         # combine multiple auxiliary hidden states returned by eagle3
 
+        if _DISAGG_DEBUG:
+            input_norm = hidden_states.float().norm().item()
+            logger.info(
+                "[DISAGG_DIAG][CP9] fc input: shape=%s dtype=%s norm=%.6f",
+                hidden_states.shape,
+                hidden_states.dtype,
+                input_norm,
+            )
+
         if self.model.norm_before_fc:
             hidden_states = self.model.input_norm(hidden_states)
-        return self.model.fc(hidden_states)
+
+        output = self.model.fc(hidden_states)
+
+        if _DISAGG_DEBUG:
+            output_norm = output.float().norm().item()
+            logger.info(
+                "[DISAGG_DIAG][CP9] fc output: norm=%.6f "
+                "norm_before_fc=%s",
+                output_norm,
+                self.model.norm_before_fc,
+            )
+
+        return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}

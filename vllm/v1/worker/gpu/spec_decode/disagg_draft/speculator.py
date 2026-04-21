@@ -18,6 +18,7 @@ Unlike Eagle (which runs the draft model on the same GPU), disagg_draft:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -27,6 +28,8 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+_DISAGG_DEBUG = os.environ.get("DISAGG_EAGLE_DEBUG", "0") == "1"
 
 
 class DisaggSpeculatorProxy:
@@ -209,9 +212,34 @@ class DisaggSpeculatorProxy:
 
         if aux_hidden_states is not None and len(aux_hidden_states) > 0:
             combined = torch.cat(list(aux_hidden_states), dim=-1)
-            return combined[last_token_indices]
+            hs = combined[last_token_indices]
+            if _DISAGG_DEBUG:
+                logger.info(
+                    "[DISAGG_DIAG][CP1] path=aux_hidden_states "
+                    "last_token_indices=%s source_shape=%s",
+                    last_token_indices.tolist(), list(combined.shape))
+                for j in range(hs.shape[0]):
+                    logger.info(
+                        "[DISAGG_DIAG][CP1] req=%d norm=%.6f "
+                        "dtype=%s first3=%s",
+                        j, hs[j].float().norm().item(),
+                        hs.dtype, hs[j, :3].tolist())
+            return hs
 
-        return last_hidden_states[last_token_indices]
+        hs = last_hidden_states[last_token_indices]
+        if _DISAGG_DEBUG:
+            logger.info(
+                "[DISAGG_DIAG][CP1] path=last_hidden_states "
+                "last_token_indices=%s source_shape=%s",
+                last_token_indices.tolist(),
+                list(last_hidden_states.shape))
+            for j in range(hs.shape[0]):
+                logger.info(
+                    "[DISAGG_DIAG][CP1] req=%d norm=%.6f "
+                    "dtype=%s first3=%s",
+                    j, hs[j].float().norm().item(),
+                    hs.dtype, hs[j, :3].tolist())
+        return hs
 
     @property
     def is_connected(self) -> bool:

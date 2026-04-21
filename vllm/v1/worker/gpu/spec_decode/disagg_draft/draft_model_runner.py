@@ -23,6 +23,7 @@ Reference: SSD ref impl ssd/engine/model_runner.py
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -34,6 +35,8 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+_DISAGG_DEBUG = os.environ.get("DISAGG_EAGLE_DEBUG", "0") == "1"
 
 
 class DraftModelRunner:
@@ -1908,12 +1911,22 @@ class DraftModelRunner:
         hidden_states: torch.Tensor,
         temperatures: torch.Tensor | None = None,
         seeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        glue_prenorm: torch.Tensor | None = None,
+        glue_logits: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Run K-step autoregressive EAGLE speculation.
 
         Step 0 feeds the target model's hidden states into the EAGLE
         head.  Steps 1..K-1 feed the EAGLE head's own output hidden
         states back as input, forming an autoregressive chain.
+
+        When ``glue_prenorm`` and ``glue_logits`` are provided (from
+        the glue decode pass), step 0 is short-circuited: the first
+        draft token is sampled from ``glue_logits`` and ``glue_prenorm``
+        is used as the starting hidden state for step 1+.  This matches
+        the co-located EAGLE flow where step 0 processes all query
+        tokens via a full forward pass and samples from the last
+        position's logits.
 
         Sampling strategy:
         - T > 0: Gumbel sampling with position-based seeds (correlated
@@ -1932,10 +1945,21 @@ class DraftModelRunner:
                 ``None`` means greedy for all requests.
             seeds: [B] — per-request random seeds for Gumbel noise.
                 Required when any temperature > 0.
+            glue_prenorm: [B, hidden_size] — EAGLE model's prenorm
+                output from glue decode at the recovery position.
+                When provided, step 0 is skipped and this is used
+                as the starting hidden state for step 1.
+            glue_logits: [B, V] — logits from glue decode at the
+                recovery position. When provided, step 0 token is
+                sampled from these instead of running the EAGLE model.
 
         Returns:
             draft_tokens: [B, K] — generated draft token IDs.
             draft_logits: [B, K, V] — logits at each step.
+            draft_prenorms: [B, K, hidden_size] — per-step prenorm
+                outputs from the EAGLE head (self-conditioned hidden
+                states). Used by ``_build_next_cache`` for tree decode.
+                ``None`` for MTP method.
         """
         B = recovery_tokens.shape[0]
         V = self.vocab_size
@@ -1946,6 +1970,15 @@ class DraftModelRunner:
         draft_logits = torch.zeros(
             B, num_steps, V, dtype=self.dtype, device=self.device,
         )
+
+        # Track per-step prenorms for tree decode cache building.
+        hs_dim = hidden_states.shape[-1] if self.method != "mtp" else 0
+        draft_prenorms: torch.Tensor | None = None
+        if self.method != "mtp" and hs_dim > 0:
+            draft_prenorms = torch.zeros(
+                B, num_steps, hs_dim,
+                dtype=self.dtype, device=self.device,
+            )
 
         current_ids = recovery_tokens
         current_pos = positions.clone()
@@ -1964,13 +1997,64 @@ class DraftModelRunner:
                 B, dtype=torch.int64, device=self.device,
             )
 
+        # When glue decode results are available, use them for step 0.
+        # The glue decode already ran the EAGLE model forward pass over
+        # extend + recovery tokens, producing prenorm and logits at the
+        # recovery position.  Using these directly matches the co-located
+        # flow where step 0 processes all query tokens via run_model and
+        # samples from the last position's logits.
+        use_glue_for_step0 = (
+            glue_prenorm is not None
+            and glue_logits is not None
+        )
+        start_step = 0
+
+        if use_glue_for_step0:
+            # Sample step 0 token from glue decode logits.
+            # We still run eagle_forward below (step 0 is NOT skipped
+            # from the loop) to populate the KV cache at this position.
+            # But we use glue logits for sampling and glue prenorm as
+            # the starting hidden state for step 1+.
+            pos0 = positions
+            if use_gumbel:
+                step0_tokens = gumbel_sample(
+                    logits=glue_logits,
+                    expanded_idx_mapping=idx_mapping,
+                    temperature=temperatures,
+                    seed=seeds,
+                    pos=pos0,
+                    apply_temperature=True,
+                )
+            else:
+                step0_tokens = glue_logits.argmax(dim=-1)
+
+            if _DISAGG_DEBUG:
+                top5_vals, top5_ids = torch.topk(glue_logits[0], 5)
+                logger.info(
+                    "[DISAGG_DIAG][CP7] step=0 (glue) "
+                    "input_hs_norm=%.6f "
+                    "output_prenorm_norm=%.6f "
+                    "top5_ids=%s top5_vals=%s "
+                    "sampled_token=%d pos=%d",
+                    hidden_states[0].float().norm().item(),
+                    glue_prenorm[0].float().norm().item(),
+                    top5_ids.tolist(), top5_vals.tolist(),
+                    step0_tokens[0].item(), pos0[0].item(),
+                )
+
         # Pre-compute slot mappings for all K positions to avoid
         # per-step Python overhead.
         seq_ids_long = seq_ids.to(torch.int64)
         all_positions = [positions + step for step in range(num_steps)]
 
-        for step in range(num_steps):
+        for step in range(start_step, num_steps):
             pos = all_positions[step]
+
+            if _DISAGG_DEBUG:
+                logger.info(
+                    "[DISAGG_DIAG][CP7] step=%d input_hs_norm=%.6f",
+                    step, current_hs.float().norm().item(),
+                )
 
             # Compute slot mapping (vectorized, no Python loop)
             logical_blocks = (pos // self.block_size).to(torch.int64)
@@ -2003,6 +2087,24 @@ class DraftModelRunner:
                     current_ids, pos, current_hs, seq_ids,
                 )
 
+            # Store per-step prenorm (self-conditioned hidden state)
+            if draft_prenorms is not None:
+                draft_prenorms[:, step] = current_hs
+
+            # When using glue shortcut for step 0, override the
+            # eagle_forward outputs with glue decode results.
+            # eagle_forward still ran above to populate the KV cache
+            # at this position, but we use glue logits for sampling
+            # and glue prenorm as the hidden state for step 1+.
+            if use_glue_for_step0 and step == 0:
+                current_hs = glue_prenorm
+                if draft_prenorms is not None:
+                    draft_prenorms[:, 0] = glue_prenorm
+                draft_logits[:, 0] = glue_logits
+                draft_tokens[:, 0] = step0_tokens
+                current_ids = step0_tokens
+                continue
+
             # Compute logits and sample
             if hasattr(self.model, "compute_logits"):
                 logits = self.model.compute_logits(last_hs)
@@ -2031,12 +2133,23 @@ class DraftModelRunner:
             draft_tokens[:, step] = next_tokens
             current_ids = next_tokens
 
+            if _DISAGG_DEBUG:
+                top5_vals, top5_ids = torch.topk(logits[0], 5)
+                logger.info(
+                    "[DISAGG_DIAG][CP7] step=%d output_prenorm_norm=%.6f "
+                    "top5_ids=%s top5_vals=%s "
+                    "sampled_token=%d pos=%d",
+                    step, current_hs.float().norm().item(),
+                    top5_ids.tolist(), top5_vals.tolist(),
+                    next_tokens[0].item(), pos[0].item(),
+                )
+
         # Update _seq_lens after all K steps (deferred from eagle_forward)
         final_pos = all_positions[-1]
         for i, sid in enumerate(seq_ids.tolist()):
             self._seq_lens[int(sid)] = int(final_pos[i].item()) + 1
 
-        return draft_tokens, draft_logits
+        return draft_tokens, draft_logits, draft_prenorms
 
     @torch.inference_mode()
     def sequential_speculate(

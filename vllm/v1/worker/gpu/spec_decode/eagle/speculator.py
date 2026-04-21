@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 import torch
@@ -30,6 +31,8 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import EagleCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 logger = init_logger(__name__)
+
+_DISAGG_DEBUG = os.environ.get("DISAGG_EAGLE_DEBUG", "0") == "1"
 
 
 class EagleSpeculator:
@@ -213,6 +216,13 @@ class EagleSpeculator:
             hidden_states = hidden_states[:num_reqs]
             logits = self.model.compute_logits(last_hidden_states)
 
+            if (_DISAGG_DEBUG and num_reqs > 0
+                    and not torch.cuda.is_current_stream_capturing()):
+                logger.info(
+                    "[COLOCATED_DIAG][CP8] step=%d input_hs_norm=%.6f",
+                    step, self.hidden_states[0].float().norm().item(),
+                )
+
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
             draft_tokens = gumbel_sample(
@@ -227,6 +237,19 @@ class EagleSpeculator:
                 else None,
             )
             self.draft_tokens[:num_reqs, step] = draft_tokens
+
+            if (_DISAGG_DEBUG and num_reqs > 0
+                    and not torch.cuda.is_current_stream_capturing()):
+                top5_vals, top5_ids = torch.topk(logits[0], 5)
+                logger.info(
+                    "[COLOCATED_DIAG][CP8] step=%d "
+                    "output_hs_norm=%.6f "
+                    "top5_ids=%s top5_vals=%s "
+                    "sampled_token=%d pos=%d",
+                    step, hidden_states[0].float().norm().item(),
+                    top5_ids.tolist(), top5_vals.tolist(),
+                    draft_tokens[0].item(), pos[0].item(),
+                )
 
             if step < self.num_speculative_steps - 1:
                 # Update the inputs for the next step.
@@ -356,6 +379,18 @@ class EagleSpeculator:
         else:
             _raw_aux = None
             hidden_states = last_hidden_states
+
+        if _DISAGG_DEBUG:
+            _raw_norm = _raw_aux.float().norm().item() if _raw_aux is not None else 0.0
+            logger.info(
+                "[COLOCATED_DIAG][CP8] raw_aux_norm=%.6f "
+                "fc_projected_norm=%.6f "
+                "path=%s",
+                _raw_norm,
+                hidden_states.float().norm().item(),
+                "eagle3_aux" if _raw_aux is not None else "last_hidden_states",
+            )
+
         num_tokens = input_batch.num_tokens_after_padding
         self.hidden_states[:num_tokens] = hidden_states
 
@@ -408,6 +443,22 @@ class EagleSpeculator:
             if self.draft_logits is not None
             else None,
         )
+
+        if _DISAGG_DEBUG and num_reqs > 0:
+            top5_vals, top5_ids = torch.topk(logits[0], 5)
+            # Log the prenorm norm that feeds into step 1+
+            prenorm_at_last = hidden_states[last_token_indices[0]]
+            logger.info(
+                "[COLOCATED_DIAG][CP8] step=0 "
+                "input_hs_norm=%.6f "
+                "prenorm_norm=%.6f "
+                "top5_ids=%s top5_vals=%s "
+                "sampled_token=%d pos=%d",
+                sample_hidden_states[0].float().norm().item(),
+                prenorm_at_last.float().norm().item(),
+                top5_ids.tolist(), top5_vals.tolist(),
+                draft_tokens[0].item(), pos[0].item(),
+            )
 
         if self.num_speculative_steps == 1:
             # Early exit.
@@ -470,36 +521,6 @@ class EagleSpeculator:
                 slot_mappings_updated,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=decode_batch_desc.cg_mode,
-            )
-
-        # Diagnostic: log draft tokens for comparison with disagg
-        if not hasattr(self, '_colocated_log_count'):
-            self._colocated_log_count = 0
-        if self._colocated_log_count < 15:
-            self._colocated_log_count += 1
-            from vllm.logger import init_logger as _il
-            _logger = _il(__name__)
-            # Log hidden states for comparison with disagg
-            _last_idx = int(last_token_indices[0].item()) if num_reqs > 0 else 0
-            _hs_at_last = hidden_states[_last_idx] if hidden_states is not None else None
-            _hs_norm = _hs_at_last.float().norm().item() if _hs_at_last is not None else 0
-            _hs_first3 = _hs_at_last[:3].tolist() if _hs_at_last is not None else []
-            _raw_at_last = _raw_aux[_last_idx] if _raw_aux is not None else None
-            _raw_norm = _raw_at_last.float().norm().item() if _raw_at_last is not None else 0
-            _raw_first3 = _raw_at_last[:3].tolist() if _raw_at_last is not None else []
-            _logger.info(
-                "COLOCATED EAGLE: draft=%s, ns=%s, bonus=%s, "
-                "raw_hs_norm=%.4f, raw_first3=%s, "
-                "fc_hs_norm=%.4f, fc_first3=%s, "
-                "last_idx=%d, num_tokens=%d",
-                self.draft_tokens[0, :self.num_speculative_steps].tolist()
-                if num_reqs > 0 else "empty",
-                num_sampled[:num_reqs].tolist(),
-                last_sampled[input_batch.idx_mapping[:num_reqs]].squeeze(-1).tolist(),
-                _raw_norm, _raw_first3,
-                _hs_norm, _hs_first3,
-                _last_idx,
-                input_batch.num_tokens_after_padding,
             )
 
         return self.draft_tokens[:num_reqs]
