@@ -218,6 +218,26 @@ class SpeculativeConfig:
     the draft model generates tokens sequentially on cache miss. When False,
     random tokens are used for misses."""
 
+    # N:M disaggregated speculation configuration
+    disagg_draft_addresses: list[str] | None = None
+    """List of Draft_Server addresses (host:port) for N:M disaggregated spec
+    decode. When set, replaces the current 1:1 disagg mode."""
+
+    disagg_draft_transport: str = "zmq+nccl"
+    """Transport type: 'zmq+nccl' (same interconnect) or 'zmq+tcp'
+    (cross-node)."""
+
+    disagg_draft_routing_policy: str = "round_robin"
+    """Load balancing policy: 'round_robin', 'least_loaded', or 'sticky'."""
+
+    disagg_draft_timeout_ms: int = 5000
+    """Timeout in ms for waiting on Speculation_Response before falling
+    back."""
+
+    disagg_draft_latency_warn_ms: float = 500.0
+    """Log a warning when draft round-trip latency exceeds this threshold
+    (in milliseconds)."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -908,7 +928,12 @@ class SpeculativeConfig:
         return self.method == "dflash"
 
     def use_disagg(self) -> bool:
-        return self.disagg
+        return self.disagg or self.disagg_draft_addresses is not None
+
+    @property
+    def uses_nm_disagg(self) -> bool:
+        """True when N:M disaggregated speculation is configured."""
+        return self.disagg_draft_addresses is not None
 
     @property
     def disagg_needs_hidden_states(self) -> bool:
@@ -934,6 +959,12 @@ class SpeculativeConfig:
             else self.draft_model_config.model
         )
         num_spec_tokens = self.num_speculative_tokens
+        if self.uses_nm_disagg:
+            return (
+                f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=}, "
+                f"disagg_draft_addresses={self.disagg_draft_addresses}, "
+                f"disagg_draft_transport={self.disagg_draft_transport!r})"
+            )
         if self.disagg:
             return (
                 f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=}, "

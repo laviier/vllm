@@ -540,3 +540,32 @@ def test_ir_op_priority():
             ir_op_priority=ir_op_priority,
             kernel_config=KernelConfig(ir_op_priority=ir_op_priority),
         ).create_engine_config()
+
+
+def test_draft_server_cli_defaults():
+    """--draft-server defaults to False, --draft-server-port defaults to 50051."""
+    parser = FlexibleArgumentParser()
+    parser = EngineArgs.add_cli_args(parser)
+    args = parser.parse_args(["--model", "dummy-model"])
+    assert args.draft_server is False
+    assert args.draft_server_port == 50051
+
+
+def test_draft_server_cli_flag_set():
+    """--draft-server flag sets draft_server to True."""
+    parser = FlexibleArgumentParser()
+    parser = EngineArgs.add_cli_args(parser)
+    args = parser.parse_args([
+        "--model", "dummy-model",
+        "--draft-server",
+        "--draft-server-port", "60000",
+    ])
+    assert args.draft_server is True
+    assert args.draft_server_port == 60000
+
+
+def test_draft_server_engine_args_fields():
+    """EngineArgs has draft_server and draft_server_port with correct defaults."""
+    ea = EngineArgs(model="dummy")
+    assert ea.draft_server is False
+    assert ea.draft_server_port == 50051

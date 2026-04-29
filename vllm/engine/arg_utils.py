@@ -641,6 +641,9 @@ class EngineArgs:
         "weight_transfer_config",
     )
 
+    draft_server: bool = False
+    draft_server_port: int = 50051
+
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
 
@@ -1384,6 +1387,22 @@ class EngineArgs:
             type=int,
             default=0,
             help="Shutdown timeout in seconds. 0 = abort, >0 = wait.",
+        )
+
+        parser.add_argument(
+            "--draft-server",
+            action="store_true",
+            default=False,
+            help="Launch as a standalone Draft Server for disaggregated "
+            "speculative decoding instead of serving the OpenAI API.",
+        )
+
+        parser.add_argument(
+            "--draft-server-port",
+            type=int,
+            default=50051,
+            help="Port for the Draft Server ZMQ ROUTER socket. "
+            "Only used when --draft-server is set. Default: 50051.",
         )
 
         parser.add_argument(

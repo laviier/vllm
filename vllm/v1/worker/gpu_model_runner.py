@@ -4455,7 +4455,42 @@ class GPUModelRunner(
                 self._disagg_speculator = DisaggSpeculatorProxy(
                     self.vllm_config, self.device
                 )
-                self._disagg_speculator._lazy_connect()
+                spec_config = self.vllm_config.speculative_config
+                if spec_config is not None and spec_config.uses_nm_disagg:
+                    # N:M mode: create DraftRouter with connectors
+                    from vllm.v1.spec_decode.draft_connector import (
+                        ZmqNcclDraftConnector,
+                    )
+                    from vllm.v1.spec_decode.draft_router import DraftRouter
+                    import uuid
+
+                    addresses = spec_config.disagg_draft_addresses
+                    verify_server_id = f"vs-{uuid.uuid4().hex[:8]}"
+                    timeout_ms = spec_config.disagg_draft_timeout_ms
+                    connectors = []
+                    for addr in addresses:
+                        connector = ZmqNcclDraftConnector(
+                            address=addr,
+                            verify_server_id=verify_server_id,
+                            process_group=None,
+                            peer_rank=0,
+                            device=self.device,
+                            timeout_ms=timeout_ms,
+                        )
+                        connectors.append(connector)
+                    router = DraftRouter(
+                        connectors=connectors,
+                        draft_server_addresses=addresses,
+                        policy=spec_config.disagg_draft_routing_policy,
+                    )
+                    self._disagg_speculator.set_router(router)
+                    logger.info(
+                        "Disagg N:M mode: DraftRouter connected to %s",
+                        addresses,
+                    )
+                else:
+                    # 1:1 mode: use existing NCCL lazy connect
+                    self._disagg_speculator._lazy_connect()
             else:
                 self._disagg_speculator = None
 
@@ -4465,8 +4500,78 @@ class GPUModelRunner(
             self._disagg_next_seq_id: int = 0
 
         if self._disagg_speculator is not None and self._disagg_speculator.is_connected:
+            # N:M mode: delegate to the proxy's propose()
+            if self._disagg_speculator.router is not None:
+                try:
+                    # Cache prompt tokens for new requests so the speculator's
+                    # _prefill_new_requests_nm can send them to the draft server.
+                    for i, rid in enumerate(self.input_batch.req_ids):
+                        if rid not in self._disagg_speculator._disagg_prefilled_reqs:
+                            req = self.requests.get(rid)
+                            if req is not None and rid not in self._disagg_speculator._pending_prompt_tokens:
+                                n_prompt = req.num_prompt_tokens
+                                req_idx = self.input_batch.req_id_to_index[rid]
+                                prompt_ids = self.input_batch.token_ids_cpu[
+                                    req_idx, :n_prompt
+                                ].tolist()
+                                self._disagg_speculator.cache_new_request_tokens(
+                                    rid, prompt_ids
+                                )
+
+                    # Compute num_sampled (number of tokens sampled per req)
+                    # and last_sampled (all sampled tokens) from
+                    # valid_sampled_token_ids.
+                    # valid_sampled_token_ids[i] = [bonus_tok, draft_0, ...]
+                    # num_sampled[i] = len(valid_sampled_token_ids[i])
+                    # k_accepted[i] = num_sampled[i] - 1
+                    # bonus_token[i] = valid_sampled_token_ids[i][-1]
+                    max_sampled = max(
+                        len(ids) for ids in valid_sampled_token_ids
+                    ) if valid_sampled_token_ids else 1
+                    # Pad to uniform length for tensor construction
+                    padded = [
+                        ids + [0] * (max_sampled - len(ids))
+                        for ids in valid_sampled_token_ids
+                    ]
+                    num_sampled_t = torch.tensor(
+                        [len(ids) for ids in valid_sampled_token_ids],
+                        dtype=torch.int64, device=self.device,
+                    )
+                    last_sampled_t = torch.tensor(
+                        padded, dtype=torch.int64, device=self.device,
+                    ).unsqueeze(-1)  # [num_reqs, max_sampled, 1]
+
+                    draft_tensor = self._disagg_speculator.propose(
+                        input_batch=self.input_batch,
+                        attn_metadata={},
+                        slot_mappings={},
+                        last_hidden_states=hidden_states,
+                        aux_hidden_states=aux_hidden_states,
+                        num_sampled=num_sampled_t,
+                        num_rejected=torch.zeros(num_reqs, dtype=torch.int64,
+                                                 device=self.device),
+                        last_sampled=last_sampled_t,
+                        next_prefill_tokens=torch.tensor([]),
+                        temperature=torch.ones(num_reqs, device=self.device),
+                        seeds=torch.zeros(num_reqs, dtype=torch.int64,
+                                          device=self.device),
+                    )
+                    self._draft_token_ids = draft_tensor.tolist()
+                except Exception as e:
+                    logger.warning(
+                        "Disagg N:M propose failed: %s. Random fallback.", e,
+                    )
+                    self._draft_token_ids = [
+                        [int(torch.randint(0, vocab_size, (1,)).item())
+                         for _ in range(self.num_spec_tokens)]
+                        for _ in range(num_reqs)
+                    ]
+            else:
+                pass  # fall through to 1:1 code below
             try:
-                # Clean up finished requests
+                # Skip 1:1 inline code when N:M router is active
+                if self._disagg_speculator.router is not None:
+                    raise Exception("_nm_handled_")
                 active_rids = set(self.input_batch.req_ids)
                 stale = self._disagg_prefilled_reqs - active_rids
                 if stale:
@@ -4653,15 +4758,18 @@ class GPUModelRunner(
                 )
                 self._draft_token_ids = draft_toks.tolist()
             except Exception as e:
-                logger.warning(
-                    "Disagg draft NCCL draft failed: %s. Random fallback.",
-                    e, exc_info=True,
-                )
-                self._draft_token_ids = [
-                    [int(torch.randint(0, vocab_size, (1,)).item())
-                     for _ in range(self.num_spec_tokens)]
-                    for _ in range(num_reqs)
-                ]
+                if str(e) == "_nm_handled_":
+                    pass  # N:M mode already set _draft_token_ids above
+                else:
+                    logger.warning(
+                        "Disagg draft NCCL draft failed: %s. Random fallback.",
+                        e, exc_info=True,
+                    )
+                    self._draft_token_ids = [
+                        [int(torch.randint(0, vocab_size, (1,)).item())
+                         for _ in range(self.num_spec_tokens)]
+                        for _ in range(num_reqs)
+                    ]
         else:
             # Non-rank-0 TP workers: initialize with zeros; real tokens
             # will arrive via the TP broadcast below.

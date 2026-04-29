@@ -458,6 +458,16 @@ def maybe_launch_disagg_draft_worker(
     if spec_config is None or not spec_config.use_disagg():
         return None
 
+    # N:M mode uses standalone DraftServer processes — do NOT spawn
+    # a co-located draft worker.
+    if spec_config.uses_nm_disagg:
+        logger.info(
+            "Disagg draft: N:M mode active (disagg_draft_addresses=%s). "
+            "Skipping co-located draft worker spawn.",
+            spec_config.disagg_draft_addresses,
+        )
+        return None
+
     # Determine draft GPU device
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     draft_device_id = tp_size  # Next GPU after TP group

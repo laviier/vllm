@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Entrypoint for launching a standalone Draft Server.
+
+Usage::
+
+    vllm serve <draft_model> --draft-server --draft-server-port 50051 \
+        --speculative-config '{"num_speculative_tokens": 5, "method": "eagle"}'
+
+The module parses CLI args, builds a ``VllmConfig``, and starts the
+``DraftServer`` from ``vllm.v1.spec_decode.draft_server``.
+"""
+
+import argparse
+import asyncio
+import signal
+
+import uvloop
+
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.logger import init_logger
+from vllm.usage.usage_lib import UsageContext
+
+logger = init_logger(__name__)
+
+
+def _init_distributed_for_draft_server(vllm_config) -> None:
+    """Initialize torch.distributed and vLLM parallel state for TP=1.
+
+    Must be called inside a ``set_current_vllm_config`` context so that
+    ``initialize_model_parallel`` can read the current config.
+    """
+    from vllm.distributed.parallel_state import (
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="tcp://127.0.0.1:29599",
+            backend="gloo",
+        )
+        ensure_model_parallel_initialized(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+
+    logger.info("Draft server distributed environment initialized (TP=1).")
+
+
+def run_draft_server(args: argparse.Namespace) -> None:
+    """Parse engine args, create VllmConfig, and run the DraftServer."""
+    if hasattr(args, "model_tag") and args.model_tag is not None:
+        args.model = args.model_tag
+
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+
+    if engine_args.speculative_config is not None:
+        if "model" not in engine_args.speculative_config:
+            engine_args.speculative_config["model"] = engine_args.model
+
+    vllm_config = engine_args.create_engine_config(
+        usage_context=UsageContext.OPENAI_API_SERVER,
+    )
+
+    if vllm_config.speculative_config is None:
+        raise ValueError(
+            "--draft-server requires --speculative-config to be set "
+            "with at least the draft model and num_speculative_tokens."
+        )
+
+    port = getattr(args, "draft_server_port", 50051)
+    bind_address = f"tcp://*:{port}"
+
+    logger.info("Starting Draft Server on %s", bind_address)
+
+    # Everything that touches model parallel state or model loading
+    # must run inside the vllm config context.
+    from vllm.config.vllm import set_current_vllm_config
+
+    with set_current_vllm_config(vllm_config):
+        _init_distributed_for_draft_server(vllm_config)
+
+        from vllm.v1.spec_decode.draft_server import DraftServer
+
+        server = DraftServer(vllm_config, bind_address=bind_address)
+
+        logger.info("Loading draft model...")
+        server.load_model()
+        logger.info("Draft model loaded, starting server loop.")
+
+    serve_task: asyncio.Task | None = None
+
+    def _signal_handler(signum: int, frame: object) -> None:
+        logger.info("Received signal %d, shutting down Draft Server…", signum)
+        if serve_task is not None and not serve_task.done():
+            # Schedule cancellation from within the event loop thread
+            serve_task.get_loop().call_soon_threadsafe(serve_task.cancel)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    async def _run() -> None:
+        nonlocal serve_task
+        serve_task = asyncio.create_task(server.serve())
+        try:
+            await serve_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await server.shutdown()
+
+    uvloop.run(_run())
