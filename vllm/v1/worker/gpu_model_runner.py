@@ -4482,6 +4482,7 @@ class GPUModelRunner(
                         connectors=connectors,
                         draft_server_addresses=addresses,
                         policy=spec_config.disagg_draft_routing_policy,
+                        verify_server_id=verify_server_id,
                     )
                     self._disagg_speculator.set_router(router)
                     logger.info(

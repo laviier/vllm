@@ -87,6 +87,27 @@ def run_draft_server(args: argparse.Namespace) -> None:
         torch.cuda.set_device(device_id)
         logger.info("Draft server using GPU %d", device_id)
 
+    # Expose Prometheus metrics over HTTP so operators can scrape
+    # cache hit rate, batch size, generation latency, etc. Uses the
+    # ZMQ port + 1000 so 50051 → 51051, 50052 → 51052. Override with
+    # DRAFT_METRICS_PORT env var if that collides.
+    import os
+    import prometheus_client
+    metrics_port = int(
+        os.environ.get("DRAFT_METRICS_PORT", port + 1000)
+    )
+    try:
+        prometheus_client.start_http_server(metrics_port)
+        logger.info(
+            "Draft Server metrics on http://0.0.0.0:%d/metrics",
+            metrics_port,
+        )
+    except OSError as e:
+        logger.warning(
+            "Could not start metrics HTTP server on port %d: %s",
+            metrics_port, e,
+        )
+
     logger.info("Starting Draft Server on %s", bind_address)
 
     # Everything that touches model parallel state or model loading

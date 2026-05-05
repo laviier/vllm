@@ -3,18 +3,32 @@
 """N:M Draft Router for disaggregated speculative decoding.
 
 The ``DraftRouter`` assigns incoming requests to available Draft_Servers
-using a configurable load-balancing policy (currently round-robin).
-Each Verify_Server maintains one ``DraftRouter`` that tracks which
-``DraftConnector`` is responsible for each active request.
+using a configurable load-balancing policy. Each Verify_Server
+maintains one ``DraftRouter`` that tracks which ``DraftConnector`` is
+responsible for each active request.
+
+Supported policies:
+
+- ``"round_robin"`` — plain round-robin across all available servers.
+- ``"affinity"`` — each Verify_Server has a stable *primary* draft,
+  computed as ``hash(verify_server_id) % num_drafts``. New requests
+  pin to the primary when it is available, falling back to a
+  round-robin peer otherwise. This avoids cross-VS contention on a
+  single draft when ``V ≤ D`` (e.g. 2V+2D → VS-A→D0, VS-B→D1), while
+  still converging to even load when ``V > D`` via the fallback path.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from vllm.v1.spec_decode.draft_connector import DraftConnector
 
 logger = logging.getLogger(__name__)
+
+
+_SUPPORTED_POLICIES = ("round_robin", "affinity")
 
 
 class DraftRouter:
@@ -27,8 +41,10 @@ class DraftRouter:
             proxy.
         draft_server_addresses: Addresses of the Draft_Servers, kept
             for logging / diagnostics.  Order must match *connectors*.
-        policy: Load-balancing policy.  Currently only ``"round_robin"``
-            is supported.
+        policy: Load-balancing policy. One of ``_SUPPORTED_POLICIES``.
+        verify_server_id: Stable identifier used to compute the
+            affinity primary draft. Required when ``policy="affinity"``;
+            ignored otherwise.
     """
 
     def __init__(
@@ -36,13 +52,14 @@ class DraftRouter:
         connectors: list[DraftConnector],
         draft_server_addresses: list[str] | None = None,
         policy: str = "round_robin",
+        verify_server_id: str | None = None,
     ) -> None:
         if not connectors:
             raise ValueError("DraftRouter requires at least one connector")
-        if policy != "round_robin":
+        if policy not in _SUPPORTED_POLICIES:
             raise ValueError(
                 f"Unsupported routing policy: {policy!r}. "
-                "Only 'round_robin' is currently supported."
+                f"Supported: {_SUPPORTED_POLICIES}"
             )
 
         self.connectors = connectors
@@ -59,6 +76,29 @@ class DraftRouter:
 
         # Round-robin counter
         self._next_index: int = 0
+
+        # Primary draft for affinity routing. Stable across restarts
+        # when verify_server_id is stable (SHA1 of the id mod N).
+        self._primary_idx: int | None = None
+        if policy == "affinity":
+            if not verify_server_id:
+                raise ValueError(
+                    "DraftRouter policy='affinity' requires "
+                    "verify_server_id to pick a primary"
+                )
+            digest = hashlib.sha1(
+                verify_server_id.encode("utf-8")
+            ).digest()
+            self._primary_idx = int.from_bytes(digest[:4], "big") % len(
+                connectors
+            )
+            logger.info(
+                "DraftRouter affinity: VS %s pinned primary=server-%d "
+                "(of %d)",
+                verify_server_id,
+                self._primary_idx,
+                len(connectors),
+            )
 
         logger.info(
             "DraftRouter initialised with %d server(s), policy=%s",
@@ -181,10 +221,21 @@ class DraftRouter:
         )
 
     def _pick_next_available(self) -> int:
-        """Return the next available server index (round-robin).
+        """Return the next available server index.
+
+        ``affinity`` policy prefers the primary draft for this VS; when
+        it is unavailable, falls through to round-robin over the
+        remaining servers. ``round_robin`` rotates through all.
 
         Raises ``RuntimeError`` when no servers are available.
         """
+        if (
+            self.policy == "affinity"
+            and self._primary_idx is not None
+            and self._available[self._primary_idx]
+        ):
+            return self._primary_idx
+
         n = len(self.connectors)
         for _ in range(n):
             idx = self._next_index % n

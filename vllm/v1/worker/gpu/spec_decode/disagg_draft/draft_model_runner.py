@@ -105,9 +105,14 @@ class DraftModelRunner:
         self._next_free_block = 0
         self._free_list: list[int] = []  # recycled block IDs
         self._block_tables: dict[int, list[int]] = {}
-        # Dedicated blocks reserved by the last _build_next_cache call.
-        # Recycled at the start of the next _build_next_cache.
-        self._dedicated_blocks: list[int] = []
+        # Dedicated blocks reserved by the last _build_next_cache call,
+        # partitioned per verify server. Each VS's entry is recycled
+        # only at the start of *that VS's* next cache build, so
+        # preserved cache entries from other VSes are not invalidated
+        # when a peer VS rebuilds its cache. Under N:M with several
+        # VSes sharing a draft this is what keeps cross-VS cache
+        # entries pointing at valid KV data.
+        self._dedicated_blocks_by_vs: dict[str, list[int]] = {}
         # Track sequence lengths for decode positioning
         self._seq_lens: dict[int, int] = {}
 
@@ -1281,16 +1286,26 @@ class DraftModelRunner:
         if owned_blocks:
             self._free_list.extend(owned_blocks)
 
-    def recycle_dedicated_blocks(self) -> None:
-        """Recycle dedicated tree-decode blocks from the previous round.
+    def recycle_dedicated_blocks(
+        self, vs_id: str = "__default__"
+    ) -> None:
+        """Recycle dedicated tree-decode blocks for one verify server.
 
-        Always adds dedicated blocks to the free list and attempts
-        compaction. Previous approach of rewinding the bump pointer
-        failed when blocks were swapped out by cache hits.
+        Only that VS's blocks are returned to the free list; other
+        VSes' dedicated blocks remain reserved so their preserved
+        SpeculationCache entries continue pointing at valid KV data.
         """
-        if self._dedicated_blocks:
-            self._free_list.extend(self._dedicated_blocks)
-            self._dedicated_blocks = []
+        blocks = self._dedicated_blocks_by_vs.pop(vs_id, None)
+        if blocks:
+            self._free_list.extend(blocks)
+        self._try_compact()
+
+    def recycle_all_dedicated_blocks(self) -> None:
+        """Recycle every VS's dedicated blocks. Used during shutdown /
+        testing; avoid calling from normal per-round code paths."""
+        for blocks in self._dedicated_blocks_by_vs.values():
+            self._free_list.extend(blocks)
+        self._dedicated_blocks_by_vs.clear()
         self._try_compact()
 
     def _try_compact(self) -> None:
@@ -1310,28 +1325,37 @@ class DraftModelRunner:
             free_set.discard(self._next_free_block)
         self._free_list = list(free_set)
 
-    def reserve_dedicated_blocks(self, block_ids: list[int]) -> None:
+    def reserve_dedicated_blocks(
+        self, block_ids: list[int], vs_id: str = "__default__"
+    ) -> None:
         """Track dedicated blocks allocated for tree decode.
 
-        These blocks are reserved until the next _build_next_cache call,
-        at which point they're recycled via recycle_dedicated_blocks().
-        Blocks that get swapped into main are removed from this list
-        by exclude_from_dedicated().
+        Stored under the VS that owns them so only that VS's next
+        cache build recycles them. Replaces any prior block list for
+        this VS (prior blocks must have already been recycled by the
+        caller's preceding recycle_dedicated_blocks(vs_id) call).
         """
-        self._dedicated_blocks = block_ids
+        self._dedicated_blocks_by_vs[vs_id] = block_ids
 
-    def exclude_from_dedicated(self, owned_blocks: list[int]) -> None:
-        """Remove swapped blocks from the dedicated list.
+    def exclude_from_dedicated(
+        self, owned_blocks: list[int], vs_id: str = "__default__"
+    ) -> None:
+        """Remove swapped blocks from one VS's dedicated list.
 
-        When blocks are swapped into main block tables, they become
-        'owned' by the sequence and are tracked in SeqSwapRecord.
-        Remove them from _dedicated_blocks to prevent double-free.
+        When a cache-hit branch's blocks are swapped into that VS's
+        main block table they become 'owned' by the sequence. Remove
+        them from the dedicated list so the next
+        recycle_dedicated_blocks(vs_id) doesn't double-free them.
         """
-        if owned_blocks and self._dedicated_blocks:
-            owned_set = set(owned_blocks)
-            self._dedicated_blocks = [
-                b for b in self._dedicated_blocks if b not in owned_set
-            ]
+        if not owned_blocks:
+            return
+        blocks = self._dedicated_blocks_by_vs.get(vs_id)
+        if not blocks:
+            return
+        owned_set = set(owned_blocks)
+        self._dedicated_blocks_by_vs[vs_id] = [
+            b for b in blocks if b not in owned_set
+        ]
 
     def _get_block_table_tensor(
         self, seq_ids: torch.Tensor | list[int]

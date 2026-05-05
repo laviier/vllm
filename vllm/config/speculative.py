@@ -228,7 +228,15 @@ class SpeculativeConfig:
     (cross-node)."""
 
     disagg_draft_routing_policy: str = "round_robin"
-    """Load balancing policy: 'round_robin', 'least_loaded', or 'sticky'."""
+    """Routing policy for the N:M draft router.
+    'round_robin' (default) spreads requests across all listed drafts
+    uniformly — use this when each verify server should use only the
+    drafts it was configured with (list one draft per VS in
+    disagg_draft_addresses for pinning).
+    'affinity' pins each VS to a primary draft via hash(vs_id) mod
+    num_drafts, falling back to round-robin when the primary is down;
+    use this when every VS lists every draft for failover and you
+    want steady-state pinning under normal operation."""
 
     disagg_draft_timeout_ms: int = 5000
     """Timeout in ms for waiting on Speculation_Response before falling

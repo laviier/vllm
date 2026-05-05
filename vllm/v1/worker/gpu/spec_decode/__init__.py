@@ -59,6 +59,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
                 connectors=connectors,
                 draft_server_addresses=addresses,
                 policy=speculative_config.disagg_draft_routing_policy,
+                verify_server_id=verify_server_id,
             )
             proxy.set_router(router)
 

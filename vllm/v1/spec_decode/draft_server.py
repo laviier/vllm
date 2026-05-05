@@ -300,6 +300,10 @@ class DraftServer:
         max_batch_size = self._max_batch_size
 
         # --- Initialize SpeculationCache ---
+        # max_verify_servers sizes the per-VS partitions so concurrent
+        # VSes don't evict each other's entries. 8 covers typical N:M
+        # deployments with headroom; cost is a proportionally larger
+        # lazy logits buffer at steady state.
         self.cache = SpeculationCache(
             max_batch_size=max_batch_size,
             num_speculative_tokens=self.K,
@@ -307,9 +311,16 @@ class DraftServer:
             vocab_size=self.vocab_size,
             device=self.device,
             dtype=self.dtype,
+            max_verify_servers=8,
         )
 
         # --- Initialize OutcomePredictor ---
+        # The geometric allocation (SSD paper Theorem 12) spends the
+        # same total_fan_out budget non-uniformly across the K+1
+        # acceptance positions, giving more candidates to the
+        # positions most likely to be the actual acceptance point.
+        # This raises cache hit rate without changing cache-build cost
+        # (which scales with total branches, not shape).
         total_fan_out = self.fan_out * (self.K + 1)
         self.outcome_predictor = OutcomePredictor(
             num_speculative_tokens=self.K,
@@ -318,8 +329,6 @@ class DraftServer:
             power_law_exponent=1.5,
             device=self.device,
         )
-        self.outcome_predictor.fan_out_list = [self.fan_out] * (self.K + 1)
-        self.outcome_predictor.max_fan_out = self.fan_out
 
         # --- Initialize SaguaroSampler ---
         self.saguaro_sampler = SaguaroSampler(
@@ -775,6 +784,14 @@ class DraftServer:
             # Increment eviction counter.
             self.metrics.draft_eviction_count.inc(len(keys))
 
+            # Release this VS's partitioned resources so its dedicated
+            # blocks can be reused by peer VSes and its cache slots
+            # are freed.
+            if runner is not None:
+                runner.recycle_dedicated_blocks(vs_id)
+            if self.cache is not None:
+                self.cache.reset_vs(vs_id)
+
             # Remove the verify server from tracking.
             self._verify_servers.pop(vs_id, None)
             self._verify_server_last_seen.pop(vs_id, None)
@@ -955,6 +972,7 @@ class DraftServer:
         self,
         batch_size: int,
         seq_ids: torch.Tensor,
+        vs_id: str,
     ) -> None:
         """Background wrapper around ``_build_next_cache``.
 
@@ -964,13 +982,16 @@ class DraftServer:
         and command decode for the next message overlap with this GPU
         work. Any subsequent handler awaits this task before mutating
         runner/cache state.
+
+        ``vs_id`` scopes cache-reset and dedicated-block recycling so
+        peer VSes' preserved cache entries survive this build.
         """
         runner = self.draft_model_runner
         if runner is None:
             return
         if not self.needs_hidden_states:
             saved = dict(runner._seq_lens)
-        self._build_next_cache(batch_size, seq_ids)
+        self._build_next_cache(batch_size, seq_ids, vs_id)
         if not self.needs_hidden_states:
             runner._seq_lens = saved
 
@@ -1037,7 +1058,9 @@ class DraftServer:
                     _seq_ids = self._last_spec_seq_ids
                     if _seq_ids is not None:
                         self._inflight_cache_build = asyncio.create_task(
-                            self._run_cache_build(B, _seq_ids)
+                            self._run_cache_build(
+                                B, _seq_ids, verify_server_id
+                            )
                         )
         except Exception:
             logger.exception(
@@ -1267,8 +1290,14 @@ class DraftServer:
                         prefix_lens=hit_prefix_lens,
                         K=self.K,
                     )
+                    # The hit entries' dedicated blocks were reserved
+                    # under THIS VS (cache entries for this round's
+                    # seq_ids can only come from this VS's partition
+                    # because internal seq_ids are globally unique).
                     for blocks in owned.values():
-                        runner.exclude_from_dedicated(blocks)
+                        runner.exclude_from_dedicated(
+                            blocks, verify_server_id
+                        )
                     if displaced:
                         runner._free_list.extend(displaced)
 
@@ -1768,15 +1797,19 @@ class DraftServer:
         self,
         batch_size: int,
         seq_ids: torch.Tensor,
+        vs_id: str,
     ) -> None:
         """Pre-compute speculation cache for the NEXT round.
 
-        Delegates to the existing ``SpeculationCache`` and
-        ``DraftModelRunner`` tree decode logic, matching the
-        ``DisaggDraftWorker._build_next_cache`` flow.
+        Scoped to a single verify server: only ``vs_id``'s partition
+        of the SpeculationCache is reset, and only ``vs_id``'s
+        dedicated blocks are recycled inside
+        ``_build_standalone_cache`` / ``_build_eagle_cache``. Peer
+        VSes' preserved entries and their dedicated-block pools are
+        untouched.
         """
         if self.cache is not None:
-            self.cache.reset()
+            self.cache.reset_vs(vs_id)
 
         runner = self.draft_model_runner
         if runner is None or not runner._model_loaded:
@@ -1789,14 +1822,38 @@ class DraftServer:
 
         B = batch_size
         K = self.K
-        F = self.fan_out
+
+        # Geometric fan-out: consult the OutcomePredictor for the
+        # per-position candidate counts computed by
+        # compute_geometric_fanout(). fan_out_list is a list of length
+        # K+1 summing to total_fan_out, with more budget on the
+        # earlier (more likely) acceptance positions.
+        predictor = self.outcome_predictor
+        fan_out_list = list(predictor.fan_out_list)
+        entries_per_seq = sum(fan_out_list)
 
         max_branches = 504
-        if B * (K + 1) * F > max_branches:
-            F = max(1, max_branches // (B * (K + 1)))
-        N = B * (K + 1) * F
+        if B * entries_per_seq > max_branches:
+            # Scale the whole allocation down proportionally, preserving
+            # the geometric shape rather than flattening to uniform.
+            scale = max_branches / (B * entries_per_seq)
+            shrunk = [max(1, int(f * scale)) for f in fan_out_list]
+            # Re-normalize deficit/overflow onto the largest buckets so
+            # the final total fits under max_branches.
+            while B * sum(shrunk) > max_branches:
+                max_idx = max(range(len(shrunk)), key=lambda i: shrunk[i])
+                if shrunk[max_idx] <= 1:
+                    break
+                shrunk[max_idx] -= 1
+            fan_out_list = shrunk
+            entries_per_seq = sum(fan_out_list)
+        N = B * entries_per_seq
         if N > max_branches:
             return
+
+        # Max per-position fan-out is what the top-k kernel needs to
+        # emit before we slice down to each position's target count.
+        max_fan_out = max(fan_out_list) if fan_out_list else 0
 
         draft_tokens = self._last_draft_tokens
         draft_logits = self._last_draft_logits
@@ -1806,24 +1863,30 @@ class DraftServer:
 
         if self.needs_hidden_states:
             self._build_eagle_cache(
-                B, K, F, N, seq_ids, seq_ids_list, runner,
-                draft_tokens, draft_logits, rec_tokens,
+                B, K, fan_out_list, max_fan_out, N,
+                seq_ids, seq_ids_list, runner,
+                draft_tokens, draft_logits, rec_tokens, vs_id,
             )
         else:
             self._build_standalone_cache(
-                B, K, F, N, seq_ids, seq_ids_list, runner,
-                draft_tokens, draft_logits, rec_tokens,
+                B, K, fan_out_list, max_fan_out, N,
+                seq_ids, seq_ids_list, runner,
+                draft_tokens, draft_logits, rec_tokens, vs_id,
             )
 
     def _build_eagle_cache(
         self,
-        B: int, K: int, F: int, N: int,
+        B: int, K: int,
+        fan_out_list: list[int],
+        max_fan_out: int,
+        N: int,
         seq_ids: torch.Tensor,
         seq_ids_list: list[int],
         runner: Any,
         draft_tokens: torch.Tensor,
         draft_logits: torch.Tensor,
         rec_tokens: torch.Tensor,
+        vs_id: str,
     ) -> None:
         """Build speculation cache for EAGLE methods.
 
@@ -1963,7 +2026,10 @@ class DraftServer:
             glue_logits_flat = glue_logits_flat[:, : self.vocab_size]
             outcome_logits = glue_logits_flat.view(B, Kp1, -1)
 
-        # Step 2: Fork bonus candidates
+        # Step 2: Fork bonus candidates using the geometric fan-out
+        # allocation. Top-max_fan_out is computed across all K+1
+        # positions; for each position k we slice down to
+        # fan_out_list[k] candidates. See OutcomePredictor.
         outcome_tokens = torch.cat(
             [rec_tokens.unsqueeze(1), draft_tokens], dim=1
         )
@@ -1973,25 +2039,54 @@ class DraftServer:
             index=outcome_tokens[:, 1:].unsqueeze(2),
             value=float("-inf"),
         )
-        _, topk_indices = torch.topk(masked_logits, F, dim=-1)
+        _, topk_indices = torch.topk(
+            masked_logits, max_fan_out, dim=-1
+        )  # [B, Kp1, max_F]
 
-        batch_ids_grid = (
-            torch.arange(B, device=self.device)
-            .view(B, 1, 1)
-            .expand(B, Kp1, F)
-        )
-        k_pos_grid = (
-            torch.arange(Kp1, device=self.device, dtype=torch.int64)
-            .view(1, Kp1, 1)
-            .expand(B, Kp1, F)
-        )
+        # Assemble flat per-branch tensors in batch-major order so
+        # each sequence's branches are contiguous:
+        #   [batch 0 branches..., batch 1 branches..., ...]
+        # Within each batch, branches run in (k, cand) order matching
+        # the geometric fan_out_list allocation. This layout lets the
+        # tree-decode code at Step 3+ compute branch_within_seq as a
+        # simple arange without interleaving.
+        branches_per_seq = sum(fan_out_list)
+        per_seq_k: list[torch.Tensor] = []
+        per_seq_cand_slots: list[torch.Tensor] = []  # per-seq indices 0..branches_per_seq
+        start = 0
+        for k, F_k in enumerate(fan_out_list):
+            if F_k <= 0:
+                continue
+            per_seq_k.append(torch.full(
+                (F_k,), k, dtype=torch.int64, device=self.device
+            ))
+            per_seq_cand_slots.append(torch.arange(
+                F_k, dtype=torch.int64, device=self.device,
+            ))
+            start += F_k
+        # [branches_per_seq]
+        per_seq_k_flat = torch.cat(per_seq_k) if per_seq_k else \
+            torch.zeros(0, dtype=torch.int64, device=self.device)
+        per_seq_cand_flat = torch.cat(per_seq_cand_slots) if per_seq_cand_slots else \
+            torch.zeros(0, dtype=torch.int64, device=self.device)
 
-        k_positions = k_pos_grid.reshape(-1)
-        bonus_candidates = topk_indices.reshape(-1)
-        entry_batch_ids = batch_ids_grid.reshape(-1)
+        # Expand to [B, branches_per_seq] → flatten to [N] batch-major.
+        k_positions = per_seq_k_flat.unsqueeze(0).expand(
+            B, branches_per_seq
+        ).reshape(-1)
+        entry_batch_ids = torch.arange(
+            B, device=self.device, dtype=torch.int64,
+        ).unsqueeze(1).expand(B, branches_per_seq).reshape(-1)
+        # Gather candidates from topk_indices[b, k_pos, cand_slot]
+        # using the per-branch (b, k_pos, cand_slot) triples.
+        cand_slots_full = per_seq_cand_flat.unsqueeze(0).expand(
+            B, branches_per_seq
+        ).reshape(-1)
+        bonus_candidates = topk_indices[
+            entry_batch_ids, k_positions, cand_slots_full
+        ]
 
         # Step 3: Ensure blocks for tree decode
-        branches_per_seq = Kp1 * F
         max_tree_pos = Kp1 + branches_per_seq * K + K
         for sid in seq_ids_list:
             base = self._round_base_lens.get(sid, 0)
@@ -2083,6 +2178,7 @@ class DraftServer:
             draft_logits=all_logits,
             branch_block_tables=tree_block_tables,
             prefix_lens=tree_start,
+            vs_id=vs_id,
         )
 
         # Restore _seq_lens
@@ -2090,20 +2186,26 @@ class DraftServer:
 
     def _build_standalone_cache(
         self,
-        B: int, K: int, F: int, N: int,
+        B: int, K: int,
+        fan_out_list: list[int],
+        max_fan_out: int,
+        N: int,
         seq_ids: torch.Tensor,
         seq_ids_list: list[int],
         runner: Any,
         draft_tokens: torch.Tensor,
         draft_logits: torch.Tensor,
         rec_tokens: torch.Tensor,
+        vs_id: str,
     ) -> None:
         """Build speculation cache for standalone draft models.
 
-        Uses dedicated blocks with KV copy, matching
-        ``DisaggDraftWorker._build_standalone_cache``.
+        Uses dedicated blocks with KV copy. Fan-out is per-position
+        (geometric allocation), not uniform. Dedicated-block
+        allocation is scoped to ``vs_id`` so peer VSes' preserved
+        cache entries keep pointing at live KV data.
         """
-        runner.recycle_dedicated_blocks()
+        runner.recycle_dedicated_blocks(vs_id)
 
         # Glue decode for K+1th logits
         glue_logits = runner.glue_decode(
@@ -2128,22 +2230,41 @@ class DraftServer:
             index=outcome_tokens[:, 1:].unsqueeze(2),
             value=float("-inf"),
         )
-        _, topk_indices = torch.topk(masked_logits, F, dim=-1)
+        _, topk_indices = torch.topk(
+            masked_logits, max_fan_out, dim=-1
+        )  # [B, Kp1, max_F]
 
-        batch_ids_grid = (
-            torch.arange(B, device=self.device)
-            .view(B, 1, 1)
-            .expand(B, Kp1, F)
-        )
-        k_pos_grid = (
-            torch.arange(Kp1, device=self.device, dtype=torch.int64)
-            .view(1, Kp1, 1)
-            .expand(B, Kp1, F)
-        )
+        # Batch-major flat layout: [batch 0 branches..., batch 1 ...].
+        # See _build_eagle_cache for the rationale.
+        branches_per_seq = sum(fan_out_list)
+        per_seq_k: list[torch.Tensor] = []
+        per_seq_cand_slots: list[torch.Tensor] = []
+        for k, F_k in enumerate(fan_out_list):
+            if F_k <= 0:
+                continue
+            per_seq_k.append(torch.full(
+                (F_k,), k, dtype=torch.int64, device=self.device
+            ))
+            per_seq_cand_slots.append(torch.arange(
+                F_k, dtype=torch.int64, device=self.device,
+            ))
+        per_seq_k_flat = torch.cat(per_seq_k) if per_seq_k else \
+            torch.zeros(0, dtype=torch.int64, device=self.device)
+        per_seq_cand_flat = torch.cat(per_seq_cand_slots) if per_seq_cand_slots else \
+            torch.zeros(0, dtype=torch.int64, device=self.device)
 
-        k_positions = k_pos_grid.reshape(-1)
-        bonus_candidates = topk_indices.reshape(-1)
-        entry_batch_ids = batch_ids_grid.reshape(-1)
+        k_positions = per_seq_k_flat.unsqueeze(0).expand(
+            B, branches_per_seq
+        ).reshape(-1)
+        entry_batch_ids = torch.arange(
+            B, device=self.device, dtype=torch.int64,
+        ).unsqueeze(1).expand(B, branches_per_seq).reshape(-1)
+        cand_slots_full = per_seq_cand_flat.unsqueeze(0).expand(
+            B, branches_per_seq
+        ).reshape(-1)
+        bonus_candidates = topk_indices[
+            entry_batch_ids, k_positions, cand_slots_full
+        ]
 
         # Bounds check for dedicated blocks
         bs = runner.block_size
@@ -2163,7 +2284,7 @@ class DraftServer:
         dedicated_blocks = [
             runner._alloc_one_block() for _ in range(total_needed)
         ]
-        runner.reserve_dedicated_blocks(dedicated_blocks)
+        runner.reserve_dedicated_blocks(dedicated_blocks, vs_id)
 
         # Build per-branch block tables
         base_lens_t = torch.tensor(
@@ -2251,6 +2372,7 @@ class DraftServer:
             draft_logits=all_logits,
             branch_block_tables=branch_block_tables,
             prefix_lens=prefix_lens,
+            vs_id=vs_id,
         )
 
         # Restore _seq_lens (undo glue's +1)
@@ -2576,17 +2698,38 @@ class DraftServer:
                 verify_server_id,
             )
 
+        # Drop this VS's SpeculationCache partition. The freed seq_ids
+        # might be recycled by another VS on its next PREFILL (via the
+        # shared ``_free_internal_seq_ids`` pool), and this VS's cache
+        # entries are keyed by those sids. If we left them in place,
+        # a future peer-VS SPECULATE could HIT on stale pre-free data
+        # and splice garbage into its sequence. Wiping the partition
+        # here is conservative (this VS loses its live-request entries
+        # too), but those entries get rebuilt on the next SPECULATE
+        # and the correctness cost of not wiping is far larger.
+        if self.cache is not None:
+            self.cache.reset_vs(verify_server_id)
+
     async def _handle_exit(
         self, verify_server_id: str, identity: bytes
     ) -> None:
         """Handle EXIT command from a verify server.
 
-        Cleans up all state for the disconnecting verify server.
+        Cleans up all state for the disconnecting verify server,
+        including its SpeculationCache partition and dedicated-block
+        pool (so those resources can be reused by other VSes).
         """
         keys = list(self._verify_servers.get(verify_server_id, set()))
         for key in keys:
             self._request_state.pop(key, None)
         self._verify_servers.pop(verify_server_id, None)
+
+        runner = self.draft_model_runner
+        if runner is not None:
+            runner.recycle_dedicated_blocks(verify_server_id)
+        if self.cache is not None:
+            self.cache.reset_vs(verify_server_id)
+
         logger.info(
             "DraftServer cleaned up %d requests for exiting "
             "verify server %s",
