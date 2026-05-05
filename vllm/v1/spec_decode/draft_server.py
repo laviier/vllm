@@ -189,6 +189,14 @@ class DraftServer:
         # to overlap with the next SPECULATE's JIT on the default stream.
         self._cache_stream: torch.cuda.Stream | None = None
 
+        # In-flight background cache build. Awaited before the next
+        # SPECULATE begins work on the runner (runner state and the
+        # SpeculationCache are mutated by _build_next_cache, so new
+        # handlers must wait). Returns the serve loop to recv_multipart
+        # immediately, overlapping ZMQ recv/decode for the next message
+        # with the GPU-bound cache build on the default stream.
+        self._inflight_cache_build: asyncio.Task | None = None
+
         # ----- NCCL process groups per verify server -----
         # Maps verify_server_id → (process_group, peer_rank)
         self._nccl_groups: dict[
@@ -512,6 +520,7 @@ class DraftServer:
     async def shutdown(self) -> None:
         """Gracefully stop the server loop and release resources."""
         self._running = False
+        await self._await_inflight_cache_build()
         self._cleanup()
         logger.info("DraftServer shut down.")
 
@@ -557,6 +566,12 @@ class DraftServer:
         # first so that ordering is preserved.
         if self._pending_speculations:
             await self._process_batched_speculation()
+
+        # Non-SPECULATE commands (PREFILL / FREE_SEQ) also touch runner
+        # state (KV allocation, _seq_lens, block tables). Wait for any
+        # in-flight cache build to complete before executing them so
+        # the two don't race.
+        await self._await_inflight_cache_build()
 
         if cmd == "PREFILL":
             prefill = decode(command.payload, PrefillRequest)
@@ -918,6 +933,47 @@ class DraftServer:
     # Command handlers
     # ------------------------------------------------------------------
 
+    async def _await_inflight_cache_build(self) -> None:
+        """Block until any scheduled cache build finishes.
+
+        The cache build mutates the SpeculationCache and runner state
+        (_seq_lens, block tables, KV cache) on the default CUDA stream.
+        Any handler that also touches those must wait here first.
+        """
+        task = self._inflight_cache_build
+        if task is None:
+            return
+        self._inflight_cache_build = None
+        try:
+            await task
+        except Exception:
+            logger.exception(
+                "DraftServer background cache build failed"
+            )
+
+    async def _run_cache_build(
+        self,
+        batch_size: int,
+        seq_ids: torch.Tensor,
+    ) -> None:
+        """Background wrapper around ``_build_next_cache``.
+
+        Invoked via ``asyncio.create_task`` after the SPECULATE response
+        is sent so the serve loop can return to ``recv_multipart`` while
+        GPU cache-building kernels run on the default stream. ZMQ recv
+        and command decode for the next message overlap with this GPU
+        work. Any subsequent handler awaits this task before mutating
+        runner/cache state.
+        """
+        runner = self.draft_model_runner
+        if runner is None:
+            return
+        if not self.needs_hidden_states:
+            saved = dict(runner._seq_lens)
+        self._build_next_cache(batch_size, seq_ids)
+        if not self.needs_hidden_states:
+            runner._seq_lens = saved
+
     async def _handle_speculation(
         self,
         verify_server_id: str,
@@ -950,6 +1006,15 @@ class DraftServer:
             B,
         )
 
+        # Block until the previous round's cache build finishes.
+        # Cache build mutates runner._seq_lens, block tables, the
+        # SpeculationCache contents, and issues GPU kernels that share
+        # the default stream with this handler's JIT/glue work — so
+        # we must serialize them. Awaiting here (rather than in the
+        # serve loop) lets the serve loop pipeline ZMQ recv/decode
+        # for this message against the prior round's cache build.
+        await self._await_inflight_cache_build()
+
         try:
             result = await self._handle_speculation_inner(
                 verify_server_id, identity, outcome
@@ -961,20 +1026,19 @@ class DraftServer:
                     verify_server_id, identity, cache_hits, draft_tokens,
                     draft_logits,
                 )
-                # Build cache AFTER response is sent.
-                # NOTE: This blocks the serve loop for ~30ms. With
-                # multiple verify servers, this causes head-of-line
-                # blocking. Parallel drafting (1 forward pass instead
-                # of K=6) is the real fix for multi-VS performance.
+                # Schedule cache build as a background task so the
+                # serve loop returns to recv_multipart immediately.
+                # The task holds references to the per-round state it
+                # needs (seq_ids and B); _await_inflight_cache_build
+                # is called at the top of the next SPECULATE so we
+                # never have two cache builds running concurrently.
                 runner = self.draft_model_runner
                 if runner is not None:
                     _seq_ids = self._last_spec_seq_ids
                     if _seq_ids is not None:
-                        if not self.needs_hidden_states:
-                            saved = dict(runner._seq_lens)
-                        self._build_next_cache(B, _seq_ids)
-                        if not self.needs_hidden_states:
-                            runner._seq_lens = saved
+                        self._inflight_cache_build = asyncio.create_task(
+                            self._run_cache_build(B, _seq_ids)
+                        )
         except Exception:
             logger.exception(
                 "DraftServer _handle_speculation failed for %s",

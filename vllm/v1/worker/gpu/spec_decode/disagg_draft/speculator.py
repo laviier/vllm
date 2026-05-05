@@ -862,14 +862,11 @@ class DisaggSpeculatorProxy:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """N:M speculation: group requests by server, send per-connector.
 
-        Groups active requests by their assigned draft server index,
-        sends one batched ``VerificationOutcome`` per server, then
-        receives ``SpeculationResponse`` from each and reassembles
-        the results in the original request order.
-
-        Returns:
-            ``(draft_tokens, draft_logits)`` tensors with shape
-            ``[B_active, K]`` and ``[B_active, K, V]`` (or ``None``).
+        Sends verification outcomes and receives responses concurrently
+        across connectors via ``asyncio.gather``. When only one server
+        is hit, this degenerates to a single await — same cost as the
+        prior serial code. With M>1 servers, per-server round-trips
+        overlap so the slowest connector dominates, not the sum.
         """
         assert self.router is not None
         K = self.num_speculative_steps
@@ -881,20 +878,19 @@ class DisaggSpeculatorProxy:
             if rid in self.router.assignment:
                 srv_idx = self.router.assignment[rid]
             else:
-                # Request not yet assigned — assign now (shouldn't
-                # normally happen since prefill assigns, but be safe).
                 connector = self.router.assign(rid)
                 srv_idx = self.router.assignment[rid]
             server_groups[srv_idx].append(j)
 
-        # Allocate output tensors
         draft_toks_out = torch.zeros(
             B_active, K, dtype=torch.int64, device=self.device,
         )
         draft_logits_out: torch.Tensor | None = None
 
-        # Send verification outcomes and receive speculation responses
-        # per-connector.
+        needs_logits = self.draft_logits is not None
+        srv_order: list[int] = []
+        srv_local_indices: list[list[int]] = []
+        coros: list[Any] = []
         for srv_idx, local_indices in server_groups.items():
             connector = self.router.connectors[srv_idx]
             n = len(local_indices)
@@ -902,7 +898,6 @@ class DisaggSpeculatorProxy:
                 local_indices, dtype=torch.int64, device=self.device,
             )
 
-            # Slice tensors for this server's batch
             srv_seq_ids = seq_ids[idx_t]
             srv_k_accepted = k_accepted[idx_t]
             srv_bonus_tokens = bonus_tokens[idx_t]
@@ -923,67 +918,70 @@ class DisaggSpeculatorProxy:
                 if extend_token_ids is not None else None
             )
 
-            try:
-                # Send verification outcome and receive speculation in one call
-                needs_logits = self.draft_logits is not None
-                cache_hits, srv_draft_toks, srv_draft_logits = (
-                    self._run_async(
-                        connector.send_and_recv_speculation(
-                            batch_size=n,
-                            seq_ids=srv_seq_ids,
-                            k_accepted=srv_k_accepted,
-                            bonus_tokens=srv_bonus_tokens,
-                            temperatures=srv_temps,
-                            hidden_states=srv_hs,
-                            aux_hidden_states=None,
-                            extend_counts=srv_ext_counts,
-                            extend_hidden_states=srv_ext_hs,
-                            extend_token_ids=srv_ext_ids,
-                            needs_logits=needs_logits,
-                        )
-                    )
+            srv_order.append(srv_idx)
+            srv_local_indices.append(local_indices)
+            coros.append(
+                connector.send_and_recv_speculation(
+                    batch_size=n,
+                    seq_ids=srv_seq_ids,
+                    k_accepted=srv_k_accepted,
+                    bonus_tokens=srv_bonus_tokens,
+                    temperatures=srv_temps,
+                    hidden_states=srv_hs,
+                    aux_hidden_states=None,
+                    extend_counts=srv_ext_counts,
+                    extend_hidden_states=srv_ext_hs,
+                    extend_token_ids=srv_ext_ids,
+                    needs_logits=needs_logits,
                 )
+            )
 
-                # Map results back into the output tensors
-                for local_j, global_j in enumerate(local_indices):
-                    if local_j < srv_draft_toks.shape[0]:
-                        draft_toks_out[global_j] = srv_draft_toks[local_j]
+        async def _gather():
+            return await asyncio.gather(*coros, return_exceptions=True)
 
-                if srv_draft_logits is not None:
-                    if draft_logits_out is None:
-                        draft_logits_out = torch.zeros(
-                            B_active, K, self.vocab_size,
-                            dtype=self.dtype, device=self.device,
-                        )
-                    for local_j, global_j in enumerate(local_indices):
-                        if local_j < srv_draft_logits.shape[0]:
-                            K_actual = min(
-                                srv_draft_logits.shape[1],
-                                draft_logits_out.shape[1],
-                            )
-                            draft_logits_out[global_j, :K_actual] = (
-                                srv_draft_logits[local_j, :K_actual]
-                            )
+        results = self._run_async(_gather()) if coros else []
 
-            except ConnectionError as e:
+        for srv_idx, local_indices, result in zip(
+            srv_order, srv_local_indices, results
+        ):
+            if isinstance(result, ConnectionError):
                 logger.warning(
                     "N:M speculation from server %d failed with "
                     "ConnectionError: %s. Marking server unavailable "
                     "and reassigning requests.",
-                    srv_idx, e,
+                    srv_idx, result,
                 )
                 self.router.handle_server_failure(srv_idx)
-                # Requests assigned to this server get zeros (already
-                # initialised to zero).
-
-            except Exception as e:
+                continue
+            if isinstance(result, BaseException):
                 logger.warning(
                     "N:M speculation from server %d failed: %s. "
                     "Affected requests get zero draft tokens.",
-                    srv_idx, e,
+                    srv_idx, result,
                 )
-                # Requests assigned to this server get zeros (already
-                # initialised to zero).
+                continue
+
+            cache_hits, srv_draft_toks, srv_draft_logits = result
+
+            for local_j, global_j in enumerate(local_indices):
+                if local_j < srv_draft_toks.shape[0]:
+                    draft_toks_out[global_j] = srv_draft_toks[local_j]
+
+            if srv_draft_logits is not None:
+                if draft_logits_out is None:
+                    draft_logits_out = torch.zeros(
+                        B_active, K, self.vocab_size,
+                        dtype=self.dtype, device=self.device,
+                    )
+                for local_j, global_j in enumerate(local_indices):
+                    if local_j < srv_draft_logits.shape[0]:
+                        K_actual = min(
+                            srv_draft_logits.shape[1],
+                            draft_logits_out.shape[1],
+                        )
+                        draft_logits_out[global_j, :K_actual] = (
+                            srv_draft_logits[local_j, :K_actual]
+                        )
 
         return draft_toks_out, draft_logits_out
 
