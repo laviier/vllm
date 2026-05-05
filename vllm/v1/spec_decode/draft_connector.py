@@ -163,6 +163,14 @@ class ZmqNcclDraftConnector(DraftConnector):
 
         self._connect()
 
+        # ZMQ-only tensor transport — NCCL handshake disabled.
+        # For standalone drafters the tensors are tiny (~100 bytes),
+        # so ZMQ serialization overhead is negligible (~0.4ms).
+        # NCCL would require all processes to see all GPUs (no
+        # CUDA_VISIBLE_DEVICES isolation), which complicates deployment.
+        # The NCCL code paths remain in _nccl_send/_nccl_recv for
+        # future use with EAGLE hidden states if needed.
+
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -215,6 +223,125 @@ class ZmqNcclDraftConnector(DraftConnector):
     @property
     def connected(self) -> bool:
         return self._connected
+
+    # ------------------------------------------------------------------
+    # NCCL handshake
+    # ------------------------------------------------------------------
+
+    def _nccl_handshake(self) -> None:
+        """Establish an NCCL PG with the draft server via ZMQ handshake.
+
+        The verify server hosts a TCPStore (master=True) on a random
+        port, sends the port to the draft server via a HANDSHAKE ZMQ
+        message, and waits for the draft server to connect.
+        """
+        import asyncio
+        from datetime import timedelta
+
+        import torch.distributed as dist
+
+        from vllm.utils.network_utils import get_open_port
+
+        store_port = get_open_port()
+        store_host = "0.0.0.0"
+
+        logger.info(
+            "ZmqNcclDraftConnector: initiating NCCL handshake with %s "
+            "(store port %d)",
+            self._address,
+            store_port,
+        )
+
+        # Send HANDSHAKE over ZMQ
+        from vllm.v1.spec_decode.draft_data_models import (
+            HandshakeRequest,
+            HandshakeResponse,
+            decode,
+            encode_command,
+        )
+
+        hs_req = HandshakeRequest(
+            verify_server_id=self._verify_server_id,
+            nccl_store_host=store_host,
+            nccl_store_port=store_port,
+        )
+        cmd_bytes = encode_command("HANDSHAKE", hs_req)
+
+        # Send handshake and receive response synchronously
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self._send_multipart(cmd_bytes, []))
+        finally:
+            loop.close()
+
+        # Start TCPStore as master — draft server will connect to this
+        store = dist.TCPStore(
+            host_name=store_host,
+            port=store_port,
+            world_size=2,
+            is_master=True,
+            timeout=timedelta(seconds=30),
+        )
+
+        # Create NCCL PG: verify=rank 0, draft=rank 1
+        pg = dist.ProcessGroupNCCL(
+            store,
+            rank=0,
+            size=2,
+            timeout=timedelta(hours=24),
+        )
+
+        self._pg = pg
+        self._peer_rank = 1
+
+        # Warm up the NCCL communicator with a timeout.
+        # The first send/recv triggers lazy NCCL init (a collective).
+        # If GPUs can't see each other, this hangs — so we use a thread
+        # with a timeout to detect and abort.
+        import threading
+
+        warmup = torch.zeros(1, dtype=torch.int64, device=self._device)
+        warmup_ok = [False]
+
+        def _do_warmup():
+            try:
+                pg.send([warmup], 1, 0).wait()
+                pg.recv([warmup], 1, 0).wait()
+                warmup_ok[0] = True
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_do_warmup, daemon=True)
+        t.start()
+        t.join(timeout=10)  # 10 second timeout
+
+        if not warmup_ok[0]:
+            self._pg = None
+            self._peer_rank = 0
+            raise RuntimeError(
+                "NCCL warmup timed out — GPUs may not have P2P visibility. "
+                "Use --draft-server-device instead of CUDA_VISIBLE_DEVICES."
+            )
+
+        # Wait for handshake response
+        loop = asyncio.new_event_loop()
+        try:
+            resp_bytes, _ = loop.run_until_complete(self._recv_multipart())
+        finally:
+            loop.close()
+
+        resp = decode(resp_bytes, HandshakeResponse)
+        if not resp.success:
+            self._pg = None
+            raise RuntimeError(
+                f"NCCL handshake failed: {resp.error}"
+            )
+
+        logger.info(
+            "ZmqNcclDraftConnector: NCCL PG established with %s "
+            "(verify=rank0, draft=rank1)",
+            self._address,
+        )
 
     # ------------------------------------------------------------------
     # NCCL helpers (used when process_group is set)

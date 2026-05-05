@@ -144,8 +144,8 @@ class DraftServer:
         self.jit_fallback = spec_config.disagg_jit_fallback
         self.needs_hidden_states = spec_config.disagg_needs_hidden_states
 
-        # Determine device (draft server typically uses cuda:0)
-        self.device = torch.device("cuda:0")
+        # Determine device (use current CUDA device, set by entrypoint)
+        self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
 
@@ -180,6 +180,14 @@ class DraftServer:
         self._eagle_prefix_cache_max = 64
         # Track prefill prenorm validity (mirrors DisaggDraftWorker)
         self._prefill_prenorm_valid = False
+
+        # Last speculation seq_ids — stored by _handle_speculation_inner,
+        # consumed by _handle_speculation for post-response cache building.
+        self._last_spec_seq_ids: torch.Tensor | None = None
+
+        # Separate CUDA stream for cache building — allows cache build
+        # to overlap with the next SPECULATE's JIT on the default stream.
+        self._cache_stream: torch.cuda.Stream | None = None
 
         # ----- NCCL process groups per verify server -----
         # Maps verify_server_id → (process_group, peer_rank)
@@ -228,6 +236,16 @@ class DraftServer:
 
         # ----- Metrics -----
         self.metrics = DraftServerMetrics()
+
+        # ----- Seq ID remapping for multi-verify-server isolation -----
+        # Each verify server assigns its own seq_ids starting from 0.
+        # To avoid collisions in the DraftModelRunner's KV cache and
+        # block tables, we remap (verify_server_id, external_seq_id)
+        # to a unique internal_seq_id.
+        self._ext_to_int_seq: dict[tuple[str, int], int] = {}
+        self._int_to_ext_seq: dict[int, tuple[str, int]] = {}
+        self._next_internal_seq_id: int = 0
+        self._free_internal_seq_ids: list[int] = []
 
         # ----- Multi-verify-server batching -----
         # Pending SPECULATE commands queued for batched processing.
@@ -316,17 +334,109 @@ class DraftServer:
             self.device,
         )
 
+        # Create CUDA stream for async cache building
+        self._cache_stream = torch.cuda.Stream(device=self.device)
+
+    # ------------------------------------------------------------------
+    # GPU worker thread
+    # ------------------------------------------------------------------
+
+    def _gpu_worker_loop(self) -> None:
+        """Background thread that runs all GPU inference.
+
+        Pulls work items from ``_gpu_work_queue``, executes them on the
+        GPU, and puts results into ``_gpu_response_queue``.  This keeps
+        the asyncio ZMQ I/O loop free to receive/send messages while
+        GPU work is in progress.
+
+        Work items are tuples: (work_type, work_id, args)
+        Results are tuples: (work_id, result_or_exception)
+        """
+        torch.cuda.set_device(self.device)
+        logger.info("DraftServer GPU worker thread started.")
+
+        # Reuse a single event loop for all async handler calls
+        import asyncio as _aio
+        _gpu_loop = _aio.new_event_loop()
+
+        while self._running:
+            try:
+                item = self._gpu_work_queue.get(timeout=0.1)
+            except queue_mod.Empty:
+                continue
+
+            work_type, work_id, args = item
+            try:
+                if work_type == "SPECULATE":
+                    vs_id, identity, outcome, frames = args
+                    self._current_tensor_frames = frames
+                    self._current_tensor_idx = 0
+                    result = self._gpu_handle_speculation(
+                        vs_id, identity, outcome, _gpu_loop
+                    )
+                    self._gpu_response_queue.put((work_id, vs_id, identity, result))
+                elif work_type == "PREFILL":
+                    vs_id, identity, prefill, frames = args
+                    self._current_tensor_frames = frames
+                    self._current_tensor_idx = 0
+                    _gpu_loop.run_until_complete(
+                        self._handle_prefill(vs_id, identity, prefill)
+                    )
+                elif work_type == "FREE_SEQ":
+                    vs_id, identity, free_req, frames = args
+                    self._current_tensor_frames = frames
+                    self._current_tensor_idx = 0
+                    _gpu_loop.run_until_complete(
+                        self._handle_free_seq(vs_id, identity, free_req)
+                    )
+                elif work_type == "SHUTDOWN":
+                    break
+            except Exception:
+                logger.exception(
+                    "DraftServer GPU worker failed on %s", work_type
+                )
+                if work_type == "SPECULATE":
+                    vs_id, identity, outcome, frames = args
+                    self._gpu_response_queue.put(
+                        (work_id, vs_id, identity, None)
+                    )
+
+        _gpu_loop.close()
+        logger.info("DraftServer GPU worker thread exiting.")
+
+    @torch.inference_mode()
+    def _gpu_handle_speculation(
+        self,
+        verify_server_id: str,
+        identity: bytes,
+        outcome: VerificationOutcome,
+        loop,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, bool] | None:
+        """Run speculation on GPU thread."""
+        B = outcome.batch_size
+        _spec_start = time.monotonic()
+        self.metrics.draft_batch_size.set(B)
+
+        try:
+            result = loop.run_until_complete(
+                self._handle_speculation_inner(
+                    verify_server_id, identity, outcome
+                )
+            )
+            return result
+        except Exception:
+            logger.exception(
+                "DraftServer GPU speculation failed for %s",
+                verify_server_id,
+            )
+            return None
+
     async def serve(self) -> None:
         """Main loop: accept commands from multiple verify servers.
 
-        Runs until an EXIT command is received or :meth:`shutdown` is
-        called.  Each incoming ZMQ message is a multipart frame:
-        ``[identity, b"", payload]`` where *identity* is the
-        verify_server_id set by the DEALER socket on the connector side.
-
-        Uses a polling loop with a short timeout so that partial
-        speculation batches are flushed even when no new messages
-        arrive within ``_batch_timeout_s``.
+        Single-threaded design: ZMQ I/O and GPU work run on the same
+        thread.  ``_build_next_cache`` runs on a separate CUDA stream
+        so it overlaps with the next ZMQ recv.
         """
         import zmq
 
@@ -337,18 +447,7 @@ class DraftServer:
         poller.register(self._socket, zmq.POLLIN)
 
         while self._running:
-            # Compute poll timeout: if we have pending speculations,
-            # wait at most until the batch timeout expires.
-            if self._pending_speculations and self._batch_first_arrival is not None:
-                elapsed = time.monotonic() - self._batch_first_arrival
-                remaining_ms = max(
-                    0, (self._batch_timeout_s - elapsed) * 1000
-                )
-                poll_timeout_ms = int(remaining_ms)
-            else:
-                # No pending batch — block until a message arrives
-                # (use a long timeout to avoid busy-waiting).
-                poll_timeout_ms = 1000
+            poll_timeout_ms = 1000
 
             try:
                 events = dict(await poller.poll(timeout=poll_timeout_ms))
@@ -358,6 +457,7 @@ class DraftServer:
                 logger.exception("DraftServer poll error")
                 continue
 
+            # --- Receive ZMQ messages ---
             if self._socket in events:
                 try:
                     frames = await self._socket.recv_multipart(
@@ -395,19 +495,15 @@ class DraftServer:
                         )
                         continue
 
-                    # Store tensor frames for this message so handlers
-                    # can consume them via _zmq_nccl_recv().
-                    self._current_tensor_frames = list(tensor_frames)
+                    # Store tensor frames for this message.
+                    tensor_frame_list = list(tensor_frames)
+
+                    self._current_tensor_frames = tensor_frame_list
                     self._current_tensor_idx = 0
 
                     await self._dispatch(
                         verify_server_id, identity, command
                     )
-
-            # After processing any incoming message (or on poll
-            # timeout), check whether the pending batch should be
-            # flushed due to timeout.
-            await self._maybe_flush_batch()
 
             # Check for verify servers that have timed out and evict
             # their requests.
@@ -450,19 +546,11 @@ class DraftServer:
 
         if cmd == "SPECULATE":
             outcome = decode(command.payload, VerificationOutcome)
-            # When using ZMQ tensor transport (no NCCL), process immediately
-            # to avoid the tensor frames being consumed by the serve() loop.
-            if verify_server_id not in self._nccl_groups:
-                await self._handle_speculation(
-                    verify_server_id, identity, outcome
-                )
-                return
-            self._enqueue_speculation(
+            # Process immediately — sequential is correct for ZMQ
+            # tensor transport (frames must be consumed before next msg).
+            await self._handle_speculation(
                 verify_server_id, identity, outcome
             )
-            # Trigger batch processing if the queue is full.
-            if len(self._pending_speculations) >= self._max_batch_size:
-                await self._process_batched_speculation()
             return
 
         # For non-SPECULATE commands, flush any pending speculations
@@ -490,6 +578,15 @@ class DraftServer:
 
         elif cmd == "HEALTHCHECK":
             await self._handle_healthcheck(verify_server_id, identity)
+
+        elif cmd == "HANDSHAKE":
+            from vllm.v1.spec_decode.draft_data_models import (
+                HandshakeRequest,
+            )
+            hs_req = decode(command.payload, HandshakeRequest)
+            await self._handle_handshake(
+                verify_server_id, identity, hs_req
+            )
 
         else:
             logger.warning(
@@ -532,6 +629,23 @@ class DraftServer:
         if elapsed >= self._batch_timeout_s:
             await self._process_batched_speculation()
 
+    async def _flush_speculation_batch(self) -> None:
+        """Flush pending cross-verify-server speculation batch.
+
+        Processes each pending SPECULATE sequentially (they share the
+        same GPU so true batching requires merging tensors). The key
+        benefit is that we accumulate for ~1ms to avoid interleaving
+        with prefill/free_seq commands from other verify servers.
+        """
+        batch = self._pending_speculations
+        self._pending_speculations = []
+        self._batch_first_arrival = None
+
+        for vs_id, identity, outcome, frames, idx in batch:
+            self._current_tensor_frames = frames
+            self._current_tensor_idx = idx
+            await self._handle_speculation(vs_id, identity, outcome)
+
     async def _process_batched_speculation(self) -> None:
         """Process all pending SPECULATE commands as a single batch.
 
@@ -573,9 +687,15 @@ class DraftServer:
         # _handle_speculation handles its own NCCL receives and
         # ZMQ response sends, so the verify servers are served
         # in order within the batch.
-        for verify_server_id, identity, outcome in batch:
+        for entry in batch:
+            if len(entry) == 5:
+                vs_id, identity, outcome, frames, idx = entry
+                self._current_tensor_frames = frames
+                self._current_tensor_idx = idx
+            else:
+                vs_id, identity, outcome = entry
             await self._handle_speculation(
-                verify_server_id, identity, outcome
+                vs_id, identity, outcome
             )
 
     # ------------------------------------------------------------------
@@ -621,16 +741,21 @@ class DraftServer:
 
             # Free KV cache and per-request state for each request.
             runner = self.draft_model_runner
-            for _vs_id, seq_id in keys:
+            for _vs_id, ext_seq_id in keys:
+                # Remap to internal seq_id
+                internal_sid = self._unmap_seq_id(_vs_id, ext_seq_id)
+                if internal_sid is None:
+                    self._request_state.pop((_vs_id, ext_seq_id), None)
+                    continue
                 # Clear per-round state
-                self._round_base_lens.pop(seq_id, None)
-                self._swap_states.pop(seq_id, None)
-                self._seq_prompt_hash.pop(seq_id, None)
+                self._round_base_lens.pop(internal_sid, None)
+                self._swap_states.pop(internal_sid, None)
+                self._seq_prompt_hash.pop(internal_sid, None)
 
                 if runner is not None:
-                    runner.free_blocks(seq_id)
+                    runner.free_blocks(internal_sid)
 
-                self._request_state.pop((_vs_id, seq_id), None)
+                self._request_state.pop((_vs_id, ext_seq_id), None)
 
             # Increment eviction counter.
             self.metrics.draft_eviction_count.inc(len(keys))
@@ -688,6 +813,50 @@ class DraftServer:
         if key not in self._request_state:
             self._request_state[key] = {}
         return self._request_state[key]
+
+    # ------------------------------------------------------------------
+    # Seq ID remapping
+    # ------------------------------------------------------------------
+
+    def _alloc_internal_seq_id(self) -> int:
+        """Allocate a unique internal seq_id."""
+        if self._free_internal_seq_ids:
+            return self._free_internal_seq_ids.pop()
+        sid = self._next_internal_seq_id
+        self._next_internal_seq_id += 1
+        return sid
+
+    def _map_seq_id(self, vs_id: str, ext_seq_id: int) -> int:
+        """Map (verify_server_id, external_seq_id) → internal_seq_id.
+
+        Allocates a new internal ID on first use.
+        """
+        key = (vs_id, ext_seq_id)
+        if key not in self._ext_to_int_seq:
+            internal = self._alloc_internal_seq_id()
+            self._ext_to_int_seq[key] = internal
+            self._int_to_ext_seq[internal] = key
+        return self._ext_to_int_seq[key]
+
+    def _unmap_seq_id(self, vs_id: str, ext_seq_id: int) -> int | None:
+        """Remove mapping and recycle the internal seq_id."""
+        key = (vs_id, ext_seq_id)
+        internal = self._ext_to_int_seq.pop(key, None)
+        if internal is not None:
+            self._int_to_ext_seq.pop(internal, None)
+            self._free_internal_seq_ids.append(internal)
+        return internal
+
+    def _remap_seq_ids(
+        self, vs_id: str, seq_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Remap a tensor of external seq_ids to internal seq_ids."""
+        internal_ids = []
+        for ext_id in seq_ids.tolist():
+            internal_ids.append(self._map_seq_id(vs_id, int(ext_id)))
+        return torch.tensor(
+            internal_ids, dtype=seq_ids.dtype, device=seq_ids.device
+        )
 
     # ------------------------------------------------------------------
     # Tensor transport helpers
@@ -782,9 +951,30 @@ class DraftServer:
         )
 
         try:
-            await self._handle_speculation_inner(
+            result = await self._handle_speculation_inner(
                 verify_server_id, identity, outcome
             )
+            if result is not None:
+                cache_hits, draft_tokens, draft_logits, needs_logits = result
+                # Send response FIRST — unblocks the verify server
+                await self._send_speculation_response(
+                    verify_server_id, identity, cache_hits, draft_tokens,
+                    draft_logits,
+                )
+                # Build cache AFTER response is sent.
+                # NOTE: This blocks the serve loop for ~30ms. With
+                # multiple verify servers, this causes head-of-line
+                # blocking. Parallel drafting (1 forward pass instead
+                # of K=6) is the real fix for multi-VS performance.
+                runner = self.draft_model_runner
+                if runner is not None:
+                    _seq_ids = self._last_spec_seq_ids
+                    if _seq_ids is not None:
+                        if not self.needs_hidden_states:
+                            saved = dict(runner._seq_lens)
+                        self._build_next_cache(B, _seq_ids)
+                        if not self.needs_hidden_states:
+                            runner._seq_lens = saved
         except Exception:
             logger.exception(
                 "DraftServer _handle_speculation failed for %s",
@@ -826,6 +1016,10 @@ class DraftServer:
             outcome.seq_ids_ref.shape,
             _str_to_dtype(outcome.seq_ids_ref.dtype),
         )
+        # Remap external seq_ids to internal (unique across verify servers)
+        seq_ids = self._remap_seq_ids(verify_server_id, seq_ids)
+        # Store for cache building after response is sent
+        self._last_spec_seq_ids = seq_ids
         k_accepted = self._zmq_nccl_recv(
             verify_server_id,
             outcome.k_accepted_ref.shape,
@@ -1102,25 +1296,19 @@ class DraftServer:
         self._last_draft_logits = draft_logits.clone()
         self._last_bonus_tokens = bonus_tokens.clone()
 
-        # ---- Step 4: Send SpeculationResponse ----
-        # Only send draft_logits if the verify server requested them
+        # ---- Step 4: Return result IMMEDIATELY ----
+        # Cache building happens after the caller sends the response.
         send_logits = outcome.needs_logits
-        await self._send_speculation_response(
-            verify_server_id, identity, cache_hits, draft_tokens,
-            draft_logits if send_logits else None,
-        )
 
-        # Record generation latency for this speculation batch.
+        # Record generation latency (before cache build).
         self.metrics.draft_generation_latency.observe(
             time.monotonic() - _spec_start
         )
 
-        # ---- Step 5: Build speculation cache for NEXT round ----
-        if runner is not None and not self.needs_hidden_states:
-            saved_seq_lens = dict(runner._seq_lens)
-        self._build_next_cache(B, seq_ids)
-        if runner is not None and not self.needs_hidden_states:
-            runner._seq_lens = saved_seq_lens
+        # Return result — caller sends via ZMQ, then we build cache.
+        return (cache_hits, draft_tokens,
+                draft_logits if send_logits else None,
+                send_logits)
 
     # ------------------------------------------------------------------
     # Response helpers
@@ -2057,7 +2245,7 @@ class DraftServer:
             )
 
         # ---- Step 2: Delegate to existing prefill logic ----
-        seq_id = prefill.seq_id
+        seq_id = self._map_seq_id(verify_server_id, prefill.seq_id)
         B = 1  # Prefill is per-sequence
         num_tokens = torch.tensor(
             [prompt_token_ids.shape[0]],
@@ -2262,8 +2450,13 @@ class DraftServer:
         # ---- Step 2: Free resources for each sequence ----
         runner = self.draft_model_runner
         freed = 0
-        for sid in seq_ids.tolist():
-            sid = int(sid)
+        for ext_sid in seq_ids.tolist():
+            ext_sid = int(ext_sid)
+            # Remap to internal seq_id and release the mapping
+            sid = self._unmap_seq_id(verify_server_id, ext_sid)
+            if sid is None:
+                # Unknown seq — skip
+                continue
 
             # Clear per-round state
             self._round_base_lens.pop(sid, None)
@@ -2353,6 +2546,95 @@ class DraftServer:
                 "DraftServer failed to send HEALTHCHECK_ACK to %s",
                 verify_server_id,
             )
+
+    async def _handle_handshake(
+        self,
+        verify_server_id: str,
+        identity: bytes,
+        hs_req: "HandshakeRequest",
+    ) -> None:
+        """Handle HANDSHAKE: establish NCCL PG with a verify server.
+
+        The verify server hosts a TCPStore (master). We connect as
+        client (rank=1) and create a ProcessGroupNCCL.
+        """
+        from datetime import timedelta
+        from urllib.parse import urlparse
+
+        import torch.distributed as dist
+
+        from vllm.v1.spec_decode.draft_data_models import (
+            HandshakeResponse,
+            encode,
+        )
+
+        logger.info(
+            "DraftServer HANDSHAKE from %s: store=%s:%d",
+            verify_server_id,
+            hs_req.nccl_store_host,
+            hs_req.nccl_store_port,
+        )
+
+        try:
+            # Parse the verify server's address to get its real IP
+            # (the store_host from the verify server is 0.0.0.0,
+            # so we use the ZMQ connection's source IP instead).
+            # For localhost connections, use 127.0.0.1.
+            connect_host = "127.0.0.1"
+
+            store = dist.TCPStore(
+                host_name=connect_host,
+                port=hs_req.nccl_store_port,
+                world_size=2,
+                is_master=False,  # draft is client
+                timeout=timedelta(seconds=30),
+            )
+            pg = dist.ProcessGroupNCCL(
+                store,
+                rank=1,  # draft = rank 1
+                size=2,
+                timeout=timedelta(hours=24),
+            )
+
+            self._nccl_groups[verify_server_id] = (pg, 0)  # peer_rank=0
+
+            # Warm up NCCL with timeout (must match verify server's
+            # warmup sequence: verify sends first, then recvs).
+            import threading as _threading
+
+            warmup = torch.zeros(1, dtype=torch.int64, device=self.device)
+            warmup_ok = [False]
+
+            def _do_warmup():
+                try:
+                    pg.recv([warmup], 0, 0).wait()
+                    pg.send([warmup], 0, 0).wait()
+                    warmup_ok[0] = True
+                except Exception:
+                    pass
+
+            t = _threading.Thread(target=_do_warmup, daemon=True)
+            t.start()
+            t.join(timeout=10)
+
+            if not warmup_ok[0]:
+                self._nccl_groups.pop(verify_server_id, None)
+                raise RuntimeError("NCCL warmup timed out")
+
+            resp = HandshakeResponse(success=True)
+            logger.info(
+                "DraftServer NCCL PG established with %s "
+                "(draft=rank1, verify=rank0)",
+                verify_server_id,
+            )
+        except Exception as e:
+            logger.exception(
+                "DraftServer HANDSHAKE failed for %s", verify_server_id
+            )
+            resp = HandshakeResponse(success=False, error=str(e))
+
+        resp_bytes = encode(resp)
+        await self._socket.send_multipart([identity, resp_bytes])
 
     # ------------------------------------------------------------------
     # Cleanup

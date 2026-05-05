@@ -643,6 +643,7 @@ class EngineArgs:
 
     draft_server: bool = False
     draft_server_port: int = 50051
+    draft_server_device: int | None = None
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
@@ -1403,6 +1404,16 @@ class EngineArgs:
             default=50051,
             help="Port for the Draft Server ZMQ ROUTER socket. "
             "Only used when --draft-server is set. Default: 50051.",
+        )
+
+        parser.add_argument(
+            "--draft-server-device",
+            type=int,
+            default=None,
+            help="CUDA device index for the Draft Server. Use this "
+            "instead of CUDA_VISIBLE_DEVICES to allow NCCL P2P "
+            "with verify servers on other GPUs. Example: "
+            "--draft-server-device 7",
         )
 
         parser.add_argument(

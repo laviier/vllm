@@ -37,11 +37,13 @@ def _init_distributed_for_draft_server(vllm_config) -> None:
     )
 
     if not model_parallel_is_initialized():
+        from vllm.utils.network_utils import get_open_port
+        init_port = get_open_port()
         init_distributed_environment(
             world_size=1,
             rank=0,
             local_rank=0,
-            distributed_init_method="tcp://127.0.0.1:29599",
+            distributed_init_method=f"tcp://127.0.0.1:{init_port}",
             backend="gloo",
         )
         ensure_model_parallel_initialized(
@@ -74,7 +76,16 @@ def run_draft_server(args: argparse.Namespace) -> None:
         )
 
     port = getattr(args, "draft_server_port", 50051)
+    device_id = getattr(args, "draft_server_device", None)
     bind_address = f"tcp://*:{port}"
+
+    # Set the CUDA device for the draft server process.
+    # This allows running without CUDA_VISIBLE_DEVICES isolation
+    # so NCCL can see all GPUs for P2P transfers.
+    if device_id is not None:
+        import torch
+        torch.cuda.set_device(device_id)
+        logger.info("Draft server using GPU %d", device_id)
 
     logger.info("Starting Draft Server on %s", bind_address)
 

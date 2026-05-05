@@ -2216,3 +2216,155 @@ class DraftModelRunner:
             current_pos = current_pos + 1
 
         return draft_tokens, draft_logits
+
+    def parallel_speculate(
+        self,
+        recovery_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        seq_ids: torch.Tensor,
+        num_steps: int,
+        mask_token_id: int,
+        temperature: torch.Tensor | None = None,
+        saguaro_sampler=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run parallel drafting: predict K tokens in a single forward pass.
+
+        Instead of K sequential decode steps, builds an input of
+        [bonus_token, <mask>, <mask>, ..., <mask>] per sequence and
+        runs one prefill-style forward pass. The model must be trained
+        to predict tokens at <mask> positions (P-EAGLE style).
+
+        Args:
+            recovery_tokens: [B] — starting token (bonus token).
+            positions: [B] — starting position in each sequence.
+            seq_ids: [B] — sequence IDs.
+            num_steps: K — number of draft tokens to generate.
+            mask_token_id: Token ID for <mask> in the model's vocabulary.
+            temperature: [B] — sampling temperatures (None = greedy).
+            saguaro_sampler: Optional SaguaroSampler for cache hit rate.
+
+        Returns:
+            draft_tokens: [B, K] — generated draft tokens.
+            draft_logits: [B, K, V] — logits at each position.
+        """
+        assert self._model_loaded, "Call load_model() first"
+        B = recovery_tokens.shape[0]
+        K = num_steps
+        V = self.vocab_size
+        Kp1 = K + 1  # bonus_token + K mask tokens
+
+        # Build input: [bonus_token, <mask>, <mask>, ..., <mask>] per seq
+        # Total tokens: B * (K+1)
+        total_tokens = B * Kp1
+        input_ids = torch.full(
+            (total_tokens,), mask_token_id,
+            dtype=torch.int64, device=self.device,
+        )
+        # Set the first token of each sequence to the bonus token
+        for i in range(B):
+            input_ids[i * Kp1] = recovery_tokens[i]
+
+        # Build positions: [pos, pos+1, pos+2, ..., pos+K] per seq
+        all_positions = torch.zeros(
+            total_tokens, dtype=torch.int64, device=self.device,
+        )
+        for i in range(B):
+            base_pos = positions[i].item()
+            all_positions[i * Kp1 : (i + 1) * Kp1] = (
+                torch.arange(Kp1, device=self.device) + base_pos
+            )
+
+        # Ensure blocks are allocated for all positions
+        for i, sid in enumerate(seq_ids.tolist()):
+            max_pos = int(positions[i].item()) + K
+            self.ensure_blocks(int(sid), max_pos + 1)
+
+        # Build slot mapping for all tokens
+        expanded_seq_ids: list[int] = []
+        for i in range(B):
+            expanded_seq_ids.extend([int(seq_ids[i].item())] * Kp1)
+        slot_mapping = self._compute_slot_mapping(
+            all_positions, expanded_seq_ids,
+        )
+
+        # Build block tables
+        block_tables = self._get_block_table_tensor(seq_ids)
+
+        # Build prefill-style attention metadata
+        # Each sequence has Kp1 query tokens
+        seqlens_q = torch.full(
+            (B,), Kp1, dtype=torch.int32, device=self.device,
+        )
+        query_start_loc = torch.zeros(
+            B + 1, dtype=torch.int32, device=self.device,
+        )
+        torch.cumsum(seqlens_q, dim=0, out=query_start_loc[1:])
+
+        # Total context length per sequence = existing KV + new tokens
+        seq_lens_list = []
+        for i in range(B):
+            base_pos = int(positions[i].item())
+            seq_lens_list.append(base_pos + Kp1)
+        seq_lens_t = torch.tensor(
+            seq_lens_list, dtype=torch.int32, device=self.device,
+        )
+        max_seq_len = int(seq_lens_t.max().item())
+
+        from vllm.forward_context import BatchDescriptor, set_forward_context
+
+        attn_metadata = self._build_flash_attn_metadata(
+            num_tokens=total_tokens,
+            seq_lens_tensor=seq_lens_t,
+            max_seq_len=max_seq_len,
+            max_query_len=Kp1,
+            query_start_loc=query_start_loc,
+            block_table=block_tables,
+            slot_mapping=slot_mapping,
+        )
+        slot_mapping_dict = self._build_slot_mapping_dict(slot_mapping)
+
+        batch_descriptor = BatchDescriptor(num_tokens=total_tokens)
+        with set_forward_context(
+            attn_metadata=attn_metadata,
+            vllm_config=self._draft_vllm_config,
+            num_tokens=total_tokens,
+            slot_mapping=slot_mapping_dict,
+            batch_descriptor=batch_descriptor,
+        ):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=all_positions,
+            )
+
+        # Compute logits
+        if hasattr(self.model, "compute_logits"):
+            all_logits = self.model.compute_logits(hidden_states)
+        elif hasattr(self.model, "lm_head"):
+            all_logits = self.model.lm_head(hidden_states)
+        else:
+            all_logits = torch.matmul(
+                hidden_states,
+                self.model.get_input_embeddings().weight.T,
+            )
+        all_logits = all_logits[:, :V]
+
+        # Reshape: [B*(K+1), V] → [B, K+1, V]
+        # Take positions 1..K (the mask positions) as draft logits
+        all_logits_2d = all_logits.view(B, Kp1, V)
+        draft_logits = all_logits_2d[:, 1:, :]  # [B, K, V]
+
+        # Apply Saguaro rescaling if configured
+        if saguaro_sampler is not None:
+            for step in range(K):
+                draft_logits[:, step] = saguaro_sampler.apply(
+                    draft_logits[:, step], temperature=temperature,
+                )
+
+        # Sample draft tokens (greedy)
+        draft_tokens = draft_logits.argmax(dim=-1)  # [B, K]
+
+        # Update tracked sequence lengths
+        for i, sid in enumerate(seq_ids.tolist()):
+            self._seq_lens[int(sid)] = int(positions[i].item()) + Kp1
+
+        return draft_tokens, draft_logits

@@ -75,8 +75,23 @@ class FreeSeqRequest(msgspec.Struct):
 class DraftCommand(msgspec.Struct):
     """Envelope for all draft service messages over ZMQ."""
 
-    command: str  # "SPECULATE", "PREFILL", "FREE_SEQ", "EXIT", "HEALTHCHECK"
+    command: str  # "SPECULATE", "PREFILL", "FREE_SEQ", "EXIT", "HEALTHCHECK", "HANDSHAKE"
     payload: bytes  # msgspec-encoded inner message
+
+
+class HandshakeRequest(msgspec.Struct):
+    """Verify_Server → Draft_Server: initiate NCCL PG setup."""
+
+    verify_server_id: str
+    nccl_store_host: str  # TCPStore host (verify server's IP)
+    nccl_store_port: int  # TCPStore port (verify server listens)
+
+
+class HandshakeResponse(msgspec.Struct):
+    """Draft_Server → Verify_Server: NCCL PG setup complete."""
+
+    success: bool
+    error: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +114,8 @@ _decoders: dict[type, msgspec.msgpack.Decoder] = {
     PrefillRequest: msgspec.msgpack.Decoder(PrefillRequest),
     FreeSeqRequest: msgspec.msgpack.Decoder(FreeSeqRequest),
     DraftCommand: msgspec.msgpack.Decoder(DraftCommand),
+    HandshakeRequest: msgspec.msgpack.Decoder(HandshakeRequest),
+    HandshakeResponse: msgspec.msgpack.Decoder(HandshakeResponse),
 }
 
 # Union of all message types that can be encoded/decoded
@@ -109,6 +126,8 @@ DraftMessage = Union[
     PrefillRequest,
     FreeSeqRequest,
     DraftCommand,
+    HandshakeRequest,
+    HandshakeResponse,
 ]
 
 
