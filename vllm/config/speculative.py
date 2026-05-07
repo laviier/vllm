@@ -293,6 +293,48 @@ class SpeculativeConfig:
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
+    # N:M disaggregated speculation configuration
+    disagg_draft_addresses: list[str] | None = None
+    """List of Draft_Server addresses (host:port) for N:M disaggregated
+    speculative decoding. When set, verify servers dispatch speculation
+    requests to these standalone draft servers over ZMQ. Each draft server
+    is launched separately with `python -m vllm.v1.spec_decode.draft_server`."""
+
+    disagg_fan_out: int = 1
+    """Fan-out F for the disaggregated speculation cache. At each acceptance
+    position, the draft pre-computes speculations for the top-F bonus token
+    candidates. F=1 is empirically best for low-latency N:M setups;
+    F=3 maximizes cache hit rate but costs more draft-side compute."""
+
+    disagg_saguaro_c: float | None = None
+    """Saguaro sampling C parameter (0-1). Controls suppression of cached
+    token probabilities in the draft model to increase cache hit rate.
+    1.0 = no modification (standard sampling)."""
+
+    disagg_jit_fallback: bool = True
+    """Enable just-in-time fallback speculation for cache misses. When True,
+    the draft model generates tokens sequentially on cache miss. When False,
+    random tokens are used for misses."""
+
+    disagg_draft_routing_policy: str = "round_robin"
+    """Routing policy for the N:M draft router.
+    'round_robin' (default) spreads requests across all listed drafts
+    uniformly — use this when each verify server should use only the
+    drafts it was configured with (list one draft per VS in
+    disagg_draft_addresses for pinning).
+    'affinity' pins each VS to a primary draft via hash(vs_id) mod
+    num_drafts, falling back to round-robin when the primary is down;
+    use this when every VS lists every draft for failover and you
+    want steady-state pinning under normal operation."""
+
+    disagg_draft_timeout_ms: int = 5000
+    """Timeout in ms for waiting on Speculation_Response before falling
+    back."""
+
+    disagg_draft_latency_warn_ms: float = 500.0
+    """Log a warning when draft round-trip latency exceeds this threshold
+    (in milliseconds)."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -1434,6 +1476,9 @@ class SpeculativeConfig:
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
 
+    def use_disagg(self) -> bool:
+        return self.disagg_draft_addresses is not None
+
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
 
@@ -1465,4 +1510,10 @@ class SpeculativeConfig:
             else self.draft_model_config.model
         )
         num_spec_tokens = self.num_speculative_tokens
+        if self.use_disagg():
+            return (
+                f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=}, "
+                f"disagg_draft_addresses={self.disagg_draft_addresses}, "
+                f"disagg_fan_out={self.disagg_fan_out})"
+            )
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

@@ -1,0 +1,616 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Verify-side proxy for disaggregated (N:M) speculative decoding.
+
+``DisaggSpeculatorProxy`` lives inside the verify server's model runner
+and forwards verification outcomes to remote draft servers over ZMQ. It
+does not load a draft model locally; the draft servers run as separate
+processes on separate GPUs.
+
+The proxy exposes the same ``propose()`` interface as ``EagleSpeculator``
+so the model runner can call it uniformly. Under the hood it:
+
+- Uses a ``DraftRouter`` to pick a draft server per request.
+- Wraps each connector's async ZMQ calls in a dedicated event loop so
+  the synchronous model-runner code path can invoke them.
+- Manages per-request seq_id assignment on the draft side; issues
+  PREFILL when a request first completes its prompt, FREE_SEQ on
+  finish, and SPECULATE every decode step.
+- Only TP rank 0 talks to draft servers; other ranks receive the final
+  draft tokens via a TP broadcast in the model runner.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import defaultdict
+from typing import Any
+
+import prometheus_client
+import torch
+
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+class DisaggDraftMetrics:
+    """Prometheus metrics for disaggregated speculation (verify side)."""
+
+    def __init__(self) -> None:
+        self.draft_tokens_requested = prometheus_client.Counter(
+            name="vllm:disagg_draft_tokens_requested_total",
+            documentation=(
+                "Total draft tokens requested from draft server(s)."
+            ),
+        )
+        self.draft_tokens_accepted = prometheus_client.Counter(
+            name="vllm:disagg_draft_tokens_accepted_total",
+            documentation=(
+                "Total draft tokens accepted after verification."
+            ),
+        )
+        self.draft_round_trip_latency = prometheus_client.Histogram(
+            name="vllm:disagg_draft_round_trip_latency_seconds",
+            documentation=(
+                "Round-trip latency (seconds) for SPECULATE requests."
+            ),
+            buckets=(
+                0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0,
+            ),
+        )
+        self.draft_acceptance_rate = prometheus_client.Gauge(
+            name="vllm:disagg_draft_acceptance_rate",
+            documentation=(
+                "Rolling acceptance rate of draft tokens "
+                "(accepted / requested)."
+            ),
+        )
+        self._total_requested: int = 0
+        self._total_accepted: int = 0
+
+    def record_speculation(
+        self,
+        tokens_requested: int,
+        tokens_accepted: int,
+        latency_s: float,
+    ) -> None:
+        self.draft_tokens_requested.inc(tokens_requested)
+        self.draft_tokens_accepted.inc(tokens_accepted)
+        self.draft_round_trip_latency.observe(latency_s)
+
+        self._total_requested += tokens_requested
+        self._total_accepted += tokens_accepted
+        if self._total_requested > 0:
+            self.draft_acceptance_rate.set(
+                self._total_accepted / self._total_requested
+            )
+
+
+class DisaggSpeculatorProxy:
+    """Verify-side proxy that relays verification outcomes to remote
+    draft servers and returns their pre-computed draft tokens.
+
+    Created by ``init_speculator()`` and stored on the model runner.
+    A ``DraftRouter`` is injected via ``set_router()``; construction
+    without a router is not useful (all paths require one).
+    """
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self.vllm_config = vllm_config
+        self.device = device
+
+        self.speculative_config = vllm_config.speculative_config
+        assert self.speculative_config is not None
+        self.num_speculative_steps = (
+            self.speculative_config.num_speculative_tokens
+        )
+        self.draft_model_config = self.speculative_config.draft_model_config
+        self.vocab_size = self.draft_model_config.get_vocab_size()
+        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.dtype = vllm_config.model_config.dtype
+
+        # Pre-allocated result buffers reused across propose() calls.
+        self.draft_tokens = torch.zeros(
+            self.max_num_reqs,
+            self.num_speculative_steps,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.draft_logits: torch.Tensor | None = None
+        if self.speculative_config.rejection_sample_method == "probabilistic":
+            self.draft_logits = torch.zeros(
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                self.vocab_size,
+                dtype=self.dtype,
+                device=device,
+            )
+
+        # disagg does not support multimodal inputs for drafting
+        self.supports_mm_inputs = False
+
+        # Injected via set_router(); see init_speculator().
+        self.router: DraftRouter | None = None
+        self._nm_event_loop: asyncio.AbstractEventLoop | None = None
+
+        # Graceful degradation: reconnection tracking
+        self._reconnect_check_interval: int = 10
+        self._last_all_unavailable_warn: int = 0
+        self._all_unavailable_warn_interval: int = 50
+
+        # Prompt tokens cached by cache_new_request_tokens(), drained
+        # by _prefill_new_requests(). Keyed by req_id.
+        self._pending_prompt_tokens: dict[str, list[int]] = {}
+
+        # Per-request state for the draft side.
+        self._disagg_prefilled_reqs: set[str] = set()
+        self._disagg_req_to_seq_id: dict[str, int] = {}
+        self._disagg_next_seq_id: int = 0
+        self._disagg_free_seq_ids: list[int] = []  # recycled seq_ids
+
+        self._propose_count = 0
+
+        self._metrics = DisaggDraftMetrics()
+        self._latency_warn_ms: float = (
+            self.speculative_config.disagg_draft_latency_warn_ms
+        )
+
+        # Only TP rank 0 talks to the draft server(s). Other ranks
+        # short-circuit propose() and rely on a TP broadcast in the
+        # model runner to receive the final draft tokens.
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+            self._tp_rank = get_tp_group().rank_in_group
+        except Exception:
+            self._tp_rank = 0
+
+        logger.info(
+            "DisaggSpeculatorProxy created: K=%d, V=%d, device=%s, "
+            "tp_rank=%d",
+            self.num_speculative_steps,
+            self.vocab_size,
+            device,
+            self._tp_rank,
+        )
+
+    # ------------------------------------------------------------------
+    # Wiring hooks
+    # ------------------------------------------------------------------
+
+    def set_router(self, router: "DraftRouter") -> None:
+        from vllm.v1.spec_decode.draft_router import DraftRouter
+
+        assert isinstance(router, DraftRouter)
+        self.router = router
+        self._nm_event_loop = asyncio.new_event_loop()
+        logger.info(
+            "DisaggSpeculatorProxy: DraftRouter connected with %d server(s).",
+            len(router.connectors),
+        )
+
+    def cache_new_request_tokens(
+        self, req_id: str, prompt_token_ids: list[int]
+    ) -> None:
+        """Stash a new request's prompt tokens so ``_prefill_new_requests``
+        can ship them to a draft server without a second UVA read."""
+        self._pending_prompt_tokens[req_id] = list(prompt_token_ids)
+
+    @property
+    def is_connected(self) -> bool:
+        return self.router is not None
+
+    # ------------------------------------------------------------------
+    # Graceful degradation
+    # ------------------------------------------------------------------
+
+    def _attempt_reconnect_unavailable_servers(self) -> None:
+        """Periodically try to reconnect draft servers that have been
+        marked unavailable by the router (e.g. after a prior timeout)."""
+        if self.router is None:
+            return
+        for srv_idx, available in enumerate(self.router._available):
+            if available:
+                continue
+            connector = self.router.connectors[srv_idx]
+            if not getattr(connector, 'connected', False):
+                try:
+                    connector._reconnect()
+                except Exception:
+                    pass
+            if getattr(connector, 'connected', False):
+                self.router.mark_server_available(srv_idx)
+                logger.info(
+                    "Draft server %d reconnected successfully.", srv_idx,
+                )
+
+    # ------------------------------------------------------------------
+    # Model-runner shim (these methods make the proxy look like a local
+    # speculator to the V2 model runner)
+    # ------------------------------------------------------------------
+
+    def load_model(self, target_model=None) -> None:
+        """No-op: the draft model lives on a separate GPU."""
+        self.model = _DisaggDraftModelStub()
+
+    def set_attn(self, *args, **kwargs) -> None:
+        """No-op: the draft model manages its own attention."""
+
+    def capture_model(self) -> None:
+        """No-op: CUDA graphs for the draft live on the draft GPU."""
+
+    # ------------------------------------------------------------------
+    # Propose (V1 runner signature — called from gpu_model_runner.py)
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def propose(
+        self,
+        input_batch,
+        num_sampled: torch.Tensor,
+        last_sampled: torch.Tensor,
+        temperature: torch.Tensor,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Request K draft tokens for every request in the batch.
+
+        Returns ``[num_reqs, K]`` int64 tensor. Non-rank-0 TP workers,
+        dummy/warmup batches, and batches with no active requests all
+        return zeros; callers rely on a TP broadcast to align all ranks.
+        """
+        num_reqs = input_batch.num_reqs
+        K = self.num_speculative_steps
+        zeros = torch.zeros(
+            num_reqs, K, dtype=torch.int64, device=self.device,
+        )
+
+        if self._tp_rank != 0 or self.router is None:
+            return zeros
+
+        self._propose_count += 1
+
+        # Periodically try to recover unavailable draft servers.
+        if (self.router.num_available_servers < len(self.router.connectors)
+                and self._propose_count
+                    % self._reconnect_check_interval == 0):
+            self._attempt_reconnect_unavailable_servers()
+
+        if self.router.num_available_servers == 0:
+            since = self._propose_count - self._last_all_unavailable_warn
+            if since >= self._all_unavailable_warn_interval:
+                self._last_all_unavailable_warn = self._propose_count
+                logger.warning(
+                    "All draft servers unavailable — returning zero "
+                    "draft tokens. Will retry reconnection. "
+                    "(propose_count=%d)", self._propose_count,
+                )
+            return zeros
+
+        # Skip warmup/dummy requests — they pollute the draft server's
+        # state with fake seq_ids that never get freed.
+        if any(rid.startswith("_warmup_") or rid.startswith("_dummy_")
+               for rid in input_batch.req_ids):
+            return zeros
+
+        try:
+            return self._do_propose(
+                input_batch, num_sampled, last_sampled, temperature,
+            )
+        except Exception:
+            logger.exception("Disagg propose failed; returning zeros.")
+            return zeros
+
+    def _do_propose(
+        self,
+        input_batch,
+        num_sampled: torch.Tensor,
+        last_sampled: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> torch.Tensor:
+        num_reqs = input_batch.num_reqs
+        K = self.num_speculative_steps
+        req_ids = input_batch.req_ids
+        idx_mapping = getattr(input_batch, 'idx_mapping', None)
+        if idx_mapping is not None:
+            idx_mapping = idx_mapping[:num_reqs]
+        else:
+            idx_mapping = torch.arange(
+                num_reqs, dtype=torch.int64, device=self.device,
+            )
+
+        # Step 1: Send FREE_SEQ for requests that have just finished.
+        self._free_stale_requests(req_ids)
+
+        # Step 2: Send PREFILL for new requests that just finished
+        # their prompt processing.
+        new_req_ids = [
+            rid for i, rid in enumerate(req_ids)
+            if rid not in self._disagg_prefilled_reqs
+            and int(num_sampled[i].item()) > 0
+        ]
+        if new_req_ids:
+            self._prefill_new_requests(new_req_ids)
+
+        # Step 3: Build the verification outcome tensors over the subset
+        # of requests that are prefilled and ready for decode.
+        active_req_indices = [
+            i for i, rid in enumerate(req_ids)
+            if rid in self._disagg_req_to_seq_id
+        ]
+        if not active_req_indices:
+            return torch.zeros(
+                num_reqs, K, dtype=torch.int64, device=self.device,
+            )
+
+        active_req_ids = [req_ids[i] for i in active_req_indices]
+        active_idx = torch.tensor(
+            active_req_indices, dtype=torch.int64, device=self.device,
+        )
+        seq_ids = torch.tensor(
+            [self._disagg_req_to_seq_id[rid] for rid in active_req_ids],
+            dtype=torch.int64, device=self.device,
+        )
+        k_accepted = (
+            num_sampled[active_idx] - 1
+        ).clamp(min=0).to(torch.int64)
+
+        # last_sampled is [num_reqs, max_sampled, 1] or [num_reqs, 1];
+        # the bonus token is the last valid sample per request.
+        _ls = last_sampled[idx_mapping[active_idx]]
+        _ns = num_sampled[active_idx]
+        if _ls.dim() == 3:
+            last_idx = (_ns - 1).clamp(min=0).long()
+            bonus_tokens = _ls[
+                torch.arange(_ls.shape[0], device=_ls.device),
+                last_idx, 0,
+            ].to(torch.int64)
+        elif _ls.dim() == 2:
+            last_idx = (_ns - 1).clamp(min=0).long()
+            bonus_tokens = _ls[
+                torch.arange(_ls.shape[0], device=_ls.device),
+                last_idx,
+            ].to(torch.int64)
+        else:
+            bonus_tokens = _ls.squeeze(-1).to(torch.int64)
+
+        temps = temperature[idx_mapping[active_idx]].to(torch.float32)
+
+        # Step 4: Dispatch SPECULATE requests to the draft servers.
+        import time as _time
+        t0 = _time.perf_counter()
+        B_active = len(active_req_indices)
+        draft_toks, draft_logits = self._dispatch_speculation(
+            active_req_ids=active_req_ids,
+            seq_ids=seq_ids,
+            k_accepted=k_accepted,
+            bonus_tokens=bonus_tokens,
+            temperatures=temps,
+            B_active=B_active,
+        )
+        dt_ms = (_time.perf_counter() - t0) * 1000.0
+
+        tokens_requested = B_active * K
+        tokens_accepted = int(k_accepted.sum().item())
+        self._metrics.record_speculation(
+            tokens_requested=tokens_requested,
+            tokens_accepted=tokens_accepted,
+            latency_s=dt_ms / 1000.0,
+        )
+        if dt_ms > self._latency_warn_ms:
+            logger.warning(
+                "Disagg SPECULATE latency %.2fms exceeds threshold "
+                "%.2fms (B_active=%d, K=%d)",
+                dt_ms, self._latency_warn_ms, B_active, K,
+            )
+
+        # Step 5: Map draft tokens back into the full-batch buffer.
+        self.draft_tokens[:num_reqs].zero_()
+        if self.draft_logits is not None and draft_logits is not None:
+            K_actual = min(draft_logits.shape[1], self.draft_logits.shape[1])
+            self.draft_logits[:num_reqs].zero_()
+            for j, orig_i in enumerate(active_req_indices):
+                self.draft_logits[orig_i, :K_actual] = draft_logits[
+                    j, :K_actual
+                ]
+
+        target_vocab = self.vllm_config.model_config.get_vocab_size()
+        draft_toks = draft_toks.clamp(min=0, max=target_vocab - 1)
+        for j, orig_i in enumerate(active_req_indices):
+            self.draft_tokens[orig_i] = draft_toks[j]
+
+        return self.draft_tokens[:num_reqs]
+
+    # ------------------------------------------------------------------
+    # FREE_SEQ / PREFILL / SPECULATE dispatch helpers
+    # ------------------------------------------------------------------
+
+    def _run_async(self, coro):
+        """Run an async connector call synchronously on the dedicated loop."""
+        assert self._nm_event_loop is not None
+        return self._nm_event_loop.run_until_complete(coro)
+
+    def _free_stale_requests(self, req_ids: list[str]) -> None:
+        """Send FREE_SEQ per draft server for requests no longer active."""
+        assert self.router is not None
+        active_rids = set(req_ids)
+        stale = self._disagg_prefilled_reqs - active_rids
+        if not stale:
+            return
+        self._disagg_prefilled_reqs -= stale
+        stale_by_server: dict[int, list[int]] = defaultdict(list)
+        for rid in stale:
+            sid = self._disagg_req_to_seq_id.pop(rid, None)
+            if sid is not None:
+                self._disagg_free_seq_ids.append(sid)
+                if rid in self.router.assignment:
+                    srv_idx = self.router.assignment[rid]
+                    stale_by_server[srv_idx].append(sid)
+            self.router.release(rid)
+        for srv_idx, sids in stale_by_server.items():
+            free_ids = torch.tensor(
+                sids, dtype=torch.int64, device=self.device,
+            )
+            connector = self.router.connectors[srv_idx]
+            try:
+                self._run_async(connector.send_free_seq(free_ids))
+            except Exception as e:
+                logger.warning(
+                    "FREE_SEQ to draft server %d failed: %s", srv_idx, e,
+                )
+
+    def _prefill_new_requests(self, new_req_ids: list[str]) -> None:
+        """Assign each new request to a draft server and PREFILL it."""
+        assert self.router is not None
+
+        # Allocate seq_ids for new requests (recycled from freed ones
+        # when available).
+        for rid in new_req_ids:
+            if rid in self._disagg_req_to_seq_id:
+                continue
+            if self._disagg_free_seq_ids:
+                sid = self._disagg_free_seq_ids.pop()
+            else:
+                sid = self._disagg_next_seq_id
+                self._disagg_next_seq_id += 1
+            self._disagg_req_to_seq_id[rid] = sid
+
+        for rid in new_req_ids:
+            prompt_ids = self._pending_prompt_tokens.pop(rid, None)
+            if not prompt_ids:
+                logger.warning(
+                    "Disagg prefill req %s: no cached prompt tokens, "
+                    "skipping.", rid,
+                )
+                continue
+
+            try:
+                connector = self.router.assign(rid)
+            except RuntimeError:
+                logger.error(
+                    "No available draft servers for prefill of req %s", rid,
+                )
+                continue
+
+            prompt_ids_t = torch.tensor(
+                prompt_ids, dtype=torch.int64, device=self.device,
+            )
+            try:
+                self._run_async(
+                    connector.send_prefill(
+                        seq_id=self._disagg_req_to_seq_id[rid],
+                        prompt_token_ids=prompt_ids_t,
+                    )
+                )
+            except Exception as e:
+                logger.error("PREFILL for req %s failed: %s", rid, e)
+                continue
+
+        self._disagg_prefilled_reqs.update(new_req_ids)
+
+    def _dispatch_speculation(
+        self,
+        active_req_ids: list[str],
+        seq_ids: torch.Tensor,
+        k_accepted: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+        B_active: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Group requests by draft server, send per-server SPECULATEs
+        concurrently, stitch results back to active-batch order."""
+        assert self.router is not None
+        K = self.num_speculative_steps
+
+        server_groups: dict[int, list[int]] = defaultdict(list)
+        for j, rid in enumerate(active_req_ids):
+            if rid in self.router.assignment:
+                srv_idx = self.router.assignment[rid]
+            else:
+                self.router.assign(rid)
+                srv_idx = self.router.assignment[rid]
+            server_groups[srv_idx].append(j)
+
+        draft_toks_out = torch.zeros(
+            B_active, K, dtype=torch.int64, device=self.device,
+        )
+        draft_logits_out: torch.Tensor | None = None
+        needs_logits = self.draft_logits is not None
+
+        srv_order: list[int] = []
+        srv_local_indices: list[list[int]] = []
+        coros: list[Any] = []
+        for srv_idx, local_indices in server_groups.items():
+            connector = self.router.connectors[srv_idx]
+            n = len(local_indices)
+            idx_t = torch.tensor(
+                local_indices, dtype=torch.int64, device=self.device,
+            )
+            srv_order.append(srv_idx)
+            srv_local_indices.append(local_indices)
+            coros.append(
+                connector.send_and_recv_speculation(
+                    batch_size=n,
+                    seq_ids=seq_ids[idx_t],
+                    k_accepted=k_accepted[idx_t],
+                    bonus_tokens=bonus_tokens[idx_t],
+                    temperatures=temperatures[idx_t],
+                    needs_logits=needs_logits,
+                )
+            )
+
+        if not coros:
+            return draft_toks_out, draft_logits_out
+
+        async def _gather():
+            return await asyncio.gather(*coros, return_exceptions=True)
+
+        results = self._run_async(_gather())
+        for srv_idx, local_indices, result in zip(
+            srv_order, srv_local_indices, results
+        ):
+            if isinstance(result, ConnectionError):
+                logger.warning(
+                    "Draft server %d failed (%s); marking unavailable.",
+                    srv_idx, result,
+                )
+                self.router.handle_server_failure(srv_idx)
+                continue
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Draft server %d error: %s; affected requests "
+                    "get zero drafts.", srv_idx, result,
+                )
+                continue
+
+            _, srv_draft_toks, srv_draft_logits = result
+            for local_j, global_j in enumerate(local_indices):
+                if local_j < srv_draft_toks.shape[0]:
+                    draft_toks_out[global_j] = srv_draft_toks[local_j]
+
+            if srv_draft_logits is not None:
+                if draft_logits_out is None:
+                    draft_logits_out = torch.zeros(
+                        B_active, K, self.vocab_size,
+                        dtype=self.dtype, device=self.device,
+                    )
+                for local_j, global_j in enumerate(local_indices):
+                    if local_j < srv_draft_logits.shape[0]:
+                        K_actual = min(
+                            srv_draft_logits.shape[1],
+                            draft_logits_out.shape[1],
+                        )
+                        draft_logits_out[global_j, :K_actual] = (
+                            srv_draft_logits[local_j, :K_actual]
+                        )
+
+        return draft_toks_out, draft_logits_out
+
+
+class _DisaggDraftModelStub(torch.nn.Module):
+    """Stub exposed via ``speculator.model`` so the model runner's
+    generic handling (e.g. eplb registration) doesn't crash. The real
+    draft model lives on a separate process on a separate GPU."""
+
+    def __init__(self):
+        super().__init__()

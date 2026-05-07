@@ -251,6 +251,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+
+        # Wire up req_states to Disagg draft speculator for prompt token access.
+        if (self.speculator is not None
+                and hasattr(self.speculator, 'set_req_states')):
+            self.speculator.set_req_states(self.req_states)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -884,6 +889,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     req_index,
                     new_req_data.pooling_params,
                     new_req_data.prompt_token_ids,
+                )
+
+            # Cache prompt tokens for Disagg draft speculator prefill.
+            if (self.speculator is not None
+                    and hasattr(self.speculator, 'cache_new_request_tokens')):
+                self.speculator.cache_new_request_tokens(
+                    req_id, new_req_data.prompt_token_ids
                 )
 
             if self.encoder_cache is not None:
@@ -1610,6 +1622,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+
+            # Disaggregated speculation: only TP rank 0 talks to the
+            # draft server; other ranks start with zeros. Broadcast
+            # authoritative tokens so the next target forward-pass sees
+            # identical inputs on every rank (required for TP all-reduce).
+            if (hasattr(self.speculator, '_tp_rank')
+                    and self.parallel_config.tensor_parallel_size > 1):
+                from vllm.distributed.parallel_state import get_tp_group
+                tp_group = get_tp_group()
+                draft_buf = self.req_states.draft_tokens[
+                    input_batch.idx_mapping
+                ]
+                torch.distributed.broadcast(
+                    draft_buf, src=tp_group.first_rank,
+                    group=tp_group.device_group,
+                )
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping
+                ] = draft_buf
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

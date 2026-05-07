@@ -648,6 +648,11 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_disagg():
+                # Disagg uses a disaggregated draft worker on a separate GPU.
+                # No local drafter is needed — the speculator proxy
+                # handles communication with the draft worker via NCCL.
+                self.drafter = None  # type: ignore[assignment]
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -4614,7 +4619,7 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         draft_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and not spec_config.use_disagg():
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = self._input_fits_in_drafter(
                 spec_decode_common_attn_metadata
@@ -4737,6 +4742,12 @@ class GPUModelRunner(
                     | Gemma4Proposer,
                 )
                 self.drafter.dummy_run(num_tokens=1)
+
+        # Disaggregated speculative decoding: draft tokens come from a
+        # remote draft server via ZMQ. Fetched after bookkeeping so
+        # valid_sampled_token_ids is finalised.
+        if spec_config is not None and spec_config.use_disagg():
+            self._disagg_propose_drafts(valid_sampled_token_ids)
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -4865,6 +4876,113 @@ class GPUModelRunner(
             self.input_batch.is_token_ids[i, pos] = True
             self.input_batch.num_tokens_no_spec[i] = pos + 1
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
+    def _disagg_propose_drafts(
+        self,
+        valid_sampled_token_ids,
+    ) -> None:
+        """Fetch draft tokens from remote draft server(s).
+
+        Only TP rank 0 talks to the draft server(s); other ranks
+        initialise with zeros and receive the authoritative tokens via
+        a TP broadcast at the end so the next target forward-pass sees
+        identical inputs on every rank.
+        """
+        num_reqs = self.input_batch.num_reqs
+
+        # Lazily create the speculator proxy on first use (TP rank 0 only).
+        if not hasattr(self, "_disagg_speculator"):
+            from vllm.distributed.parallel_state import get_tp_group
+            from vllm.v1.worker.gpu.spec_decode import init_speculator
+            tp_rank = get_tp_group().rank_in_group
+            self._disagg_tp_rank = tp_rank
+            self._disagg_speculator = None
+            if tp_rank == 0:
+                self._disagg_speculator = init_speculator(
+                    self.vllm_config, self.device,
+                )
+
+        speculator = self._disagg_speculator
+        if speculator is not None and speculator.is_connected:
+            # Cache prompt tokens for new requests so the speculator's
+            # prefill path can send them to the draft server without
+            # re-reading the input batch.
+            for rid in self.input_batch.req_ids:
+                if rid in speculator._disagg_prefilled_reqs:
+                    continue
+                if rid in speculator._pending_prompt_tokens:
+                    continue
+                req = self.requests.get(rid)
+                if req is None:
+                    continue
+                n_prompt = req.num_prompt_tokens
+                req_idx = self.input_batch.req_id_to_index[rid]
+                prompt_ids = self.input_batch.token_ids_cpu[
+                    req_idx, :n_prompt
+                ].tolist()
+                speculator.cache_new_request_tokens(rid, prompt_ids)
+
+            # Build num_sampled + last_sampled tensors from the list-of-lists
+            # returned by _bookkeeping_sync. valid_sampled_token_ids[i] is
+            # [accepted_0, ..., bonus_token] so len-1 is k_accepted and
+            # the last element is the bonus token.
+            max_sampled = (
+                max(len(ids) for ids in valid_sampled_token_ids)
+                if valid_sampled_token_ids else 1
+            )
+            padded = [
+                ids + [0] * (max_sampled - len(ids))
+                for ids in valid_sampled_token_ids
+            ]
+            num_sampled_t = torch.tensor(
+                [len(ids) for ids in valid_sampled_token_ids],
+                dtype=torch.int64, device=self.device,
+            )
+            last_sampled_t = torch.tensor(
+                padded, dtype=torch.int64, device=self.device,
+            ).unsqueeze(-1)
+
+            try:
+                draft_tensor = speculator.propose(
+                    input_batch=self.input_batch,
+                    num_sampled=num_sampled_t,
+                    last_sampled=last_sampled_t,
+                    temperature=torch.ones(num_reqs, device=self.device),
+                )
+                self._draft_token_ids = draft_tensor.tolist()
+            except Exception as e:
+                logger.warning(
+                    "Disagg propose failed: %s. Returning zero drafts.", e,
+                )
+                self._draft_token_ids = [
+                    [0] * self.num_spec_tokens for _ in range(num_reqs)
+                ]
+        else:
+            # Non-rank-0 TP workers initialise with zeros; the real
+            # tokens arrive via the TP broadcast below.
+            self._draft_token_ids = [
+                [0] * self.num_spec_tokens for _ in range(num_reqs)
+            ]
+
+        # Broadcast draft tokens from TP rank 0 to all ranks. The next
+        # target forward pass writes these into input_ids, and TP
+        # all-reduce requires identical inputs on every rank.
+        if self.parallel_config.tensor_parallel_size > 1:
+            from vllm.distributed.parallel_state import get_tp_group
+            tp_group = get_tp_group()
+            draft_buf = torch.tensor(
+                self._draft_token_ids,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            torch.distributed.broadcast(
+                draft_buf, src=tp_group.first_rank,
+                group=tp_group.device_group,
+            )
+            self._draft_token_ids = draft_buf.tolist()
+
+        self._draft_token_req_ids = self.input_batch.req_ids.copy()
+
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
