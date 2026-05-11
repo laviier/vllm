@@ -141,6 +141,11 @@ class DraftServer:
         self.saguaro_c = spec_config.disagg_saguaro_c
         self.jit_fallback = spec_config.disagg_jit_fallback
 
+        # Parallel fanout: use single-pass MTP-style drafting when the
+        # model supports it (configured via speculative_config).
+        self._use_parallel_fanout = spec_config.disagg_parallel_fanout
+        self._mtp_token_id: int = spec_config.disagg_mtp_token_id
+
         # Determine device (use current CUDA device, set by entrypoint)
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -309,6 +314,14 @@ class DraftServer:
             self.vocab_size,
             self.device,
         )
+
+        # --- Log parallel fanout status ---
+        if self._use_parallel_fanout:
+            logger.info(
+                "Parallel fanout ENABLED: mtp_token_id=%d, "
+                "all depths generated in single forward pass",
+                self._mtp_token_id,
+            )
 
     async def serve(self) -> None:
         """Main loop: accept commands from multiple verify servers.
@@ -1405,6 +1418,116 @@ class DraftServer:
 
         return all_tokens, all_logits
 
+    def _run_parallel_fanout(
+        self,
+        runner: Any,
+        N: int,
+        K: int,
+        seq_ids: torch.Tensor,
+        entry_batch_ids: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        branch_block_tables: torch.Tensor,
+        bonus_candidates: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-pass parallel fanout for MTP-style draft models.
+
+        Instead of K sequential tree_decode_step calls, generates all
+        N×K tokens in ONE forward pass. The parallel draft model uses:
+        - Depth-1: bonus candidate token embedding (seeds the branch)
+        - Depth-2+: MTP mask token embedding (model predicts independently)
+
+        Each token is a separate 1-token "sequence" in the varlen batch.
+        Depths within a branch do NOT attend to each other (no intra-branch
+        KV dependency) — they only attend to the shared prefix context.
+        This is the key property of the parallel draft model that enables
+        single-pass generation.
+
+        Args:
+            runner: DraftModelRunner instance
+            N: number of branches
+            K: speculation depth per branch
+            seq_ids: [B] sequence IDs
+            entry_batch_ids: [N] maps each branch to its batch index
+            prefix_lens: [N] prefix length per branch (prefix + spec[:k_j])
+            branch_block_tables: [N, max_blocks] per-branch block tables
+            bonus_candidates: [N] seed tokens for depth-1
+
+        Returns:
+            all_tokens: [N, K] generated draft tokens
+            all_logits: [N, K, V] logits at each position
+        """
+        total_tokens = N * K
+
+        # --- Build input_ids: [N*K] ---
+        # Layout: [br0_d0, br0_d1, ..., br0_dK-1, br1_d0, ..., brN_dK-1]
+        # Depth 0 (first in each branch): bonus candidate token
+        # Depth 1+ (rest): MTP mask token
+        input_ids = torch.full(
+            (total_tokens,), self._mtp_token_id,
+            dtype=torch.int32, device=self.device,
+        )
+        # Set depth-0 positions to bonus candidates
+        depth0_indices = torch.arange(
+            0, total_tokens, K, device=self.device
+        )
+        input_ids[depth0_indices] = bonus_candidates.to(torch.int32)
+
+        # --- Build positions: [N*K] ---
+        # Branch j, depth d → prefix_lens[j] + d
+        # Each branch starts at its prefix_len (which already includes
+        # the verified prefix + accepted spec tokens up to k_j)
+        positions = torch.zeros(
+            total_tokens, dtype=torch.int64, device=self.device
+        )
+        depth_offsets = torch.arange(K, device=self.device, dtype=torch.int64)
+        for branch_idx in range(N):
+            start = branch_idx * K
+            positions[start:start + K] = prefix_lens[branch_idx] + depth_offsets
+
+        # --- Build seq_lens: [N*K] ---
+        # For parallel model: each token only attends to the prefix
+        # (no intra-branch KV dependency). seq_len = prefix_lens + 1
+        # (the +1 accounts for the current token itself in the attention
+        # computation — FlashAttention uses seq_len as the total KV length
+        # including the current position being written).
+        #
+        # IMPORTANT: We use prefix_lens + 1 for ALL depths, not
+        # prefix_lens + depth + 1. This is the key difference from
+        # sequential tree decode — depths don't see each other's KV.
+        seq_lens = torch.zeros(
+            total_tokens, dtype=torch.int32, device=self.device
+        )
+        for branch_idx in range(N):
+            start = branch_idx * K
+            # All depths in this branch see the same context length
+            seq_lens[start:start + K] = (prefix_lens[branch_idx] + 1).to(
+                torch.int32
+            )
+
+        # --- Build block_tables: [N*K, max_blocks] ---
+        # All depths in a branch share the same block table (they all
+        # attend to the same prefix KV, no branch-local KV needed).
+        block_tables_expanded = branch_block_tables.repeat_interleave(
+            K, dim=0
+        )
+
+        # --- Run single forward pass ---
+        max_context_hint = int(prefix_lens.max().item()) + K + 1
+        logits_flat = runner.tree_decode_step(
+            input_ids=input_ids,
+            positions=positions,
+            seq_lens=seq_lens,
+            seq_ids_expanded=seq_ids[entry_batch_ids].repeat_interleave(K),
+            block_tables=block_tables_expanded,
+            max_seq_len_hint=max_context_hint,
+        )
+
+        # --- Reshape outputs: [N*K] → [N, K] ---
+        all_logits = logits_flat.view(N, K, -1)
+        all_tokens = all_logits.argmax(dim=-1)
+
+        return all_tokens, all_logits
+
     def _build_standalone_cache(
         self,
         B: int, K: int,
@@ -1466,16 +1589,28 @@ class DraftServer:
             return
         branch_block_tables, prefix_lens = alloc
 
-        all_tokens, all_logits = self._run_tree_decode(
-            runner=runner,
-            N=N,
-            K=K,
-            seq_ids=seq_ids,
-            entry_batch_ids=entry_batch_ids,
-            prefix_lens=prefix_lens,
-            branch_block_tables=branch_block_tables,
-            bonus_candidates=bonus_candidates,
-        )
+        if self._use_parallel_fanout:
+            all_tokens, all_logits = self._run_parallel_fanout(
+                runner=runner,
+                N=N,
+                K=K,
+                seq_ids=seq_ids,
+                entry_batch_ids=entry_batch_ids,
+                prefix_lens=prefix_lens,
+                branch_block_tables=branch_block_tables,
+                bonus_candidates=bonus_candidates,
+            )
+        else:
+            all_tokens, all_logits = self._run_tree_decode(
+                runner=runner,
+                N=N,
+                K=K,
+                seq_ids=seq_ids,
+                entry_batch_ids=entry_batch_ids,
+                prefix_lens=prefix_lens,
+                branch_block_tables=branch_block_tables,
+                bonus_candidates=bonus_candidates,
+            )
 
         self.cache.populate(
             seq_ids=seq_ids[entry_batch_ids],

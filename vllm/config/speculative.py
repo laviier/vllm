@@ -335,6 +335,19 @@ class SpeculativeConfig:
     """Log a warning when draft round-trip latency exceeds this threshold
     (in milliseconds)."""
 
+    disagg_parallel_fanout: bool = False
+    """Enable single-pass parallel fanout for the draft server's cache build.
+    When True, the draft server generates all fanout tokens (N branches × K
+    depths) in a single forward pass using the MTP mask token at depth > 1,
+    instead of K sequential autoregressive steps. Requires a draft model
+    trained with the parallel prediction (MTP) objective."""
+
+    disagg_mtp_token_id: int = 200019
+    """Token ID of the <our_mtp_token> mask embedding used for parallel
+    fanout. This is the input token fed at depth > 1 positions during
+    single-pass parallel speculation. The model's embedding at this ID
+    must be trained with the MTP objective."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
