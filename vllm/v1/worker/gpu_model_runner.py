@@ -593,7 +593,13 @@ class GPUModelRunner(
                 | Gemma4Proposer
                 | Step3p5MTPProposer
             )
-            if self.speculative_config.method == "custom_class":
+            if self.speculative_config.use_disagg():
+                # Disagg uses a remote draft worker over ZMQ; no local
+                # drafter is loaded on the verify side. Must short-circuit
+                # before any method-specific branch since disagg can
+                # coexist with method='draft_model'.
+                self.drafter = None  # type: ignore[assignment]
+            elif self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
                     self.vllm_config
                 )
@@ -648,11 +654,6 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
-            elif self.speculative_config.use_disagg():
-                # Disagg uses a disaggregated draft worker on a separate GPU.
-                # No local drafter is needed — the speculator proxy
-                # handles communication with the draft worker via NCCL.
-                self.drafter = None  # type: ignore[assignment]
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -5426,7 +5427,7 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if hasattr(self, "drafter") and self.drafter is not None:
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
                         self.drafter.load_model(self.model)
@@ -6256,10 +6257,14 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and not self.speculative_config.use_disagg()
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -7238,9 +7243,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config
+            and not self.speculative_config.use_disagg()
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -7292,10 +7301,14 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and not self.speculative_config.use_disagg()
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
