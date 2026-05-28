@@ -107,6 +107,22 @@ class DraftServerMetrics:
         self._total_lookups: int = 0
         self._total_hits: int = 0
 
+        # Cross-VS SPECULATE merge counters (Option A).
+        self.draft_speculate_total = prometheus_client.Counter(
+            name="vllm:draft_server_speculate_total",
+            documentation=(
+                "Total SPECULATEs processed (a merged round counts as 2)."
+            ),
+        )
+        self.draft_speculate_merged = prometheus_client.Counter(
+            name="vllm:draft_server_speculate_merged_total",
+            documentation=(
+                "SPECULATEs that participated in a cross-VS merged "
+                "batch (counts each VS individually, so a successful "
+                "2-VS merge increments by 2)."
+            ),
+        )
+
 
 class DraftServer:
     """Standalone draft server accepting requests from N verify servers.
@@ -216,6 +232,25 @@ class DraftServer:
 
         # Server lifecycle flag
         self._running = False
+
+        # ----- Cross-VS SPECULATE merging (Option A) -----
+        # When enabled, the serve loop opportunistically peeks for a
+        # second pending SPECULATE after receiving the first, and runs
+        # both as a single merged batch. This collapses the 2× draft
+        # serialization observed in 2V+1D under sustained load.
+        # Default off; enable by setting DISAGG_MERGE_SPECULATES=1.
+        # DISAGG_MERGE_PEEK_MS controls how long to wait (in ms) for a
+        # second pending SPECULATE from a different VS before giving up
+        # and processing the first message alone.
+        self._merge_speculates: bool = (
+            os.environ.get("DISAGG_MERGE_SPECULATES") == "1"
+        )
+        try:
+            self._merge_peek_timeout_ms: int = int(
+                os.environ.get("DISAGG_MERGE_PEEK_MS", "1")
+            )
+        except ValueError:
+            self._merge_peek_timeout_ms = 1
 
         # ----- torch.profiler hooks (toggled via start/stop_profile) -----
         # Active when VLLM_DRAFT_TORCH_PROFILER_DIR is set in the env and
@@ -358,55 +393,124 @@ class DraftServer:
 
             # --- Receive ZMQ messages ---
             if self._socket in events:
-                try:
-                    frames = await self._socket.recv_multipart(
-                        flags=zmq.NOBLOCK
-                    )
-                except Exception:
+                msg = await self._recv_one_message(zmq)
+                if msg is None:
                     if not self._running:
                         break
-                    logger.exception("DraftServer recv error")
                     continue
 
-                # ZMQ ROUTER frames: [identity, metadata, tensor0, ...]
-                # DEALER sends [metadata, t0, ...] → ROUTER prepends identity.
-                # There is NO empty delimiter when using send_multipart.
-                if len(frames) < 2:
-                    logger.warning(
-                        "DraftServer received malformed message "
-                        "with %d frames (need ≥2), skipping",
-                        len(frames),
+                # If this is a SPECULATE and cross-VS merging is enabled,
+                # try to peek for a second pending SPECULATE (NOBLOCK)
+                # from a DIFFERENT vs_id, and process them as one merged
+                # batch. Otherwise dispatch normally.
+                vs_id, identity, command, frames = msg
+                merged: list[tuple[str, bytes, DraftCommand,
+                                   list[bytes]]] | None = None
+                if (
+                    self._merge_speculates
+                    and command.command.upper() == "SPECULATE"
+                ):
+                    msg2 = await self._try_recv_second_speculate(
+                        zmq, exclude_vs_id=vs_id,
                     )
+                    if msg2 is not None:
+                        merged = [msg, msg2]
+
+                if merged is not None:
+                    self._verify_server_last_seen[vs_id] = time.monotonic()
+                    self._verify_server_last_seen[merged[1][0]] = (
+                        time.monotonic()
+                    )
+                    await self._handle_speculation_merged(merged)
                 else:
-                    identity = frames[0]
-                    metadata_frame = frames[1]
-                    tensor_frames = frames[2:]  # may be empty (NCCL path)
-                    verify_server_id = identity.decode(
-                        "utf-8", errors="replace"
-                    )
-
-                    try:
-                        command = decode_command(metadata_frame)
-                    except Exception:
-                        logger.exception(
-                            "DraftServer failed to decode command from %s",
-                            verify_server_id,
-                        )
-                        continue
-
-                    # Store tensor frames for this message.
-                    tensor_frame_list = list(tensor_frames)
-
-                    self._current_tensor_frames = tensor_frame_list
+                    self._current_tensor_frames = frames
                     self._current_tensor_idx = 0
-
-                    await self._dispatch(
-                        verify_server_id, identity, command
-                    )
+                    await self._dispatch(vs_id, identity, command)
 
             # Check for verify servers that have timed out and evict
             # their requests.
             self._check_evictions()
+
+    async def _recv_one_message(
+        self, zmq: Any,
+    ) -> tuple[str, bytes, DraftCommand, list[bytes]] | None:
+        """Receive one full ZMQ message; decode header. Returns None on
+        recv error or malformed input. Returns (vs_id, identity, command,
+        tensor_frames) on success.
+        """
+        try:
+            frames = await self._socket.recv_multipart(
+                flags=zmq.NOBLOCK
+            )
+        except Exception:
+            if not self._running:
+                return None
+            logger.exception("DraftServer recv error")
+            return None
+
+        if len(frames) < 2:
+            logger.warning(
+                "DraftServer received malformed message with %d frames; "
+                "skipping", len(frames),
+            )
+            return None
+
+        identity = frames[0]
+        metadata_frame = frames[1]
+        tensor_frames = list(frames[2:])
+        vs_id = identity.decode("utf-8", errors="replace")
+
+        try:
+            command = decode_command(metadata_frame)
+        except Exception:
+            logger.exception(
+                "DraftServer failed to decode command from %s", vs_id,
+            )
+            return None
+
+        return vs_id, identity, command, tensor_frames
+
+    async def _try_recv_second_speculate(
+        self, zmq: Any, exclude_vs_id: str,
+        peek_timeout_ms: int | None = None,
+    ) -> tuple[str, bytes, DraftCommand, list[bytes]] | None:
+        """Opportunistically peek for a second pending SPECULATE from a
+        different VS. Returns the message tuple if one is available
+        within ``peek_timeout_ms`` and the command is a SPECULATE from
+        a VS other than ``exclude_vs_id``; otherwise returns None.
+
+        On a non-SPECULATE message or a same-VS SPECULATE, the message
+        is dispatched normally inline before returning None — so we
+        never drop messages.
+        """
+        # Quick poll: if nothing's pending now (or within 1ms), return.
+        if peek_timeout_ms is None:
+            peek_timeout_ms = self._merge_peek_timeout_ms
+        poller = zmq.asyncio.Poller()
+        poller.register(self._socket, zmq.POLLIN)
+        try:
+            events = dict(await poller.poll(timeout=peek_timeout_ms))
+        except Exception:
+            return None
+        if self._socket not in events:
+            return None
+
+        msg = await self._recv_one_message(zmq)
+        if msg is None:
+            return None
+        vs_id2, identity2, command2, frames2 = msg
+        if (
+            command2.command.upper() == "SPECULATE"
+            and vs_id2 != exclude_vs_id
+        ):
+            return msg
+
+        # Not a SPECULATE we can merge — dispatch it normally and skip.
+        self._verify_server_last_seen[vs_id2] = time.monotonic()
+        self._current_tensor_frames = frames2
+        self._current_tensor_idx = 0
+        await self._dispatch(vs_id2, identity2, command2)
+        return None
 
     async def shutdown(self) -> None:
         """Gracefully stop the server loop and release resources."""
@@ -504,6 +608,7 @@ class DraftServer:
 
         if cmd == "SPECULATE":
             outcome = decode(command.payload, VerificationOutcome)
+            self.metrics.draft_speculate_total.inc()
             # Process immediately — sequential is correct for ZMQ
             # tensor transport (frames must be consumed before next msg).
             await self._handle_speculation(
@@ -713,18 +818,32 @@ class DraftServer:
         self,
         shape: tuple[int, ...],
         dtype: torch.dtype,
+        frames: list[bytes] | None = None,
+        idx_state: list[int] | None = None,
     ) -> torch.Tensor:
-        """Consume the next tensor frame from the current ZMQ message."""
-        idx = self._current_tensor_idx
-        self._current_tensor_idx += 1
-        if idx >= len(self._current_tensor_frames):
+        """Consume the next tensor frame from a ZMQ message.
+
+        Default (frames=None) reads from self._current_tensor_frames /
+        self._current_tensor_idx. When merging two SPECULATEs, callers
+        pass explicit frames + a single-element list cursor to keep the
+        two messages' tensor streams separate.
+        """
+        if frames is None:
+            frames = self._current_tensor_frames
+            idx = self._current_tensor_idx
+            self._current_tensor_idx += 1
+        else:
+            assert idx_state is not None
+            idx = idx_state[0]
+            idx_state[0] += 1
+        if idx >= len(frames):
             logger.warning(
                 "DraftServer: tensor frame %d missing (have %d frames), "
                 "returning zeros for shape=%s dtype=%s",
-                idx, len(self._current_tensor_frames), shape, dtype,
+                idx, len(frames), shape, dtype,
             )
             return torch.zeros(shape, dtype=dtype, device=self.device)
-        buf = self._current_tensor_frames[idx]
+        buf = frames[idx]
         recv_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
         return torch.frombuffer(
             bytearray(buf), dtype=recv_dtype,
@@ -883,32 +1002,40 @@ class DraftServer:
         self,
         verify_server_id: str,
         outcome: VerificationOutcome,
+        frames: list[bytes] | None = None,
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None,
     ]:
         """Read seq_ids, k_accepted, bonus_tokens, temperatures off the wire.
 
         Order must match ZmqDraftConnector.send_and_recv_speculation.
-        Remaps seq_ids into the draft-local internal numbering.
+        Remaps seq_ids into the draft-local internal numbering. If
+        ``frames`` is provided, reads from that list instead of the
+        instance-level cursor (used for cross-VS SPECULATE merging).
         """
+        idx_state = [0] if frames is not None else None
         seq_ids = self._recv_tensor(
             outcome.seq_ids_ref.shape,
             _str_to_dtype(outcome.seq_ids_ref.dtype),
+            frames=frames, idx_state=idx_state,
         )
         seq_ids = self._remap_seq_ids(verify_server_id, seq_ids)
         k_accepted = self._recv_tensor(
             outcome.k_accepted_ref.shape,
             _str_to_dtype(outcome.k_accepted_ref.dtype),
+            frames=frames, idx_state=idx_state,
         )
         bonus_tokens = self._recv_tensor(
             outcome.bonus_tokens_ref.shape,
             _str_to_dtype(outcome.bonus_tokens_ref.dtype),
+            frames=frames, idx_state=idx_state,
         )
         temperatures: torch.Tensor | None = None
         if outcome.temperatures_ref is not None:
             temperatures = self._recv_tensor(
                 outcome.temperatures_ref.shape,
                 _str_to_dtype(outcome.temperatures_ref.dtype),
+                frames=frames, idx_state=idx_state,
             )
         return seq_ids, k_accepted, bonus_tokens, temperatures
 
@@ -1131,6 +1258,310 @@ class DraftServer:
         return (cache_hits, draft_tokens,
                 draft_logits if send_logits else None,
                 send_logits)
+
+    # ------------------------------------------------------------------
+    # Merged SPECULATE handler (Option A: cross-VS batching)
+    # ------------------------------------------------------------------
+
+    async def _handle_speculation_merged(
+        self,
+        items: list[tuple[str, bytes, DraftCommand, list[bytes]]],
+    ) -> None:
+        """Run two SPECULATEs (one per VS) as a single merged forward.
+
+        Each item is (vs_id, identity, command, tensor_frames). The
+        merge concatenates seq_ids/k_accepted/bonus/temperatures along
+        the batch dim, runs ONE pass through cache_lookup → swap →
+        jit → response, then splits outputs back per-VS, sends
+        per-VS SpeculationResponse, and schedules per-VS cache builds.
+
+        Per-VS bookkeeping (dedicated-block exclusion, swap_states,
+        round_base_lens, _last_*_tokens for cache build) stays
+        per-VS-correct because we track which batch indices originated
+        from which VS via ``entry_vs``.
+        """
+        with torch.profiler.record_function(
+            f"speculate_merged_n{len(items)}"
+        ):
+            with torch.profiler.record_function("await_inflight_cache_build"):
+                await self._await_inflight_cache_build()
+
+            try:
+                await self._handle_speculation_merged_inner(items)
+            except Exception:
+                logger.exception(
+                    "DraftServer _handle_speculation_merged failed; "
+                    "falling back to per-VS error responses."
+                )
+                for vs_id, identity, command, _frames in items:
+                    outcome = decode(command.payload, VerificationOutcome)
+                    try:
+                        await self._send_fallback_speculation(
+                            vs_id, identity, outcome.batch_size,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "DraftServer fallback to %s failed", vs_id,
+                        )
+
+    async def _handle_speculation_merged_inner(
+        self,
+        items: list[tuple[str, bytes, DraftCommand, list[bytes]]],
+    ) -> None:
+        # Each merged item is a real SPECULATE that, in the unmerged
+        # path, would have incremented draft_speculate_total via
+        # _dispatch. Mirror that here, plus mark how many participated
+        # in a merge (for counting merge effectiveness).
+        self.metrics.draft_speculate_total.inc(len(items))
+        if len(items) >= 2:
+            self.metrics.draft_speculate_merged.inc(len(items))
+
+        runner = self.draft_model_runner
+        if runner is None:
+            for vs_id, identity, command, _ in items:
+                outcome = decode(command.payload, VerificationOutcome)
+                await self._send_fallback_speculation(
+                    vs_id, identity, outcome.batch_size,
+                )
+            return
+
+        # ---- Per-VS recv: read each VS's tensors from its own frames ----
+        per_vs: list[dict[str, Any]] = []
+        for vs_id, identity, command, frames in items:
+            outcome = decode(command.payload, VerificationOutcome)
+            seq_ids, k_accepted, bonus_tokens, temperatures = (
+                self._recv_speculation_tensors(
+                    vs_id, outcome, frames=frames,
+                )
+            )
+            per_vs.append({
+                "vs_id": vs_id,
+                "identity": identity,
+                "outcome": outcome,
+                "B": outcome.batch_size,
+                "seq_ids": seq_ids,
+                "k_accepted": k_accepted,
+                "bonus_tokens": bonus_tokens,
+                "temperatures": temperatures,
+            })
+
+        # ---- Concatenate along batch dim ----
+        seq_ids_cat = torch.cat([p["seq_ids"] for p in per_vs], dim=0)
+        k_accepted_cat = torch.cat([p["k_accepted"] for p in per_vs], dim=0)
+        bonus_cat = torch.cat([p["bonus_tokens"] for p in per_vs], dim=0)
+        # All-or-nothing on temperatures: if any VS sent them, all must.
+        if all(p["temperatures"] is not None for p in per_vs):
+            temps_cat: torch.Tensor | None = torch.cat(
+                [p["temperatures"] for p in per_vs], dim=0,
+            )
+        else:
+            temps_cat = None
+
+        # entry_vs[i] = index into items for the i-th merged batch row
+        entry_vs: list[int] = []
+        for vs_idx, p in enumerate(per_vs):
+            entry_vs.extend([vs_idx] * p["B"])
+
+        B_total = seq_ids_cat.shape[0]
+        seq_ids_list = seq_ids_cat.tolist()
+
+        self._last_spec_seq_ids = seq_ids_cat
+        self.metrics.draft_batch_size.set(B_total)
+        _spec_start = time.monotonic()
+
+        # ---- Reconcile runner state ----
+        with torch.profiler.record_function("sync_seq_lens_merged"):
+            self._sync_runner_seq_lens_and_blocks(
+                runner, seq_ids_list, k_accepted_cat.tolist(),
+            )
+
+        # ---- Cache lookup (one merged call) ----
+        with torch.profiler.record_function("cache_lookup_merged"):
+            cached_tokens, cached_logits, cache_hits, _hs = (
+                self.cache.lookup(
+                    seq_ids=seq_ids_cat,
+                    k_accepted=k_accepted_cat,
+                    bonus_tokens=bonus_cat,
+                )
+            )
+        num_hits = int(cache_hits.sum().item())
+        hit_mask = cache_hits.bool()
+        miss_mask = ~hit_mask
+        self.metrics._total_lookups += B_total
+        self.metrics._total_hits += num_hits
+        if self.metrics._total_lookups > 0:
+            self.metrics.draft_cache_hit_rate.set(
+                self.metrics._total_hits / self.metrics._total_lookups
+            )
+
+        draft_tokens = torch.zeros(
+            B_total, self.K, dtype=torch.int64, device=self.device,
+        )
+        draft_logits = torch.zeros(
+            B_total, self.K, self.vocab_size,
+            dtype=self.dtype, device=self.device,
+        )
+
+        # ---- Swap path (split owned blocks per VS) ----
+        used_swap_for_hits = False
+        if num_hits > 0 and cached_logits is not None:
+            with torch.profiler.record_function(
+                f"swap_hits_merged_{num_hits}"
+            ):
+                hit_tables, hit_prefix_lens = (
+                    self.cache.get_hit_block_tables(cache_hits)
+                )
+                if hit_tables is not None and hit_prefix_lens is not None:
+                    hit_seq_ids = seq_ids_cat[hit_mask]
+                    owned, displaced = runner.swap_block_tables(
+                        seq_ids=hit_seq_ids,
+                        branch_block_tables=hit_tables,
+                        prefix_lens=hit_prefix_lens,
+                        K=self.K,
+                    )
+                    # Map each sid back to its VS so dedicated-block
+                    # exclusion is scoped correctly.
+                    sid_to_vs: dict[int, str] = {}
+                    for i, sid in enumerate(seq_ids_list):
+                        sid_to_vs[sid] = per_vs[entry_vs[i]]["vs_id"]
+                    for sid, blocks in owned.items():
+                        runner.exclude_from_dedicated(
+                            blocks, sid_to_vs.get(sid, "__default__"),
+                        )
+                    if displaced:
+                        runner._free_list.extend(displaced)
+                    hit_indices = hit_mask.nonzero(as_tuple=True)[0]
+                    for compact_i, idx in enumerate(hit_indices):
+                        sid = seq_ids_list[int(idx.item())]
+                        prefix_len = int(hit_prefix_lens[compact_i].item())
+                        runner._seq_lens[sid] = prefix_len + self.K
+                    draft_tokens[hit_mask] = cached_tokens[hit_mask]
+                    draft_logits[hit_mask] = cached_logits[hit_mask]
+                    used_swap_for_hits = True
+
+        # ---- JIT misses (one merged call) ----
+        B_miss = int(miss_mask.sum().item())
+        if B_miss > 0:
+            with torch.profiler.record_function(
+                f"jit_misses_merged_B{B_miss}"
+            ):
+                miss_seq_ids = seq_ids_cat[miss_mask]
+                miss_bonus = bonus_cat[miss_mask]
+                miss_temps = (
+                    temps_cat[miss_mask] if temps_cat is not None else None
+                )
+                jit_tokens, jit_logits = self._jit_speculate(
+                    miss_seq_ids, miss_bonus,
+                    B_miss=B_miss, temperatures=miss_temps,
+                )
+                draft_tokens[miss_mask] = jit_tokens
+                if jit_logits is not None:
+                    draft_logits[miss_mask] = jit_logits
+
+        if not used_swap_for_hits:
+            for sid in seq_ids_list:
+                self._swap_states[sid] = {}
+
+        # Stash for cache build (split per-VS below).
+        self._last_draft_tokens = draft_tokens.clone()
+        self._last_draft_logits = draft_logits.clone()
+        self._last_bonus_tokens = bonus_cat.clone()
+
+        self.metrics.draft_generation_latency.observe(
+            time.monotonic() - _spec_start
+        )
+
+        # ---- Send per-VS responses ----
+        offset = 0
+        for vs_idx, p in enumerate(per_vs):
+            B = p["B"]
+            sl = slice(offset, offset + B)
+            send_logits = p["outcome"].needs_logits
+            with torch.profiler.record_function("send_speculation_response"):
+                await self._send_speculation_response(
+                    p["vs_id"], p["identity"],
+                    cache_hits[sl], draft_tokens[sl],
+                    draft_logits[sl] if send_logits else None,
+                )
+            offset += B
+
+        # ---- Schedule per-VS cache builds ----
+        # Each VS's cache build needs its own slice of seq_ids and the
+        # corresponding draft_tokens/logits/bonus tensors, since the
+        # cache key includes (seq_id, k_accepted, bonus). We assign
+        # _last_* per VS via a small wrapper.
+        offset = 0
+        cache_build_tasks: list[asyncio.Task] = []
+        for vs_idx, p in enumerate(per_vs):
+            B = p["B"]
+            sl = slice(offset, offset + B)
+            cache_build_tasks.append(asyncio.create_task(
+                self._run_cache_build_slice(
+                    B=B,
+                    seq_ids=seq_ids_cat[sl].clone(),
+                    bonus_tokens=bonus_cat[sl].clone(),
+                    draft_tokens=draft_tokens[sl].clone(),
+                    draft_logits=draft_logits[sl].clone(),
+                    vs_id=p["vs_id"],
+                )
+            ))
+            offset += B
+        # Track only the LAST task as _inflight_cache_build so the next
+        # round's await waits for both (asyncio gathers them via the
+        # serial scheduling on the same event loop). For correctness
+        # under errors, gather them sequentially via a coordinator task.
+        self._inflight_cache_build = asyncio.create_task(
+            self._await_cache_build_tasks(cache_build_tasks)
+        )
+
+    @staticmethod
+    async def _await_cache_build_tasks(
+        tasks: list[asyncio.Task],
+    ) -> None:
+        """Await all per-VS cache build tasks; log exceptions."""
+        for t in tasks:
+            try:
+                await t
+            except Exception:
+                logger.exception(
+                    "DraftServer per-VS cache build task failed."
+                )
+
+    async def _run_cache_build_slice(
+        self,
+        B: int,
+        seq_ids: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_logits: torch.Tensor,
+        vs_id: str,
+    ) -> None:
+        """Per-VS cache build using explicit slice tensors.
+
+        Mirrors ``_run_cache_build`` but takes tensors directly (rather
+        than reading from ``self._last_*``) so the merged handler can
+        build per-VS caches from one merged batch.
+        """
+        runner = self.draft_model_runner
+        if runner is None:
+            return
+        with torch.profiler.record_function(f"cache_build_slice_B{B}"):
+            saved = dict(runner._seq_lens)
+            # Temporarily override _last_* so _build_next_cache picks up
+            # the per-VS slice.
+            saved_tokens = self._last_draft_tokens
+            saved_logits = self._last_draft_logits
+            saved_bonus = self._last_bonus_tokens
+            self._last_draft_tokens = draft_tokens
+            self._last_draft_logits = draft_logits
+            self._last_bonus_tokens = bonus_tokens
+            try:
+                self._build_next_cache(B, seq_ids, vs_id)
+            finally:
+                runner._seq_lens = saved
+                self._last_draft_tokens = saved_tokens
+                self._last_draft_logits = saved_logits
+                self._last_bonus_tokens = saved_bonus
 
     # ------------------------------------------------------------------
     # Response helpers
