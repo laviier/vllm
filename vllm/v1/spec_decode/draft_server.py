@@ -402,13 +402,17 @@ class DraftServer:
                 # If this is a SPECULATE and cross-VS merging is enabled,
                 # try to peek for a second pending SPECULATE (NOBLOCK)
                 # from a DIFFERENT vs_id, and process them as one merged
-                # batch. Otherwise dispatch normally.
+                # batch. Otherwise dispatch normally. Skip the peek when
+                # only one VS is connected — the poll() call costs ~1ms
+                # per round even when nothing's pending and would
+                # regress single-VS latency for no benefit.
                 vs_id, identity, command, frames = msg
                 merged: list[tuple[str, bytes, DraftCommand,
                                    list[bytes]]] | None = None
                 if (
                     self._merge_speculates
                     and command.command.upper() == "SPECULATE"
+                    and len(self._verify_servers) >= 2
                 ):
                     msg2 = await self._try_recv_second_speculate(
                         zmq, exclude_vs_id=vs_id,
@@ -1485,33 +1489,27 @@ class DraftServer:
                 )
             offset += B
 
-        # ---- Schedule per-VS cache builds ----
-        # Each VS's cache build needs its own slice of seq_ids and the
-        # corresponding draft_tokens/logits/bonus tensors, since the
-        # cache key includes (seq_id, k_accepted, bonus). We assign
-        # _last_* per VS via a small wrapper.
+        # ---- Schedule one merged cache build covering both VSes ----
+        # Cache build's per-VS scoping is only needed for cache_partition
+        # reset and dedicated-block ownership; the actual GPU work
+        # (glue_decode, allocate-and-copy-KV, tree_decode) is naturally
+        # batched and runs ~once per merged round instead of twice.
+        slice_metas: list[dict[str, Any]] = []
         offset = 0
-        cache_build_tasks: list[asyncio.Task] = []
         for vs_idx, p in enumerate(per_vs):
             B = p["B"]
             sl = slice(offset, offset + B)
-            cache_build_tasks.append(asyncio.create_task(
-                self._run_cache_build_slice(
-                    B=B,
-                    seq_ids=seq_ids_cat[sl].clone(),
-                    bonus_tokens=bonus_cat[sl].clone(),
-                    draft_tokens=draft_tokens[sl].clone(),
-                    draft_logits=draft_logits[sl].clone(),
-                    vs_id=p["vs_id"],
-                )
-            ))
+            slice_metas.append({
+                "vs_id": p["vs_id"],
+                "B": B,
+                "seq_ids": seq_ids_cat[sl].clone(),
+                "bonus_tokens": bonus_cat[sl].clone(),
+                "draft_tokens": draft_tokens[sl].clone(),
+                "draft_logits": draft_logits[sl].clone(),
+            })
             offset += B
-        # Track only the LAST task as _inflight_cache_build so the next
-        # round's await waits for both (asyncio gathers them via the
-        # serial scheduling on the same event loop). For correctness
-        # under errors, gather them sequentially via a coordinator task.
         self._inflight_cache_build = asyncio.create_task(
-            self._await_cache_build_tasks(cache_build_tasks)
+            self._run_cache_build_merged(slice_metas)
         )
 
     @staticmethod
@@ -1526,6 +1524,282 @@ class DraftServer:
                 logger.exception(
                     "DraftServer per-VS cache build task failed."
                 )
+
+    async def _run_cache_build_merged(
+        self,
+        slice_metas: list[dict[str, Any]],
+    ) -> None:
+        """One merged cache build for the merged-SPECULATE path.
+
+        Replaces what was N separate per-VS ``_run_cache_build_slice``
+        tasks with a single forward over the concatenated batch.
+        Per-VS scoping (``cache.reset_vs``, ``recycle_dedicated_blocks``,
+        ``cache.populate``) is dispatched per slice; the heavy GPU work
+        (glue_decode, allocate-and-copy-KV, tree_decode) runs once.
+
+        Args:
+            slice_metas: Per-VS dicts with keys vs_id, B, seq_ids,
+                bonus_tokens, draft_tokens, draft_logits. Each tensor's
+                first dim equals B.
+        """
+        runner = self.draft_model_runner
+        if runner is None or not runner._model_loaded:
+            return
+        if len(slice_metas) == 0:
+            return
+
+        K = self.K
+        if (
+            self.cache is None
+            or self.outcome_predictor is None
+        ):
+            return
+
+        with torch.profiler.record_function(
+            f"cache_build_merged_n{len(slice_metas)}"
+        ):
+            saved = dict(runner._seq_lens)
+            try:
+                # Reset and recycle per-VS upfront.
+                for sm in slice_metas:
+                    self.cache.reset_vs(sm["vs_id"])
+                    runner.recycle_dedicated_blocks(sm["vs_id"])
+
+                # Concatenate.
+                seq_ids_cat = torch.cat(
+                    [sm["seq_ids"] for sm in slice_metas], dim=0,
+                )
+                draft_tokens_cat = torch.cat(
+                    [sm["draft_tokens"] for sm in slice_metas], dim=0,
+                )
+                draft_logits_cat = torch.cat(
+                    [sm["draft_logits"] for sm in slice_metas], dim=0,
+                )
+                bonus_cat = torch.cat(
+                    [sm["bonus_tokens"] for sm in slice_metas], dim=0,
+                )
+                B_total = seq_ids_cat.shape[0]
+                seq_ids_list = seq_ids_cat.tolist()
+
+                # Geometric fan-out (shared across VSes).
+                fan_out_list = list(self.outcome_predictor.fan_out_list)
+                entries_per_seq = sum(fan_out_list)
+                max_branches = 504
+                if B_total * entries_per_seq > max_branches:
+                    scale = max_branches / (B_total * entries_per_seq)
+                    shrunk = [max(1, int(f * scale)) for f in fan_out_list]
+                    while B_total * sum(shrunk) > max_branches:
+                        max_idx = max(
+                            range(len(shrunk)),
+                            key=lambda i: shrunk[i],
+                        )
+                        if shrunk[max_idx] <= 1:
+                            break
+                        shrunk[max_idx] -= 1
+                    fan_out_list = shrunk
+                    entries_per_seq = sum(fan_out_list)
+                N = B_total * entries_per_seq
+                if N > max_branches or N == 0:
+                    return
+                max_fan_out = (
+                    max(fan_out_list) if fan_out_list else 0
+                )
+
+                # ONE merged glue_decode (advances _seq_lens by 1 per seq).
+                glue_logits = runner.glue_decode(
+                    tokens=draft_tokens_cat[:, -1], seq_ids=seq_ids_cat,
+                )
+                post_glue_lens = {
+                    sid: runner._seq_lens.get(sid, 0)
+                    for sid in seq_ids_list
+                }
+
+                # ONE merged bonus selection.
+                (
+                    entry_batch_ids,
+                    k_positions,
+                    bonus_candidates,
+                    _branches,
+                ) = self._select_bonus_candidates(
+                    B=B_total,
+                    fan_out_list=fan_out_list,
+                    max_fan_out=max_fan_out,
+                    draft_logits=draft_logits_cat,
+                    draft_tokens=draft_tokens_cat,
+                    rec_tokens=bonus_cat,
+                    glue_logits=glue_logits,
+                )
+
+                # Map each entry back to the originating VS via
+                # entry_batch_ids[i] (which indexes the merged batch).
+                # Build slice_owner[i] = vs_idx for each of the N
+                # entries.
+                vs_of_seq: list[int] = []
+                for vs_idx, sm in enumerate(slice_metas):
+                    vs_of_seq.extend([vs_idx] * sm["B"])
+                # entry_batch_ids: [N] int64 mapping branch i -> batch
+                # row in the concatenated batch.
+                entry_batch_ids_cpu = entry_batch_ids.tolist()
+                entry_owner = [
+                    vs_of_seq[bi] for bi in entry_batch_ids_cpu
+                ]
+
+                # ONE merged block allocation. Block reservation is
+                # per-VS, so split allocated blocks by entry_owner.
+                bs = runner.block_size
+                blocks_per_branch = (K + bs) // bs + 1
+                total_needed = N * blocks_per_branch
+                available = (
+                    (runner.num_kv_blocks - runner._next_free_block)
+                    + len(runner._free_list)
+                )
+                if available < total_needed:
+                    # Pool exhausted; restore lens and abort.
+                    for sid in seq_ids_list:
+                        if sid in post_glue_lens:
+                            runner._seq_lens[sid] = (
+                                post_glue_lens[sid] - 1
+                            )
+                    return
+                dedicated_blocks = [
+                    runner._alloc_one_block()
+                    for _ in range(total_needed)
+                ]
+                # Reserve dedicated blocks per VS (chunk
+                # dedicated_blocks by entry owner).
+                blocks_by_vs: dict[int, list[int]] = {
+                    i: [] for i in range(len(slice_metas))
+                }
+                for n in range(N):
+                    base = n * blocks_per_branch
+                    blocks_by_vs[entry_owner[n]].extend(
+                        dedicated_blocks[base:base + blocks_per_branch]
+                    )
+                for vs_idx, blks in blocks_by_vs.items():
+                    if blks:
+                        runner.reserve_dedicated_blocks(
+                            blks, slice_metas[vs_idx]["vs_id"],
+                        )
+
+                # Build branch_block_tables and prefix_lens (same math
+                # as _allocate_branch_blocks_and_copy_kv but using
+                # already-allocated dedicated_blocks).
+                M = runner.max_num_blocks
+                base_lens_t = torch.tensor(
+                    [
+                        self._round_base_lens.get(
+                            int(seq_ids_cat[b].item()), 0,
+                        )
+                        for b in range(B_total)
+                    ],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                prefix_lens = (
+                    base_lens_t[entry_batch_ids] + 1 + k_positions
+                )
+                seq_ids_for_branches = (
+                    seq_ids_cat[entry_batch_ids].to(torch.int64)
+                )
+                branch_block_tables = runner._block_table_gpu[
+                    seq_ids_for_branches
+                ].contiguous()
+                first_write_blk = prefix_lens // bs
+                ded_tensor = torch.tensor(
+                    dedicated_blocks,
+                    dtype=torch.int64,
+                    device=self.device,
+                ).view(N, blocks_per_branch)
+                j_range = torch.arange(
+                    blocks_per_branch,
+                    device=self.device,
+                    dtype=torch.int64,
+                )
+                tbl_indices = (
+                    first_write_blk.unsqueeze(1) + j_range.unsqueeze(0)
+                )
+                valid = tbl_indices < M
+                n_idx = (
+                    torch.arange(N, device=self.device)
+                    .unsqueeze(1)
+                    .expand_as(tbl_indices)
+                )
+                branch_block_tables[
+                    n_idx[valid], tbl_indices[valid].to(torch.int64),
+                ] = ded_tensor[valid].to(torch.int32)
+
+                # KV copy from parent into newly-reserved blocks.
+                parent_tables = runner._block_table_gpu[
+                    seq_ids_for_branches
+                ]
+                src_indices = tbl_indices.clamp(max=M - 1)
+                src_block_ids = parent_tables[
+                    n_idx, src_indices.to(torch.int64),
+                ].to(torch.int64)
+                dst_block_ids = ded_tensor
+                copy_mask = (
+                    valid & (src_block_ids != dst_block_ids)
+                )
+                if copy_mask.any() and runner.kv_caches is not None:
+                    src_flat = src_block_ids[copy_mask]
+                    dst_flat = dst_block_ids[copy_mask]
+                    for layer_kv in runner.kv_caches:
+                        layer_kv[:, dst_flat] = layer_kv[:, src_flat]
+
+                # ONE merged tree decode (or parallel fanout).
+                if self._use_parallel_fanout:
+                    all_tokens, all_logits = self._run_parallel_fanout(
+                        runner=runner,
+                        N=N,
+                        K=K,
+                        seq_ids=seq_ids_cat,
+                        entry_batch_ids=entry_batch_ids,
+                        prefix_lens=prefix_lens,
+                        branch_block_tables=branch_block_tables,
+                        bonus_candidates=bonus_candidates,
+                    )
+                else:
+                    all_tokens, all_logits = self._run_tree_decode(
+                        runner=runner,
+                        N=N,
+                        K=K,
+                        seq_ids=seq_ids_cat,
+                        entry_batch_ids=entry_batch_ids,
+                        prefix_lens=prefix_lens,
+                        branch_block_tables=branch_block_tables,
+                        bonus_candidates=bonus_candidates,
+                    )
+
+                # Split populate per VS by entry_owner.
+                entry_owner_t = torch.tensor(
+                    entry_owner, dtype=torch.int64, device=self.device,
+                )
+                seq_ids_per_branch = seq_ids_cat[entry_batch_ids]
+                for vs_idx, sm in enumerate(slice_metas):
+                    mask = entry_owner_t == vs_idx
+                    if not mask.any():
+                        continue
+                    self.cache.populate(
+                        seq_ids=seq_ids_per_branch[mask],
+                        k_positions=k_positions[mask],
+                        bonus_tokens=bonus_candidates[mask],
+                        draft_tokens=all_tokens[mask],
+                        draft_logits=all_logits[mask],
+                        branch_block_tables=branch_block_tables[mask],
+                        prefix_lens=prefix_lens[mask],
+                        vs_id=sm["vs_id"],
+                    )
+
+                # Undo glue's +1 on _seq_lens so next round's
+                # reconciliation starts from the same base.
+                for sid in seq_ids_list:
+                    if sid in post_glue_lens:
+                        runner._seq_lens[sid] = post_glue_lens[sid] - 1
+
+            finally:
+                # Restore caller's _seq_lens snapshot (the per-round
+                # end-of-round value), not glue's mutated state.
+                runner._seq_lens = saved
 
     async def _run_cache_build_slice(
         self,
