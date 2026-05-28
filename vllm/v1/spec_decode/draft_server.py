@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -216,6 +217,12 @@ class DraftServer:
         # Server lifecycle flag
         self._running = False
 
+        # ----- torch.profiler hooks (toggled via start/stop_profile) -----
+        # Active when VLLM_DRAFT_TORCH_PROFILER_DIR is set in the env and
+        # start_profile() has been called. Traces are written on stop.
+        self._profiler: Any = None
+        self._profiler_dir: str | None = None
+
         # ----- Metrics -----
         self.metrics = DraftServerMetrics()
 
@@ -404,9 +411,67 @@ class DraftServer:
     async def shutdown(self) -> None:
         """Gracefully stop the server loop and release resources."""
         self._running = False
+        if self._profiler is not None:
+            self.stop_profile()
         await self._await_inflight_cache_build()
         self._cleanup()
         logger.info("DraftServer shut down.")
+
+    # ------------------------------------------------------------------
+    # Profiling (toggled via SIGUSR1/SIGUSR2 in the entrypoint)
+    # ------------------------------------------------------------------
+
+    def start_profile(self) -> None:
+        """Begin a torch.profiler capture; writes on stop_profile().
+
+        No-op if VLLM_DRAFT_TORCH_PROFILER_DIR is unset or a profile is
+        already running. The captured trace covers all subsequent
+        SPECULATE/PREFILL/cache-build work until ``stop_profile`` runs.
+        """
+        if self._profiler is not None:
+            logger.info("DraftServer profile already running; ignoring start.")
+            return
+        prof_dir = os.environ.get("VLLM_DRAFT_TORCH_PROFILER_DIR")
+        if not prof_dir:
+            logger.warning(
+                "DraftServer start_profile: "
+                "VLLM_DRAFT_TORCH_PROFILER_DIR is not set; ignoring."
+            )
+            return
+        os.makedirs(prof_dir, exist_ok=True)
+        self._profiler_dir = prof_dir
+        self._profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+            with_stack=True,
+        )
+        self._profiler.__enter__()
+        logger.info("DraftServer profile started; output dir=%s", prof_dir)
+
+    def stop_profile(self) -> None:
+        """Stop the active profile capture and dump the trace."""
+        if self._profiler is None:
+            logger.info("DraftServer profile not running; ignoring stop.")
+            return
+        prof = self._profiler
+        out_dir = self._profiler_dir or "/tmp"
+        self._profiler = None
+        self._profiler_dir = None
+        prof.__exit__(None, None, None)
+        out_path = os.path.join(
+            out_dir,
+            f"draft_server_pid{os.getpid()}_{int(time.time())}.pt.trace.json",
+        )
+        try:
+            prof.export_chrome_trace(out_path)
+            logger.info("DraftServer profile written to %s", out_path)
+        except Exception:
+            logger.exception(
+                "DraftServer profile export failed; trace lost."
+            )
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -717,12 +782,15 @@ class DraftServer:
         runner = self.draft_model_runner
         if runner is None:
             return
-        # Snapshot _seq_lens around the build: tree decode mutates them
-        # for its branch KV layout, and we need the per-seq lens to stay
-        # at the end-of-round value for the next SPECULATE.
-        saved = dict(runner._seq_lens)
-        self._build_next_cache(batch_size, seq_ids, vs_id)
-        runner._seq_lens = saved
+        with torch.profiler.record_function(
+            f"cache_build_B{batch_size}"
+        ):
+            # Snapshot _seq_lens around the build: tree decode mutates them
+            # for its branch KV layout, and we need the per-seq lens to stay
+            # at the end-of-round value for the next SPECULATE.
+            saved = dict(runner._seq_lens)
+            self._build_next_cache(batch_size, seq_ids, vs_id)
+            runner._seq_lens = saved
 
     async def _handle_speculation(
         self,
@@ -756,26 +824,30 @@ class DraftServer:
             B,
         )
 
-        # Block until the previous round's cache build finishes.
-        # Cache build mutates runner._seq_lens, block tables, the
-        # SpeculationCache contents, and issues GPU kernels that share
-        # the default stream with this handler's JIT/glue work — so
-        # we must serialize them. Awaiting here (rather than in the
-        # serve loop) lets the serve loop pipeline ZMQ recv/decode
-        # for this message against the prior round's cache build.
-        await self._await_inflight_cache_build()
+        with torch.profiler.record_function(f"speculate_B{B}"):
+            # Block until the previous round's cache build finishes.
+            # Cache build mutates runner._seq_lens, block tables, the
+            # SpeculationCache contents, and issues GPU kernels that share
+            # the default stream with this handler's JIT/glue work — so
+            # we must serialize them. Awaiting here (rather than in the
+            # serve loop) lets the serve loop pipeline ZMQ recv/decode
+            # for this message against the prior round's cache build.
+            with torch.profiler.record_function("await_inflight_cache_build"):
+                await self._await_inflight_cache_build()
 
-        try:
-            result = await self._handle_speculation_inner(
-                verify_server_id, identity, outcome
-            )
-            if result is not None:
-                cache_hits, draft_tokens, draft_logits, needs_logits = result
-                # Send response FIRST — unblocks the verify server
-                await self._send_speculation_response(
-                    verify_server_id, identity, cache_hits, draft_tokens,
-                    draft_logits,
-                )
+            try:
+                with torch.profiler.record_function("handle_speculation_inner"):
+                    result = await self._handle_speculation_inner(
+                        verify_server_id, identity, outcome
+                    )
+                if result is not None:
+                    cache_hits, draft_tokens, draft_logits, needs_logits = result
+                    # Send response FIRST — unblocks the verify server
+                    with torch.profiler.record_function("send_speculation_response"):
+                        await self._send_speculation_response(
+                            verify_server_id, identity, cache_hits, draft_tokens,
+                            draft_logits,
+                        )
                 # Schedule cache build as a background task so the
                 # serve loop returns to recv_multipart immediately.
                 # The task holds references to the per-round state it
@@ -791,21 +863,21 @@ class DraftServer:
                                 B, _seq_ids, verify_server_id
                             )
                         )
-        except Exception:
-            logger.exception(
-                "DraftServer _handle_speculation failed for %s",
-                verify_server_id,
-            )
-            # Send fallback response so the verify server doesn't hang
-            try:
-                await self._send_fallback_speculation(
-                    verify_server_id, identity, B
-                )
             except Exception:
                 logger.exception(
-                    "DraftServer failed to send fallback response to %s",
+                    "DraftServer _handle_speculation failed for %s",
                     verify_server_id,
                 )
+                # Send fallback response so the verify server doesn't hang
+                try:
+                    await self._send_fallback_speculation(
+                        verify_server_id, identity, B
+                    )
+                except Exception:
+                    logger.exception(
+                        "DraftServer failed to send fallback response to %s",
+                        verify_server_id,
+                    )
 
     def _recv_speculation_tensors(
         self,
@@ -969,27 +1041,30 @@ class DraftServer:
         self.metrics.draft_batch_size.set(B)
 
         # ---- Step 1: Receive tensor payloads ----
-        seq_ids, k_accepted, bonus_tokens, temperatures = (
-            self._recv_speculation_tensors(verify_server_id, outcome)
-        )
+        with torch.profiler.record_function("recv_spec_tensors"):
+            seq_ids, k_accepted, bonus_tokens, temperatures = (
+                self._recv_speculation_tensors(verify_server_id, outcome)
+            )
         self._last_spec_seq_ids = seq_ids
         seq_ids_list = seq_ids.tolist()
 
         # ---- Step 2: Reconcile runner state with this round's base ----
         runner = self.draft_model_runner
         if runner is not None:
-            self._sync_runner_seq_lens_and_blocks(
-                runner, seq_ids_list, k_accepted.tolist(),
-            )
+            with torch.profiler.record_function("sync_seq_lens"):
+                self._sync_runner_seq_lens_and_blocks(
+                    runner, seq_ids_list, k_accepted.tolist(),
+                )
 
         # ---- Step 3: Cache lookup ----
-        cached_tokens, cached_logits, cache_hits, _cached_hs = (
-            self.cache.lookup(
-                seq_ids=seq_ids,
-                k_accepted=k_accepted,
-                bonus_tokens=bonus_tokens,
+        with torch.profiler.record_function("cache_lookup"):
+            cached_tokens, cached_logits, cache_hits, _cached_hs = (
+                self.cache.lookup(
+                    seq_ids=seq_ids,
+                    k_accepted=k_accepted,
+                    bonus_tokens=bonus_tokens,
+                )
             )
-        )
 
         num_hits = int(cache_hits.sum().item())
         hit_mask = cache_hits.bool()
@@ -1013,30 +1088,32 @@ class DraftServer:
         # ---- Step 4: Apply cache hits (swap path) ----
         used_swap_for_hits = False
         if num_hits > 0 and cached_logits is not None and runner is not None:
-            used_swap_for_hits = self._apply_swap_for_hits(
-                runner=runner,
-                verify_server_id=verify_server_id,
-                seq_ids=seq_ids,
-                seq_ids_list=seq_ids_list,
-                cache_hits=cache_hits,
-                cached_tokens=cached_tokens,
-                cached_logits=cached_logits,
-                draft_tokens=draft_tokens,
-                draft_logits=draft_logits,
-            )
+            with torch.profiler.record_function(f"swap_hits_{num_hits}"):
+                used_swap_for_hits = self._apply_swap_for_hits(
+                    runner=runner,
+                    verify_server_id=verify_server_id,
+                    seq_ids=seq_ids,
+                    seq_ids_list=seq_ids_list,
+                    cache_hits=cache_hits,
+                    cached_tokens=cached_tokens,
+                    cached_logits=cached_logits,
+                    draft_tokens=draft_tokens,
+                    draft_logits=draft_logits,
+                )
 
         # ---- Step 5: JIT on misses ----
         B_miss = int(miss_mask.sum().item())
         if B_miss > 0:
-            self._fill_misses_with_jit(
-                seq_ids=seq_ids,
-                bonus_tokens=bonus_tokens,
-                temperatures=temperatures,
-                miss_mask=miss_mask,
-                B_miss=B_miss,
-                draft_tokens=draft_tokens,
-                draft_logits=draft_logits,
-            )
+            with torch.profiler.record_function(f"jit_misses_B{B_miss}"):
+                self._fill_misses_with_jit(
+                    seq_ids=seq_ids,
+                    bonus_tokens=bonus_tokens,
+                    temperatures=temperatures,
+                    miss_mask=miss_mask,
+                    B_miss=B_miss,
+                    draft_tokens=draft_tokens,
+                    draft_logits=draft_logits,
+                )
 
         if not used_swap_for_hits:
             for sid in seq_ids_list:
@@ -1139,18 +1216,21 @@ class DraftServer:
                 dtype=torch.long,
                 device=self.device,
             )
-            tokens, logits = runner.sequential_speculate(
-                recovery_tokens=bonus_tokens,
-                positions=positions,
-                seq_ids=seq_ids,
-                num_steps=self.K,
-                temperature=temperatures,
-                saguaro_sampler=(
-                    self.saguaro_sampler
-                    if self.saguaro_c is not None
-                    else None
-                ),
-            )
+            with torch.profiler.record_function(
+                f"jit_sequential_speculate_B{B_miss}"
+            ):
+                tokens, logits = runner.sequential_speculate(
+                    recovery_tokens=bonus_tokens,
+                    positions=positions,
+                    seq_ids=seq_ids,
+                    num_steps=self.K,
+                    temperature=temperatures,
+                    saguaro_sampler=(
+                        self.saguaro_sampler
+                        if self.saguaro_c is not None
+                        else None
+                    ),
+                )
             if self.target_vocab_size < self.vocab_size:
                 tokens = tokens.clamp(max=self.target_vocab_size - 1)
             return tokens, logits

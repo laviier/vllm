@@ -133,8 +133,24 @@ def run_draft_server(args: argparse.Namespace) -> None:
             # Schedule cancellation from within the event loop thread
             serve_task.get_loop().call_soon_threadsafe(serve_task.cancel)
 
+    def _profile_handler(signum: int, frame: object) -> None:
+        # SIGUSR1 = start, SIGUSR2 = stop. Set
+        # VLLM_DRAFT_TORCH_PROFILER_DIR before launching the server.
+        if serve_task is None:
+            logger.warning(
+                "Received profile signal %d but server not running.", signum,
+            )
+            return
+        loop = serve_task.get_loop()
+        if signum == signal.SIGUSR1:
+            loop.call_soon_threadsafe(server.start_profile)
+        elif signum == signal.SIGUSR2:
+            loop.call_soon_threadsafe(server.stop_profile)
+
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGUSR1, _profile_handler)
+    signal.signal(signal.SIGUSR2, _profile_handler)
 
     async def _run() -> None:
         nonlocal serve_task
