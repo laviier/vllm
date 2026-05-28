@@ -400,8 +400,8 @@ class DraftServer:
                     continue
 
                 # If this is a SPECULATE and cross-VS merging is enabled,
-                # try to peek for a second pending SPECULATE (NOBLOCK)
-                # from a DIFFERENT vs_id, and process them as one merged
+                # try to drain additional pending SPECULATEs (NOBLOCK)
+                # from DIFFERENT vs_ids, and process them as one merged
                 # batch. Otherwise dispatch normally. Skip the peek when
                 # only one VS is connected — the poll() call costs ~1ms
                 # per round even when nothing's pending and would
@@ -414,17 +414,16 @@ class DraftServer:
                     and command.command.upper() == "SPECULATE"
                     and len(self._verify_servers) >= 2
                 ):
-                    msg2 = await self._try_recv_second_speculate(
-                        zmq, exclude_vs_id=vs_id,
+                    extras = await self._drain_pending_speculates(
+                        zmq, already_collected={vs_id},
                     )
-                    if msg2 is not None:
-                        merged = [msg, msg2]
+                    if extras:
+                        merged = [msg, *extras]
 
                 if merged is not None:
-                    self._verify_server_last_seen[vs_id] = time.monotonic()
-                    self._verify_server_last_seen[merged[1][0]] = (
-                        time.monotonic()
-                    )
+                    now = time.monotonic()
+                    for item in merged:
+                        self._verify_server_last_seen[item[0]] = now
                     await self._handle_speculation_merged(merged)
                 else:
                     self._current_tensor_frames = frames
@@ -474,47 +473,61 @@ class DraftServer:
 
         return vs_id, identity, command, tensor_frames
 
-    async def _try_recv_second_speculate(
-        self, zmq: Any, exclude_vs_id: str,
+    async def _drain_pending_speculates(
+        self, zmq: Any, already_collected: set[str],
         peek_timeout_ms: int | None = None,
-    ) -> tuple[str, bytes, DraftCommand, list[bytes]] | None:
-        """Opportunistically peek for a second pending SPECULATE from a
-        different VS. Returns the message tuple if one is available
-        within ``peek_timeout_ms`` and the command is a SPECULATE from
-        a VS other than ``exclude_vs_id``; otherwise returns None.
+    ) -> list[tuple[str, bytes, DraftCommand, list[bytes]]]:
+        """Opportunistically peek for additional pending SPECULATEs from
+        DIFFERENT VSes (one peek+recv per iteration, up to one per
+        connected VS minus those already collected).
 
-        On a non-SPECULATE message or a same-VS SPECULATE, the message
-        is dispatched normally inline before returning None — so we
-        never drop messages.
+        Returns a list of message tuples. Each is a SPECULATE from a
+        VS not in ``already_collected``. On a non-SPECULATE message or
+        a same-VS SPECULATE, the message is dispatched normally inline
+        and the drain stops (no more peeks); we never drop messages.
+
+        The first peek uses ``peek_timeout_ms`` (default
+        ``self._merge_peek_timeout_ms``); subsequent peeks use 0
+        (NOBLOCK) since the first delay already covered the slowest
+        same-iteration arrivals.
         """
-        # Quick poll: if nothing's pending now (or within 1ms), return.
         if peek_timeout_ms is None:
             peek_timeout_ms = self._merge_peek_timeout_ms
         poller = zmq.asyncio.Poller()
         poller.register(self._socket, zmq.POLLIN)
-        try:
-            events = dict(await poller.poll(timeout=peek_timeout_ms))
-        except Exception:
-            return None
-        if self._socket not in events:
-            return None
 
-        msg = await self._recv_one_message(zmq)
-        if msg is None:
-            return None
-        vs_id2, identity2, command2, frames2 = msg
-        if (
-            command2.command.upper() == "SPECULATE"
-            and vs_id2 != exclude_vs_id
-        ):
-            return msg
+        collected: list[tuple[str, bytes, DraftCommand, list[bytes]]] = []
+        max_peeks = max(0, len(self._verify_servers) - len(already_collected))
 
-        # Not a SPECULATE we can merge — dispatch it normally and skip.
-        self._verify_server_last_seen[vs_id2] = time.monotonic()
-        self._current_tensor_frames = frames2
-        self._current_tensor_idx = 0
-        await self._dispatch(vs_id2, identity2, command2)
-        return None
+        for i in range(max_peeks):
+            timeout = peek_timeout_ms if i == 0 else 0
+            try:
+                events = dict(await poller.poll(timeout=timeout))
+            except Exception:
+                break
+            if self._socket not in events:
+                break
+
+            msg = await self._recv_one_message(zmq)
+            if msg is None:
+                break
+            vs_id2, identity2, command2, frames2 = msg
+            if (
+                command2.command.upper() == "SPECULATE"
+                and vs_id2 not in already_collected
+            ):
+                collected.append(msg)
+                already_collected.add(vs_id2)
+                continue
+
+            # Not a SPECULATE we can merge — dispatch inline and stop.
+            self._verify_server_last_seen[vs_id2] = time.monotonic()
+            self._current_tensor_frames = frames2
+            self._current_tensor_idx = 0
+            await self._dispatch(vs_id2, identity2, command2)
+            break
+
+        return collected
 
     async def shutdown(self) -> None:
         """Gracefully stop the server loop and release resources."""
