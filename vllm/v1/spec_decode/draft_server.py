@@ -1485,24 +1485,26 @@ class DraftServer:
             positions[start:start + K] = prefix_lens[branch_idx] + depth_offsets
 
         # --- Build seq_lens: [N*K] ---
-        # For parallel model: each token only attends to the prefix
-        # (no intra-branch KV dependency). seq_len = prefix_lens + 1
-        # (the +1 accounts for the current token itself in the attention
-        # computation — FlashAttention uses seq_len as the total KV length
-        # including the current position being written).
+        # Causal MTP: depth-d in a branch attends to the prefix PLUS the
+        # earlier depths' K/V within the same branch. seq_len for depth-d
+        # is prefix_lens[branch] + d + 1 (prefix + d earlier mask-token
+        # K/V slots + the current position itself). This matches how the
+        # parallel-draft model was trained (mtp_attention: causal): the
+        # depth-d head expects to attend to depths 0..d-1's mask-token
+        # K/V projections, not just the prefix.
         #
-        # IMPORTANT: We use prefix_lens + 1 for ALL depths, not
-        # prefix_lens + depth + 1. This is the key difference from
-        # sequential tree decode — depths don't see each other's KV.
+        # Earlier code used prefix_lens + 1 for all depths (non-causal),
+        # which hid earlier depths from later ones. With a causal-trained
+        # model that produced a per-position acceptance cliff (P0 70% →
+        # P2 22% → P3 17%) because depths 2+ were running blind.
         seq_lens = torch.zeros(
             total_tokens, dtype=torch.int32, device=self.device
         )
         for branch_idx in range(N):
             start = branch_idx * K
-            # All depths in this branch see the same context length
-            seq_lens[start:start + K] = (prefix_lens[branch_idx] + 1).to(
-                torch.int32
-            )
+            seq_lens[start:start + K] = (
+                prefix_lens[branch_idx] + 1 + depth_offsets
+            ).to(torch.int32)
 
         # --- Build block_tables: [N*K, max_blocks] ---
         # All depths in a branch share the same block table (they all

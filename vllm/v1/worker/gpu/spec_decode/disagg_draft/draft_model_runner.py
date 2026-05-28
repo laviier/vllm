@@ -983,60 +983,60 @@ class DraftModelRunner(DraftKVCacheMixin):
         B = recovery_tokens.shape[0]
         K = num_steps
         V = self.vocab_size
-        Kp1 = K + 1  # bonus_token + K mask tokens
 
-        # Build input: [bonus_token, <mask>, <mask>, ..., <mask>] per seq
-        # Total tokens: B * (K+1)
-        total_tokens = B * Kp1
+        # Per-seq input: [bonus, mask, mask, ..., mask] of length K.
+        # Per training collator, a mask at logical position P predicts
+        # t_{P+1}. So with positions [L, L+1, ..., L+K-1] the K logits
+        # predict t_{L+1}..t_{L+K} — exactly the K draft tokens needed.
+        # An earlier K+1 layout sliced off the bonus and kept mask
+        # outputs at L+1..L+K, which produced t_{L+2}..t_{L+K+1} —
+        # off-by-one, missing draft[0]=t_{L+1} and bleeding past t_{L+K}.
+        total_tokens = B * K
         input_ids = torch.full(
             (total_tokens,), mask_token_id,
             dtype=torch.int64, device=self.device,
         )
-        # Set the first token of each sequence to the bonus token
         for i in range(B):
-            input_ids[i * Kp1] = recovery_tokens[i]
+            input_ids[i * K] = recovery_tokens[i]
 
-        # Build positions: [pos, pos+1, pos+2, ..., pos+K] per seq
+        # Per seq positions: [L, L+1, ..., L+K-1]
         all_positions = torch.zeros(
             total_tokens, dtype=torch.int64, device=self.device,
         )
         for i in range(B):
             base_pos = positions[i].item()
-            all_positions[i * Kp1 : (i + 1) * Kp1] = (
-                torch.arange(Kp1, device=self.device) + base_pos
+            all_positions[i * K : (i + 1) * K] = (
+                torch.arange(K, device=self.device) + base_pos
             )
 
-        # Ensure blocks are allocated for all positions
         for i, sid in enumerate(seq_ids.tolist()):
-            max_pos = int(positions[i].item()) + K
+            max_pos = int(positions[i].item()) + K - 1
             self.ensure_blocks(int(sid), max_pos + 1)
 
-        # Build slot mapping for all tokens
         expanded_seq_ids: list[int] = []
         for i in range(B):
-            expanded_seq_ids.extend([int(seq_ids[i].item())] * Kp1)
+            expanded_seq_ids.extend([int(seq_ids[i].item())] * K)
         slot_mapping = self._compute_slot_mapping(
             all_positions, expanded_seq_ids,
         )
 
-        # Build block tables
         block_tables = self._get_block_table_tensor(seq_ids)
 
-        # Build prefill-style attention metadata
-        # Each sequence has Kp1 query tokens
+        # Prefill-style varlen: each seq has K query tokens. Causal
+        # masking within the seq lets depth-d masks attend to
+        # depths 0..d-1 (matching mtp_attention=causal training).
         seqlens_q = torch.full(
-            (B,), Kp1, dtype=torch.int32, device=self.device,
+            (B,), K, dtype=torch.int32, device=self.device,
         )
         query_start_loc = torch.zeros(
             B + 1, dtype=torch.int32, device=self.device,
         )
         torch.cumsum(seqlens_q, dim=0, out=query_start_loc[1:])
 
-        # Total context length per sequence = existing KV + new tokens
         seq_lens_list = []
         for i in range(B):
             base_pos = int(positions[i].item())
-            seq_lens_list.append(base_pos + Kp1)
+            seq_lens_list.append(base_pos + K)
         seq_lens_t = torch.tensor(
             seq_lens_list, dtype=torch.int32, device=self.device,
         )
@@ -1048,7 +1048,7 @@ class DraftModelRunner(DraftKVCacheMixin):
             num_tokens=total_tokens,
             seq_lens_tensor=seq_lens_t,
             max_seq_len=max_seq_len,
-            max_query_len=Kp1,
+            max_query_len=K,
             query_start_loc=query_start_loc,
             block_table=block_tables,
             slot_mapping=slot_mapping,
@@ -1068,7 +1068,6 @@ class DraftModelRunner(DraftKVCacheMixin):
                 positions=all_positions,
             )
 
-        # Compute logits
         if hasattr(self.model, "compute_logits"):
             all_logits = self.model.compute_logits(hidden_states)
         elif hasattr(self.model, "lm_head"):
@@ -1080,23 +1079,18 @@ class DraftModelRunner(DraftKVCacheMixin):
             )
         all_logits = all_logits[:, :V]
 
-        # Reshape: [B*(K+1), V] → [B, K+1, V]
-        # Take positions 1..K (the mask positions) as draft logits
-        all_logits_2d = all_logits.view(B, Kp1, V)
-        draft_logits = all_logits_2d[:, 1:, :]  # [B, K, V]
+        # [B*K, V] → [B, K, V]. Each of the K logits is a draft token.
+        draft_logits = all_logits.view(B, K, V)
 
-        # Apply Saguaro rescaling if configured
         if saguaro_sampler is not None:
             for step in range(K):
                 draft_logits[:, step] = saguaro_sampler.apply(
                     draft_logits[:, step], temperature=temperature,
                 )
 
-        # Sample draft tokens (greedy)
         draft_tokens = draft_logits.argmax(dim=-1)  # [B, K]
 
-        # Update tracked sequence lengths
         for i, sid in enumerate(seq_ids.tolist()):
-            self._seq_lens[int(sid)] = int(positions[i].item()) + Kp1
+            self._seq_lens[int(sid)] = int(positions[i].item()) + K
 
         return draft_tokens, draft_logits
