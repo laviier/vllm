@@ -163,6 +163,20 @@ class DraftServer:
         self._use_parallel_fanout = spec_config.disagg_parallel_fanout
         self._mtp_token_id: int = spec_config.disagg_mtp_token_id
 
+        # SSD §4.3 fast-backup variant: on cache miss, return zero
+        # drafts to the verifier (saves the full ~17 ms K-step JIT)
+        # and let cache_build still seed real cache entries by
+        # running ONE glue_decode per miss row using the bonus token.
+        # See profile_analysis/disagg_sd_redesign.md for context.
+        self._zero_fallback = (
+            os.environ.get("DISAGG_ZERO_FALLBACK", "0") == "1"
+        )
+        # Per-round miss-mask tracking (zero-fallback mode only). Set
+        # by speculate path, consumed by cache_build's glue_decode to
+        # decide which input token (bonus vs draft_tokens[:, -1]) to
+        # feed each row.
+        self._last_miss_mask: torch.Tensor | None = None
+
         # Determine device (use current CUDA device, set by entrypoint)
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -363,6 +377,13 @@ class DraftServer:
                 "Parallel fanout ENABLED: mtp_token_id=%d, "
                 "all depths generated in single forward pass",
                 self._mtp_token_id,
+            )
+        if self._zero_fallback:
+            logger.info(
+                "Zero fallback ENABLED (DISAGG_ZERO_FALLBACK=1): "
+                "cache-miss rows return zeros from speculate; "
+                "cache_build runs glue_decode on bonus to seed cache "
+                "for next round."
             )
 
     async def serve(self) -> None:
@@ -1267,6 +1288,11 @@ class DraftServer:
         self._last_draft_tokens = draft_tokens.clone()
         self._last_draft_logits = draft_logits.clone()
         self._last_bonus_tokens = bonus_tokens.clone()
+        # Tell cache_build which rows had zero-dummy drafts so it
+        # uses bonus_tokens (not draft_tokens[:,-1]) for glue_decode
+        # and seeds branches from base+1 instead of base+K.
+        if self._zero_fallback:
+            self._last_miss_mask = miss_mask.clone()
 
         send_logits = outcome.needs_logits
         self.metrics.draft_generation_latency.observe(
@@ -1483,6 +1509,8 @@ class DraftServer:
         self._last_draft_tokens = draft_tokens.clone()
         self._last_draft_logits = draft_logits.clone()
         self._last_bonus_tokens = bonus_cat.clone()
+        if self._zero_fallback:
+            self._last_miss_mask = miss_mask.clone()
 
         self.metrics.draft_generation_latency.observe(
             time.monotonic() - _spec_start
@@ -1512,14 +1540,17 @@ class DraftServer:
         for vs_idx, p in enumerate(per_vs):
             B = p["B"]
             sl = slice(offset, offset + B)
-            slice_metas.append({
+            sm = {
                 "vs_id": p["vs_id"],
                 "B": B,
                 "seq_ids": seq_ids_cat[sl].clone(),
                 "bonus_tokens": bonus_cat[sl].clone(),
                 "draft_tokens": draft_tokens[sl].clone(),
                 "draft_logits": draft_logits[sl].clone(),
-            })
+            }
+            if self._zero_fallback and self._last_miss_mask is not None:
+                sm["miss_mask"] = self._last_miss_mask[sl].clone()
+            slice_metas.append(sm)
             offset += B
         self._inflight_cache_build = asyncio.create_task(
             self._run_cache_build_merged(slice_metas)
@@ -1618,10 +1649,43 @@ class DraftServer:
                     max(fan_out_list) if fan_out_list else 0
                 )
 
+                # Per-row glue input: bonus token for zero-fallback
+                # miss rows, last drafted token for hit/JIT rows.
+                merged_miss_mask = None
+                if (
+                    self._zero_fallback
+                    and all("miss_mask" in sm for sm in slice_metas)
+                ):
+                    merged_miss_mask = torch.cat(
+                        [sm["miss_mask"] for sm in slice_metas], dim=0,
+                    )
+                if (
+                    merged_miss_mask is not None
+                    and bool(merged_miss_mask.any().item())
+                ):
+                    glue_input = draft_tokens_cat[:, -1].clone()
+                    glue_input[merged_miss_mask] = bonus_cat[
+                        merged_miss_mask
+                    ]
+                else:
+                    glue_input = draft_tokens_cat[:, -1]
                 # ONE merged glue_decode (advances _seq_lens by 1 per seq).
                 glue_logits = runner.glue_decode(
-                    tokens=draft_tokens_cat[:, -1], seq_ids=seq_ids_cat,
+                    tokens=glue_input, seq_ids=seq_ids_cat,
                 )
+
+                # Zero-fallback miss rows: replace k=0 logits with
+                # glue_logits so bonus candidates are real (see
+                # _build_standalone_cache for full reasoning).
+                if (
+                    merged_miss_mask is not None
+                    and bool(merged_miss_mask.any().item())
+                ):
+                    draft_logits_cat = draft_logits_cat.clone()
+                    draft_logits_cat[merged_miss_mask, 0] = (
+                        glue_logits[merged_miss_mask]
+                    )
+
                 post_glue_lens = {
                     sid: runner._seq_lens.get(sid, 0)
                     for sid in seq_ids_list
@@ -1925,7 +1989,26 @@ class DraftServer:
         temperatures: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run K sequential draft-model forward passes for cache-miss
-        sequences. Delegates to ``DraftModelRunner.sequential_speculate``."""
+        sequences. Delegates to ``DraftModelRunner.sequential_speculate``.
+
+        With ``DISAGG_ZERO_FALLBACK=1`` returns zero drafts (with bonus
+        at position 0) without running the drafter. The caller marks
+        ``self._last_miss_mask`` so cache_build knows which rows need
+        bonus-token glue_decode instead of drafted-token glue_decode.
+        """
+        if self._zero_fallback:
+            with torch.profiler.record_function(
+                f"jit_zero_B{B_miss}"
+            ):
+                tokens = torch.zeros(
+                    B_miss, self.K, dtype=torch.int64, device=self.device,
+                )
+                tokens[:, 0] = bonus_tokens
+                logits = torch.zeros(
+                    B_miss, self.K, self.vocab_size,
+                    dtype=self.dtype, device=self.device,
+                )
+            return tokens, logits
         runner = self.draft_model_runner
         if runner is not None and runner._model_loaded:
             positions = torch.tensor(
@@ -2027,6 +2110,9 @@ class DraftServer:
             self._last_draft_logits,
             self._last_bonus_tokens,
             vs_id,
+            miss_mask=(
+                self._last_miss_mask if self._zero_fallback else None
+            ),
         )
 
     def _select_bonus_candidates(
@@ -2341,6 +2427,7 @@ class DraftServer:
         draft_logits: torch.Tensor,
         rec_tokens: torch.Tensor,
         vs_id: str,
+        miss_mask: torch.Tensor | None = None,
     ) -> None:
         """Build speculation cache for standalone draft models.
 
@@ -2348,14 +2435,39 @@ class DraftServer:
         (geometric allocation), not uniform. Dedicated-block
         allocation is scoped to ``vs_id`` so peer VSes' preserved
         cache entries keep pointing at live KV data.
+
+        ``miss_mask`` (zero-fallback only): rows where speculate sent
+        zero drafts and didn't run JIT. For these rows, glue_decode
+        uses the bonus token (not draft_tokens[:, -1]) to compute the
+        next-position prediction; ``_seq_lens`` for miss rows is at
+        ``base`` so glue writes the bonus's KV at base.
         """
         runner.recycle_dedicated_blocks(vs_id)
 
         # Glue decode gives us the K+1th position's logits, and
         # advances _seq_lens by one — we undo that at the end.
+        # Per-row glue input: draft_tokens[:,-1] for hit/JIT rows,
+        # bonus token for zero-fallback miss rows.
+        if miss_mask is not None and bool(miss_mask.any().item()):
+            glue_input = draft_tokens[:, -1].clone()
+            glue_input[miss_mask] = rec_tokens[miss_mask]
+        else:
+            glue_input = draft_tokens[:, -1]
         glue_logits = runner.glue_decode(
-            tokens=draft_tokens[:, -1], seq_ids=seq_ids
+            tokens=glue_input, seq_ids=seq_ids
         )
+
+        # Zero-fallback miss rows: draft_logits is all zeros (no JIT
+        # ran). _select_bonus_candidates would compute top-F over zeros
+        # → garbage token-ids → unmatchable cache entries. Replace the
+        # k=0 row with glue_logits (real prediction at base+1) so the
+        # k=0 branch's bonus candidates align with what the verifier
+        # will sample next round. Higher-k entries are unreachable
+        # (verifier accepted 0 of zeros) so we leave them as zeros.
+        if miss_mask is not None and bool(miss_mask.any().item()):
+            draft_logits = draft_logits.clone()
+            draft_logits[miss_mask, 0] = glue_logits[miss_mask]
+
         post_glue_lens = {
             sid: runner._seq_lens.get(sid, 0) for sid in seq_ids_list
         }
