@@ -163,18 +163,13 @@ class DraftServer:
         self._use_parallel_fanout = spec_config.disagg_parallel_fanout
         self._mtp_token_id: int = spec_config.disagg_mtp_token_id
 
-        # SSD §4.3 fast-backup variant: on cache miss, return zero
-        # drafts to the verifier (saves the full ~17 ms K-step JIT)
-        # and let cache_build still seed real cache entries by
-        # running ONE glue_decode per miss row using the bonus token.
-        # See profile_analysis/disagg_sd_redesign.md for context.
-        self._zero_fallback = (
-            os.environ.get("DISAGG_ZERO_FALLBACK", "0") == "1"
-        )
-        # Per-round miss-mask tracking (zero-fallback mode only). Set
-        # by speculate path, consumed by cache_build's glue_decode to
-        # decide which input token (bonus vs draft_tokens[:, -1]) to
-        # feed each row.
+        # SSD §4.3 fast-backup: on cache miss, return zero drafts to
+        # the verifier (saves the full ~17 ms K-step JIT) and let
+        # cache_build seed real cache entries by running ONE
+        # glue_decode per miss row using the bonus token. Per-round
+        # miss_mask is set by the speculate path and consumed by
+        # cache_build's glue_decode to decide which input token
+        # (bonus vs draft_tokens[:, -1]) to feed each row.
         self._last_miss_mask: torch.Tensor | None = None
 
         # Determine device (use current CUDA device, set by entrypoint)
@@ -248,17 +243,15 @@ class DraftServer:
         self._running = False
 
         # ----- Cross-VS SPECULATE merging (Option A) -----
-        # When enabled, the serve loop opportunistically peeks for a
-        # second pending SPECULATE after receiving the first, and runs
-        # both as a single merged batch. This collapses the 2× draft
-        # serialization observed in 2V+1D under sustained load.
-        # Default off; enable by setting DISAGG_MERGE_SPECULATES=1.
+        # The serve loop opportunistically peeks for additional pending
+        # SPECULATEs from other VSes after receiving the first, and runs
+        # them all as a single merged batch. This collapses the N× draft
+        # serialization that would otherwise happen under multi-VS load.
+        # Always-on; no-op when only one VS is connected (the peek is
+        # guarded by ``len(self._verify_servers) >= 2`` in the serve loop).
         # DISAGG_MERGE_PEEK_MS controls how long to wait (in ms) for a
         # second pending SPECULATE from a different VS before giving up
         # and processing the first message alone.
-        self._merge_speculates: bool = (
-            os.environ.get("DISAGG_MERGE_SPECULATES") == "1"
-        )
         try:
             self._merge_peek_timeout_ms: int = int(
                 os.environ.get("DISAGG_MERGE_PEEK_MS", "1")
@@ -378,14 +371,6 @@ class DraftServer:
                 "all depths generated in single forward pass",
                 self._mtp_token_id,
             )
-        if self._zero_fallback:
-            logger.info(
-                "Zero fallback ENABLED (DISAGG_ZERO_FALLBACK=1): "
-                "cache-miss rows return zeros from speculate; "
-                "cache_build runs glue_decode on bonus to seed cache "
-                "for next round."
-            )
-
     async def serve(self) -> None:
         """Main loop: accept commands from multiple verify servers.
 
@@ -431,8 +416,7 @@ class DraftServer:
                 merged: list[tuple[str, bytes, DraftCommand,
                                    list[bytes]]] | None = None
                 if (
-                    self._merge_speculates
-                    and command.command.upper() == "SPECULATE"
+                    command.command.upper() == "SPECULATE"
                     and len(self._verify_servers) >= 2
                 ):
                     extras = await self._drain_pending_speculates(
@@ -1291,8 +1275,7 @@ class DraftServer:
         # Tell cache_build which rows had zero-dummy drafts so it
         # uses bonus_tokens (not draft_tokens[:,-1]) for glue_decode
         # and seeds branches from base+1 instead of base+K.
-        if self._zero_fallback:
-            self._last_miss_mask = miss_mask.clone()
+        self._last_miss_mask = miss_mask.clone()
 
         send_logits = outcome.needs_logits
         self.metrics.draft_generation_latency.observe(
@@ -1509,8 +1492,7 @@ class DraftServer:
         self._last_draft_tokens = draft_tokens.clone()
         self._last_draft_logits = draft_logits.clone()
         self._last_bonus_tokens = bonus_cat.clone()
-        if self._zero_fallback:
-            self._last_miss_mask = miss_mask.clone()
+        self._last_miss_mask = miss_mask.clone()
 
         self.metrics.draft_generation_latency.observe(
             time.monotonic() - _spec_start
@@ -1548,7 +1530,7 @@ class DraftServer:
                 "draft_tokens": draft_tokens[sl].clone(),
                 "draft_logits": draft_logits[sl].clone(),
             }
-            if self._zero_fallback and self._last_miss_mask is not None:
+            if self._last_miss_mask is not None:
                 sm["miss_mask"] = self._last_miss_mask[sl].clone()
             slice_metas.append(sm)
             offset += B
@@ -1652,10 +1634,7 @@ class DraftServer:
                 # Per-row glue input: bonus token for zero-fallback
                 # miss rows, last drafted token for hit/JIT rows.
                 merged_miss_mask = None
-                if (
-                    self._zero_fallback
-                    and all("miss_mask" in sm for sm in slice_metas)
-                ):
+                if all("miss_mask" in sm for sm in slice_metas):
                     merged_miss_mask = torch.cat(
                         [sm["miss_mask"] for sm in slice_metas], dim=0,
                     )
@@ -1978,7 +1957,7 @@ class DraftServer:
             )
 
     # ------------------------------------------------------------------
-    # JIT speculation (cache miss path)
+    # Zero-fallback (cache miss path)
     # ------------------------------------------------------------------
 
     def _jit_speculate(
@@ -1988,64 +1967,23 @@ class DraftServer:
         B_miss: int,
         temperatures: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run K sequential draft-model forward passes for cache-miss
-        sequences. Delegates to ``DraftModelRunner.sequential_speculate``.
-
-        With ``DISAGG_ZERO_FALLBACK=1`` returns zero drafts (with bonus
-        at position 0) without running the drafter. The caller marks
-        ``self._last_miss_mask`` so cache_build knows which rows need
-        bonus-token glue_decode instead of drafted-token glue_decode.
+        """Return zero drafts (with bonus at position 0) for cache-miss
+        rows — SSD §4.3 fast backup. Saves the K-step drafter forward
+        on the speculate critical path; cache_build runs glue_decode
+        on the bonus token to seed cache entries for the next round.
+        Caller marks ``self._last_miss_mask`` so cache_build knows
+        which rows need bonus-token glue_decode (instead of drafted-
+        token glue_decode).
         """
-        if self._zero_fallback:
-            with torch.profiler.record_function(
-                f"jit_zero_B{B_miss}"
-            ):
-                tokens = torch.zeros(
-                    B_miss, self.K, dtype=torch.int64, device=self.device,
-                )
-                tokens[:, 0] = bonus_tokens
-                logits = torch.zeros(
-                    B_miss, self.K, self.vocab_size,
-                    dtype=self.dtype, device=self.device,
-                )
-            return tokens, logits
-        runner = self.draft_model_runner
-        if runner is not None and runner._model_loaded:
-            positions = torch.tensor(
-                [runner._seq_lens.get(int(sid), 0)
-                 for sid in seq_ids.tolist()],
-                dtype=torch.long,
-                device=self.device,
+        with torch.profiler.record_function(f"jit_zero_B{B_miss}"):
+            tokens = torch.zeros(
+                B_miss, self.K, dtype=torch.int64, device=self.device,
             )
-            with torch.profiler.record_function(
-                f"jit_sequential_speculate_B{B_miss}"
-            ):
-                tokens, logits = runner.sequential_speculate(
-                    recovery_tokens=bonus_tokens,
-                    positions=positions,
-                    seq_ids=seq_ids,
-                    num_steps=self.K,
-                    temperature=temperatures,
-                    saguaro_sampler=(
-                        self.saguaro_sampler
-                        if self.saguaro_c is not None
-                        else None
-                    ),
-                )
-            if self.target_vocab_size < self.vocab_size:
-                tokens = tokens.clamp(max=self.target_vocab_size - 1)
-            return tokens, logits
-
-        # Draft model not loaded — safe zero fallback (verify side will
-        # observe all-zero draft tokens and simply get 0% acceptance).
-        tokens = torch.zeros(
-            B_miss, self.K, dtype=torch.int64, device=self.device,
-        )
-        tokens[:, 0] = bonus_tokens
-        logits = torch.zeros(
-            B_miss, self.K, self.vocab_size,
-            dtype=self.dtype, device=self.device,
-        )
+            tokens[:, 0] = bonus_tokens
+            logits = torch.zeros(
+                B_miss, self.K, self.vocab_size,
+                dtype=self.dtype, device=self.device,
+            )
         return tokens, logits
 
     def _build_next_cache(
@@ -2110,9 +2048,7 @@ class DraftServer:
             self._last_draft_logits,
             self._last_bonus_tokens,
             vs_id,
-            miss_mask=(
-                self._last_miss_mask if self._zero_fallback else None
-            ),
+            miss_mask=self._last_miss_mask,
         )
 
     def _select_bonus_candidates(
