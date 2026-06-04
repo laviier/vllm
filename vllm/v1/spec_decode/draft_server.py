@@ -136,6 +136,33 @@ class DraftServer:
             (e.g. ``"tcp://*:50051"``).
     """
 
+    # Cap on the total number of cache-build branches per round.
+    # Sized so the merged tree decode comfortably fits within a single
+    # forward at multi-VS load (B_total × entries_per_seq <= 504).
+    MAX_BRANCHES = 504
+
+    @staticmethod
+    def _shrink_fan_out_to_budget(
+        fan_out_list: list[int], B: int, max_branches: int,
+    ) -> list[int]:
+        """Proportionally scale ``fan_out_list`` so B × sum(...) <= budget.
+
+        Preserves the geometric shape (earlier acceptance positions
+        keep more candidates than later ones) and never lets any
+        position drop below 1 unless we have to.
+        """
+        entries_per_seq = sum(fan_out_list)
+        if B * entries_per_seq <= max_branches:
+            return fan_out_list
+        scale = max_branches / (B * entries_per_seq)
+        shrunk = [max(1, int(f * scale)) for f in fan_out_list]
+        while B * sum(shrunk) > max_branches:
+            max_idx = max(range(len(shrunk)), key=lambda i: shrunk[i])
+            if shrunk[max_idx] <= 1:
+                break
+            shrunk[max_idx] -= 1
+        return shrunk
+
     def __init__(self, vllm_config: VllmConfig, bind_address: str) -> None:
         import zmq
         import zmq.asyncio
@@ -782,12 +809,6 @@ class DraftServer:
         # Update active request count metric.
         self.metrics.draft_active_requests.set(len(self._request_state))
 
-    def _get_request_state(self, key: RequestKey) -> dict[str, Any]:
-        """Get per-request state, creating if absent."""
-        if key not in self._request_state:
-            self._request_state[key] = {}
-        return self._request_state[key]
-
     # ------------------------------------------------------------------
     # Seq ID remapping
     # ------------------------------------------------------------------
@@ -947,10 +968,10 @@ class DraftServer:
 
         1. Receive tensor payloads out-of-band (NCCL, matching the
            deterministic send order in ``ZmqDraftConnector``).
-        2. Reset ``_seq_lens`` and run glue decode for EAGLE methods.
+        2. Reconcile ``_seq_lens`` from this round's k_accepted.
         3. Cache lookup via ``SpeculationCache.lookup``.
-        4. Hybrid swap+JIT: cache hits use cached tokens, misses run
-           ``_eagle_jit_speculate`` or ``_jit_speculate``.
+        4. Hybrid swap+zero-fill: cache hits use cached tokens; misses
+           get zero drafts (cache_build seeds entries for next round).
         5. Send ``SpeculationResponse`` metadata over ZMQ and tensor
            payloads over NCCL.
         6. Build speculation cache for the NEXT round (async overlap).
@@ -1152,31 +1173,25 @@ class DraftServer:
         draft_logits[hit_mask] = cached_logits[hit_mask]
         return True
 
-    def _fill_misses_with_jit(
+    def _fill_misses_with_zeros(
         self,
-        seq_ids: torch.Tensor,
         bonus_tokens: torch.Tensor,
-        temperatures: torch.Tensor | None,
         miss_mask: torch.Tensor,
         B_miss: int,
         draft_tokens: torch.Tensor,
         draft_logits: torch.Tensor,
     ) -> None:
-        """Run JIT speculation for the miss subset and write results."""
-        miss_seq_ids = seq_ids[miss_mask]
+        """Write zero drafts (with bonus at position 0) into the miss
+        subset of ``draft_tokens`` / ``draft_logits``. SSD §4.3 fast
+        backup: keep the speculate path off the K-step drafter forward.
+        Cache_build seeds real cache entries via ``glue_decode(bonus)``.
+        """
         miss_bonus = bonus_tokens[miss_mask]
-        miss_temps = (
-            temperatures[miss_mask] if temperatures is not None else None
+        zero_tokens, zero_logits = self._zero_drafts_for_misses(
+            miss_bonus, B_miss=B_miss,
         )
-        jit_tokens, jit_logits = self._jit_speculate(
-            miss_seq_ids,
-            miss_bonus,
-            B_miss=B_miss,
-            temperatures=miss_temps,
-        )
-        draft_tokens[miss_mask] = jit_tokens
-        if jit_logits is not None:
-            draft_logits[miss_mask] = jit_logits
+        draft_tokens[miss_mask] = zero_tokens
+        draft_logits[miss_mask] = zero_logits
 
     async def _handle_speculation_inner(
         self,
@@ -1250,14 +1265,12 @@ class DraftServer:
                     draft_logits=draft_logits,
                 )
 
-        # ---- Step 5: JIT on misses ----
+        # ---- Step 5: zero-fill on misses ----
         B_miss = int(miss_mask.sum().item())
         if B_miss > 0:
-            with torch.profiler.record_function(f"jit_misses_B{B_miss}"):
-                self._fill_misses_with_jit(
-                    seq_ids=seq_ids,
+            with torch.profiler.record_function(f"miss_fill_B{B_miss}"):
+                self._fill_misses_with_zeros(
                     bonus_tokens=bonus_tokens,
-                    temperatures=temperatures,
                     miss_mask=miss_mask,
                     B_miss=B_miss,
                     draft_tokens=draft_tokens,
@@ -1465,24 +1478,19 @@ class DraftServer:
                     draft_logits[hit_mask] = cached_logits[hit_mask]
                     used_swap_for_hits = True
 
-        # ---- JIT misses (one merged call) ----
+        # ---- zero-fill on misses (one merged call) ----
         B_miss = int(miss_mask.sum().item())
         if B_miss > 0:
             with torch.profiler.record_function(
-                f"jit_misses_merged_B{B_miss}"
+                f"miss_fill_merged_B{B_miss}"
             ):
-                miss_seq_ids = seq_ids_cat[miss_mask]
-                miss_bonus = bonus_cat[miss_mask]
-                miss_temps = (
-                    temps_cat[miss_mask] if temps_cat is not None else None
+                self._fill_misses_with_zeros(
+                    bonus_tokens=bonus_cat,
+                    miss_mask=miss_mask,
+                    B_miss=B_miss,
+                    draft_tokens=draft_tokens,
+                    draft_logits=draft_logits,
                 )
-                jit_tokens, jit_logits = self._jit_speculate(
-                    miss_seq_ids, miss_bonus,
-                    B_miss=B_miss, temperatures=miss_temps,
-                )
-                draft_tokens[miss_mask] = jit_tokens
-                if jit_logits is not None:
-                    draft_logits[miss_mask] = jit_logits
 
         if not used_swap_for_hits:
             for sid in seq_ids_list:
@@ -1608,31 +1616,21 @@ class DraftServer:
                 seq_ids_list = seq_ids_cat.tolist()
 
                 # Geometric fan-out (shared across VSes).
-                fan_out_list = list(self.outcome_predictor.fan_out_list)
+                fan_out_list = self._shrink_fan_out_to_budget(
+                    list(self.outcome_predictor.fan_out_list),
+                    B_total, self.MAX_BRANCHES,
+                )
                 entries_per_seq = sum(fan_out_list)
-                max_branches = 504
-                if B_total * entries_per_seq > max_branches:
-                    scale = max_branches / (B_total * entries_per_seq)
-                    shrunk = [max(1, int(f * scale)) for f in fan_out_list]
-                    while B_total * sum(shrunk) > max_branches:
-                        max_idx = max(
-                            range(len(shrunk)),
-                            key=lambda i: shrunk[i],
-                        )
-                        if shrunk[max_idx] <= 1:
-                            break
-                        shrunk[max_idx] -= 1
-                    fan_out_list = shrunk
-                    entries_per_seq = sum(fan_out_list)
                 N = B_total * entries_per_seq
-                if N > max_branches or N == 0:
+                if N > self.MAX_BRANCHES or N == 0:
                     return
                 max_fan_out = (
                     max(fan_out_list) if fan_out_list else 0
                 )
 
-                # Per-row glue input: bonus token for zero-fallback
-                # miss rows, last drafted token for hit/JIT rows.
+                # Per-row glue input: bonus token for miss rows
+                # (which received zero drafts), last drafted token
+                # for hit rows (whose drafts came from the cache).
                 merged_miss_mask = None
                 if all("miss_mask" in sm for sm in slice_metas):
                     merged_miss_mask = torch.cat(
@@ -1857,42 +1855,6 @@ class DraftServer:
                 # end-of-round value), not glue's mutated state.
                 runner._seq_lens = saved
 
-    async def _run_cache_build_slice(
-        self,
-        B: int,
-        seq_ids: torch.Tensor,
-        bonus_tokens: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        draft_logits: torch.Tensor,
-        vs_id: str,
-    ) -> None:
-        """Per-VS cache build using explicit slice tensors.
-
-        Mirrors ``_run_cache_build`` but takes tensors directly (rather
-        than reading from ``self._last_*``) so the merged handler can
-        build per-VS caches from one merged batch.
-        """
-        runner = self.draft_model_runner
-        if runner is None:
-            return
-        with torch.profiler.record_function(f"cache_build_slice_B{B}"):
-            saved = dict(runner._seq_lens)
-            # Temporarily override _last_* so _build_next_cache picks up
-            # the per-VS slice.
-            saved_tokens = self._last_draft_tokens
-            saved_logits = self._last_draft_logits
-            saved_bonus = self._last_bonus_tokens
-            self._last_draft_tokens = draft_tokens
-            self._last_draft_logits = draft_logits
-            self._last_bonus_tokens = bonus_tokens
-            try:
-                self._build_next_cache(B, seq_ids, vs_id)
-            finally:
-                runner._seq_lens = saved
-                self._last_draft_tokens = saved_tokens
-                self._last_draft_logits = saved_logits
-                self._last_bonus_tokens = saved_bonus
-
     # ------------------------------------------------------------------
     # Response helpers
     # ------------------------------------------------------------------
@@ -1960,13 +1922,11 @@ class DraftServer:
     # Zero-fallback (cache miss path)
     # ------------------------------------------------------------------
 
-    def _jit_speculate(
+    def _zero_drafts_for_misses(
         self,
-        seq_ids: torch.Tensor,
         bonus_tokens: torch.Tensor,
         B_miss: int,
-        temperatures: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return zero drafts (with bonus at position 0) for cache-miss
         rows — SSD §4.3 fast backup. Saves the K-step drafter forward
         on the speculate critical path; cache_build runs glue_decode
@@ -1975,7 +1935,7 @@ class DraftServer:
         which rows need bonus-token glue_decode (instead of drafted-
         token glue_decode).
         """
-        with torch.profiler.record_function(f"jit_zero_B{B_miss}"):
+        with torch.profiler.record_function(f"miss_zero_B{B_miss}"):
             tokens = torch.zeros(
                 B_miss, self.K, dtype=torch.int64, device=self.device,
             )
@@ -2016,26 +1976,13 @@ class DraftServer:
         # Geometric fan-out: per-position candidate counts computed by
         # the OutcomePredictor (earlier acceptance positions get more
         # budget since they're more likely to be the actual outcome).
-        fan_out_list = list(self.outcome_predictor.fan_out_list)
+        fan_out_list = self._shrink_fan_out_to_budget(
+            list(self.outcome_predictor.fan_out_list),
+            B, self.MAX_BRANCHES,
+        )
         entries_per_seq = sum(fan_out_list)
-
-        max_branches = 504
-        if B * entries_per_seq > max_branches:
-            # Scale the allocation down proportionally while preserving
-            # the geometric shape.
-            scale = max_branches / (B * entries_per_seq)
-            shrunk = [max(1, int(f * scale)) for f in fan_out_list]
-            while B * sum(shrunk) > max_branches:
-                max_idx = max(
-                    range(len(shrunk)), key=lambda i: shrunk[i],
-                )
-                if shrunk[max_idx] <= 1:
-                    break
-                shrunk[max_idx] -= 1
-            fan_out_list = shrunk
-            entries_per_seq = sum(fan_out_list)
         N = B * entries_per_seq
-        if N > max_branches:
+        if N > self.MAX_BRANCHES:
             return
 
         max_fan_out = max(fan_out_list) if fan_out_list else 0
@@ -2372,18 +2319,18 @@ class DraftServer:
         allocation is scoped to ``vs_id`` so peer VSes' preserved
         cache entries keep pointing at live KV data.
 
-        ``miss_mask`` (zero-fallback only): rows where speculate sent
-        zero drafts and didn't run JIT. For these rows, glue_decode
-        uses the bonus token (not draft_tokens[:, -1]) to compute the
-        next-position prediction; ``_seq_lens`` for miss rows is at
-        ``base`` so glue writes the bonus's KV at base.
+        ``miss_mask`` marks rows where speculate sent zero drafts.
+        For those rows, glue_decode uses the bonus token (not
+        draft_tokens[:, -1]) to compute the next-position prediction;
+        ``_seq_lens`` for miss rows is at ``base`` so glue writes the
+        bonus's KV at base.
         """
         runner.recycle_dedicated_blocks(vs_id)
 
         # Glue decode gives us the K+1th position's logits, and
         # advances _seq_lens by one — we undo that at the end.
-        # Per-row glue input: draft_tokens[:,-1] for hit/JIT rows,
-        # bonus token for zero-fallback miss rows.
+        # Per-row glue input: draft_tokens[:,-1] for hit rows (came
+        # from the cache), bonus token for miss rows (got zeros).
         if miss_mask is not None and bool(miss_mask.any().item()):
             glue_input = draft_tokens[:, -1].clone()
             glue_input[miss_mask] = rec_tokens[miss_mask]
