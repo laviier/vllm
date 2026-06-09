@@ -1798,7 +1798,9 @@ class DraftServer:
                     src_flat = src_block_ids[copy_mask]
                     dst_flat = dst_block_ids[copy_mask]
                     for layer_kv in runner.kv_caches:
-                        layer_kv[:, dst_flat] = layer_kv[:, src_flat]
+                        # Layout (num_blocks, 2, block_size, num_kv_heads,
+                        # head_dim); block dim is 0.
+                        layer_kv[dst_flat] = layer_kv[src_flat]
 
                 # ONE merged tree decode (or parallel fanout).
                 if self._use_parallel_fanout:
@@ -2141,7 +2143,9 @@ class DraftServer:
             src_flat = src_block_ids[copy_mask]
             dst_flat = dst_block_ids[copy_mask]
             for layer_kv in runner.kv_caches:
-                layer_kv[:, dst_flat] = layer_kv[:, src_flat]
+                # Layout (num_blocks, 2, block_size, num_kv_heads, head_dim);
+                # block dim is 0.
+                layer_kv[dst_flat] = layer_kv[src_flat]
 
         return branch_block_tables, prefix_lens
 

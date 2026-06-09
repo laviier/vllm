@@ -49,11 +49,14 @@ class DraftKVCacheMixin:
             self.num_kv_blocks * bytes_per_block / 1e9,
         )
 
+        # Layout: (num_blocks, 2, block_size, num_kv_heads, head_dim).
+        # Matches main's FlashAttention backend after #42095, which
+        # unpacks key/value via kv_cache.unbind(1).
         self.kv_caches = []
         for _ in range(self.num_layers):
             kv = torch.zeros(
-                2,
                 self.num_kv_blocks,
+                2,
                 self.block_size,
                 self.num_kv_heads,
                 self.head_dim,
