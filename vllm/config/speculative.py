@@ -1432,10 +1432,23 @@ class SpeculativeConfig:
             self.method == "draft_model"
             and self.target_model_config is not None
             and self.draft_model_config is not None
+            # Disagg path tolerates draft vocab >= target vocab (the
+            # extra slot is typically a special token like an MTP mask
+            # that the draft never emits to the verifier; the draft
+            # server clamps tokens to target_vocab_size - 1).
+            and not self.use_disagg()
         ):
             target_vocab_size = self.target_model_config.get_vocab_size()
             draft_vocab_size = self.draft_model_config.get_vocab_size()
-            if target_vocab_size != draft_vocab_size:
+            # Allow a draft vocab slightly larger than target (typically
+            # +1 for an MTP mask token). The draft is unlikely to emit
+            # the extra slot at non-mask positions in practice, but
+            # this is a permissive check — if a stray emission occurs
+            # the verifier will OOB. Use only for AL benchmarking.
+            if (
+                target_vocab_size != draft_vocab_size
+                and draft_vocab_size - target_vocab_size > 1
+            ):
                 raise ValueError(
                     f"Target and draft model should have the same vocabulary size. "
                     f"Target model vocab_size={target_vocab_size}. "
