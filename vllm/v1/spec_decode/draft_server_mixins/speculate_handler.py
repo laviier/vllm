@@ -133,24 +133,13 @@ class DraftServerSpeculateMixin:
     ) -> None:
         """Fix up per-seq KV lengths for this round and reserve headroom.
 
-        Seq lens can be stale in two ways: the previous round ended with
-        a swap (so `_seq_lens` still points at the JIT prefix), or the
-        previous round's JIT extended `_seq_lens` past the accepted
-        position. Both cases are reconciled from `k_accepted` relative
-        to the round's base length, then we grow blocks so there is
-        room for the next JIT or swap to land.
+        ``_seq_lens`` may have been advanced past the accepted position
+        by the previous round's JIT or swap. Reconcile from
+        ``k_accepted`` relative to the round's base length, then grow
+        blocks so there is room for the next JIT or swap to land.
         """
         for i, sid in enumerate(seq_ids_list):
-            swap_rec = self._swap_states.get(sid)
-            if swap_rec is not None and getattr(
-                swap_rec, "last_round_was_swap", False
-            ):
-                runner._seq_lens[sid] = (
-                    getattr(swap_rec, "swap_prefix_len", 0)
-                    + 1
-                    + int(k_accepted_list[i])
-                )
-            elif sid in self._round_base_lens:
+            if sid in self._round_base_lens:
                 runner._seq_lens[sid] = (
                     self._round_base_lens[sid]
                     + 1

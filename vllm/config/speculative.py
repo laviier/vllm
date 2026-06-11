@@ -1440,15 +1440,12 @@ class SpeculativeConfig:
         ):
             target_vocab_size = self.target_model_config.get_vocab_size()
             draft_vocab_size = self.draft_model_config.get_vocab_size()
-            # Allow a draft vocab slightly larger than target (typically
-            # +1 for an MTP mask token). The draft is unlikely to emit
-            # the extra slot at non-mask positions in practice, but
-            # this is a permissive check — if a stray emission occurs
-            # the verifier will OOB. Use only for AL benchmarking.
-            if (
-                target_vocab_size != draft_vocab_size
-                and draft_vocab_size - target_vocab_size > 1
-            ):
+            # Allow vocabs to differ by at most 1 (typically +1 on the
+            # draft side for an MTP mask token). Anything larger — in
+            # either direction — almost certainly indicates mismatched
+            # tokenizers and the verifier will OOB on draft emissions
+            # outside its vocab.
+            if abs(target_vocab_size - draft_vocab_size) > 1:
                 raise ValueError(
                     f"Target and draft model should have the same vocabulary size. "
                     f"Target model vocab_size={target_vocab_size}. "

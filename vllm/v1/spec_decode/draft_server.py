@@ -891,8 +891,9 @@ class DraftServer(
                 runner.free_blocks(sid)
                 freed += 1
 
-            # Unregister the request
-            self._unregister_request(verify_server_id, sid)
+            # Unregister the request. _register_request was called in
+            # _handle_prefill with the external seq_id; mirror that here.
+            self._unregister_request(verify_server_id, ext_sid)
 
         if freed:
             logger.debug(
