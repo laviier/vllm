@@ -19,6 +19,9 @@ from vllm.v1.spec_decode.draft_server_mixins.cache_build import (
 from vllm.v1.spec_decode.draft_server_mixins.seq_id_mapping import (
     DraftServerSeqIdMixin,
 )
+from vllm.v1.spec_decode.draft_server_mixins.speculate_handler import (
+    DraftServerSpeculateMixin,
+)
 from vllm.v1.spec_decode.draft_server_mixins.transport import (
     DraftServerTransportMixin,
 )
@@ -26,5 +29,6 @@ from vllm.v1.spec_decode.draft_server_mixins.transport import (
 __all__ = [
     "DraftServerCacheBuildMixin",
     "DraftServerSeqIdMixin",
+    "DraftServerSpeculateMixin",
     "DraftServerTransportMixin",
 ]
