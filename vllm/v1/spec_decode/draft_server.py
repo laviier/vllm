@@ -39,6 +39,7 @@ from vllm.v1.spec_decode.draft_data_models import (
 )
 from vllm.v1.spec_decode.draft_server_mixins import (
     DraftServerCacheBuildMixin,
+    DraftServerFanoutMixin,
     DraftServerSeqIdMixin,
     DraftServerSpeculateMixin,
     DraftServerTransportMixin,
@@ -129,6 +130,7 @@ class DraftServerMetrics:
 class DraftServer(
     DraftServerSeqIdMixin,
     DraftServerTransportMixin,
+    DraftServerFanoutMixin,
     DraftServerCacheBuildMixin,
     DraftServerSpeculateMixin,
 ):
