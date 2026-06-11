@@ -264,6 +264,14 @@ class DraftServer(
         # Server lifecycle flag
         self._running = False
 
+        # Messages peeked during cross-VS merge drain that we couldn't
+        # safely dispatch inline (because doing so would violate per-VS
+        # FIFO with the held primary SPECULATE). The serve loop drains
+        # this queue before polling ZMQ.
+        self._deferred_messages: list[
+            tuple[str, bytes, DraftCommand, list[bytes]]
+        ] = []
+
         # ----- Cross-VS SPECULATE merging (Option A) -----
         # The serve loop opportunistically peeks for additional pending
         # SPECULATEs from other VSes after receiving the first, and runs
@@ -409,53 +417,59 @@ class DraftServer(
         poller.register(self._socket, zmq.POLLIN)
 
         while self._running:
-            poll_timeout_ms = 1000
-
-            try:
-                events = dict(await poller.poll(timeout=poll_timeout_ms))
-            except Exception:
-                if not self._running:
-                    break
-                logger.exception("DraftServer poll error")
-                continue
-
-            # --- Receive ZMQ messages ---
-            if self._socket in events:
+            # Drain any messages that the merge peek deferred to keep
+            # per-VS FIFO ordering. These take priority over fresh ZMQ
+            # recv so a deferred FREE_SEQ never overtakes the SPECULATE
+            # that was held alongside it.
+            if self._deferred_messages:
+                msg = self._deferred_messages.pop(0)
+            else:
+                poll_timeout_ms = 1000
+                try:
+                    events = dict(await poller.poll(timeout=poll_timeout_ms))
+                except Exception:
+                    if not self._running:
+                        break
+                    logger.exception("DraftServer poll error")
+                    continue
+                if self._socket not in events:
+                    self._check_evictions()
+                    continue
                 msg = await self._recv_one_message(zmq)
                 if msg is None:
                     if not self._running:
                         break
                     continue
 
-                # If this is a SPECULATE and cross-VS merging is enabled,
-                # try to drain additional pending SPECULATEs (NOBLOCK)
-                # from DIFFERENT vs_ids, and process them as one merged
-                # batch. Otherwise dispatch normally. Skip the peek when
-                # only one VS is connected — the poll() call costs ~1ms
-                # per round even when nothing's pending and would
-                # regress single-VS latency for no benefit.
-                vs_id, identity, command, frames = msg
-                merged: list[tuple[str, bytes, DraftCommand,
-                                   list[bytes]]] | None = None
-                if (
-                    command.command.upper() == "SPECULATE"
-                    and len(self._verify_servers) >= 2
-                ):
-                    extras = await self._drain_pending_speculates(
-                        zmq, already_collected={vs_id},
-                    )
-                    if extras:
-                        merged = [msg, *extras]
+            # If this is a SPECULATE and cross-VS merging is enabled,
+            # try to drain additional pending SPECULATEs (NOBLOCK)
+            # from DIFFERENT vs_ids, and process them as one merged
+            # batch. Otherwise dispatch normally. Skip the peek when
+            # only one VS is connected — the poll() call costs ~1ms
+            # per round even when nothing's pending and would
+            # regress single-VS latency for no benefit.
+            vs_id, identity, command, frames = msg
+            merged: list[tuple[str, bytes, DraftCommand,
+                               list[bytes]]] | None = None
+            if (
+                command.command.upper() == "SPECULATE"
+                and len(self._verify_servers) >= 2
+            ):
+                extras = await self._drain_pending_speculates(
+                    zmq, already_collected={vs_id},
+                )
+                if extras:
+                    merged = [msg, *extras]
 
-                if merged is not None:
-                    now = time.monotonic()
-                    for item in merged:
-                        self._verify_server_last_seen[item[0]] = now
-                    await self._handle_speculation_merged(merged)
-                else:
-                    self._current_tensor_frames = frames
-                    self._current_tensor_idx = 0
-                    await self._dispatch(vs_id, identity, command)
+            if merged is not None:
+                now = time.monotonic()
+                for item in merged:
+                    self._verify_server_last_seen[item[0]] = now
+                await self._handle_speculation_merged(merged)
+            else:
+                self._current_tensor_frames = frames
+                self._current_tensor_idx = 0
+                await self._dispatch(vs_id, identity, command)
 
             # Check for verify servers that have timed out and evict
             # their requests.
@@ -509,9 +523,11 @@ class DraftServer(
         connected VS minus those already collected).
 
         Returns a list of message tuples. Each is a SPECULATE from a
-        VS not in ``already_collected``. On a non-SPECULATE message or
-        a same-VS SPECULATE, the message is dispatched normally inline
-        and the drain stops (no more peeks); we never drop messages.
+        VS not in ``already_collected``. Anything else — non-SPECULATE
+        commands and SPECULATEs from a VS already collected — is
+        deferred to ``self._deferred_messages`` so the next serve-loop
+        iteration handles it AFTER the held primary, preserving
+        per-VS FIFO ordering. We never drop messages.
 
         The first peek uses ``peek_timeout_ms`` (default
         ``self._merge_peek_timeout_ms``); subsequent peeks use 0
@@ -538,7 +554,7 @@ class DraftServer(
             msg = await self._recv_one_message(zmq)
             if msg is None:
                 break
-            vs_id2, identity2, command2, frames2 = msg
+            vs_id2, _identity2, command2, _frames2 = msg
             if (
                 command2.command.upper() == "SPECULATE"
                 and vs_id2 not in already_collected
@@ -547,11 +563,12 @@ class DraftServer(
                 already_collected.add(vs_id2)
                 continue
 
-            # Not a SPECULATE we can merge — dispatch inline and stop.
-            self._verify_server_last_seen[vs_id2] = time.monotonic()
-            self._current_tensor_frames = frames2
-            self._current_tensor_idx = 0
-            await self._dispatch(vs_id2, identity2, command2)
+            # Can't merge: either non-SPECULATE or a SPECULATE from a
+            # VS already collected. Inline dispatch would invert the
+            # per-VS FIFO with the held primary (e.g., a FREE_SEQ
+            # could free seq_ids the held SPECULATE references).
+            # Defer to the serve loop's deferred queue and stop.
+            self._deferred_messages.append(msg)
             break
 
         return collected
