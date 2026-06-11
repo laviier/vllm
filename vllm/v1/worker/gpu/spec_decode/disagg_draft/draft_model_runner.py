@@ -31,6 +31,12 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.v1.worker.gpu.spec_decode.disagg_draft.attn_metadata import (
+    DraftAttnMetadataMixin,
+)
+from vllm.v1.worker.gpu.spec_decode.disagg_draft.cuda_graphs import (
+    DraftCudaGraphMixin,
+)
 from vllm.v1.worker.gpu.spec_decode.disagg_draft.kv_cache_manager import (
     DraftKVCacheMixin,
 )
@@ -38,7 +44,11 @@ from vllm.v1.worker.gpu.spec_decode.disagg_draft.kv_cache_manager import (
 logger = init_logger(__name__)
 
 
-class DraftModelRunner(DraftKVCacheMixin):
+class DraftModelRunner(
+    DraftKVCacheMixin,
+    DraftAttnMetadataMixin,
+    DraftCudaGraphMixin,
+):
     """Manages the draft model for disagg draft disaggregated speculation.
 
     Handles model loading, KV cache allocation, and forward passes
@@ -344,244 +354,6 @@ class DraftModelRunner(DraftKVCacheMixin):
                 "Tree decode CUDA graph capture failed: %s. Using eager.", e
             )
             self._tree_decode_captured = False
-
-    def _capture_decode_graphs(self) -> None:
-        """Capture CUDA graphs for decode_step at common batch sizes.
-
-        With hybrid swap+JIT, decode graphs are used for JIT on cache
-        misses (B_miss), which under N:M spec decode at high concurrency
-        can land on any integer in [1..B_active]. Capture every size up
-        to 16 individually so no B_miss value falls back to eager; use
-        coarser steps above 16 where the B_miss distribution is less
-        sensitive to exact match.
-        """
-        max_bs = min(self.max_num_seqs, 128)
-        dense = list(range(1, 17))  # 1..16 — covers all B_miss at small B
-        coarse = [24, 32, 48, 64, 96, 128]
-        sizes = [bs for bs in dense + coarse if bs <= max_bs]
-        if max_bs not in sizes:
-            sizes.append(max_bs)
-        logger.info("Capturing CUDA graphs for decode_step: bs=%s", sizes)
-        self._capture_graphs_for_sizes(sizes, self._decode_graphs)
-        self._decode_graphs_captured = True
-        logger.info("CUDA graphs captured for %d decode sizes.", len(sizes))
-
-    def _capture_tree_decode_graphs(self) -> None:
-        """Capture CUDA graphs for tree_decode_step at common N values.
-
-        Tree decode processes N = B × sum(fan_out_list) branch tokens
-        per step. The exact N depends on both B and the geometric
-        fan-out allocation, so capture a dense set of small sizes
-        (covering F=1/2/3 at B<=8) plus coarser larger sizes for
-        high-concurrency cases. Tree-decode replay pads up to the
-        next captured size, so a miss only costs the padding overhead
-        — but wild mismatches (e.g. N=56 padded to 72) still incur
-        ~30% extra compute, and at F=1 we hit them often enough to
-        regress measurably. Dense capture below N=100 avoids this.
-        """
-        dense = [7, 10, 14, 18, 21, 28, 35, 36, 42, 49, 54, 56,
-                 63, 70, 72, 80, 84, 90, 98, 108]
-        coarse = [126, 144, 168, 192, 256, 336, 504]
-        sizes = sorted(set(dense + coarse))
-        logger.info("Capturing CUDA graphs for tree_decode_step: N=%s", sizes)
-        self._capture_graphs_for_sizes(sizes, self._tree_graphs)
-        self._tree_decode_captured = True
-        logger.info("CUDA graphs captured for %d tree sizes.", len(sizes))
-
-    def _capture_graphs_for_sizes(
-        self,
-        sizes: list[int],
-        target_dict: dict[int, dict],
-    ) -> None:
-        """Shared CUDA graph capture logic for decode and tree decode.
-
-        Pre-allocates input/output tensors at the max size, then captures
-        a graph for each size. All graphs share the same memory pool.
-
-        Args:
-            sizes: List of token counts to capture graphs for.
-            target_dict: Dict to store captured graphs (keyed by size).
-        """
-        max_n = max(sizes)
-        g_input_ids = torch.zeros(max_n, dtype=torch.int64, device=self.device)
-        g_positions = torch.zeros(max_n, dtype=torch.long, device=self.device)
-        g_slot_mapping = torch.zeros(
-            max_n, dtype=torch.int64, device=self.device
-        )
-        g_seq_lens = torch.ones(max_n, dtype=torch.int32, device=self.device)
-        g_block_tables = torch.zeros(
-            max_n, self.max_num_blocks,
-            dtype=torch.int32, device=self.device,
-        )
-        g_query_start_loc = torch.arange(
-            max_n + 1, dtype=torch.int32, device=self.device
-        )
-        g_hidden = torch.zeros(
-            max_n, self.hidden_size, dtype=self.dtype, device=self.device
-        )
-
-        for n in reversed(sizes):
-            attn_metadata = self._build_flash_attn_metadata(
-                num_tokens=n,
-                seq_lens_tensor=g_seq_lens[:n],
-                max_seq_len=self.max_model_len,
-                max_query_len=1,
-                query_start_loc=g_query_start_loc[:n + 1],
-                block_table=g_block_tables[:n],
-                slot_mapping=g_slot_mapping[:n],
-            )
-            slot_mapping_dict = self._build_slot_mapping_dict(
-                g_slot_mapping[:n]
-            )
-            batch_descriptor = BatchDescriptor(num_tokens=n)
-
-            # Warmup
-            with set_forward_context(
-                attn_metadata=attn_metadata,
-                vllm_config=self._draft_vllm_config,
-                num_tokens=n,
-                slot_mapping=slot_mapping_dict,
-                batch_descriptor=batch_descriptor,
-            ):
-                g_hidden[:n] = self.model(
-                    input_ids=g_input_ids[:n],
-                    positions=g_positions[:n],
-                )
-
-            # Capture
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self._decode_graph_pool):
-                with set_forward_context(
-                    attn_metadata=attn_metadata,
-                    vllm_config=self._draft_vllm_config,
-                    num_tokens=n,
-                    slot_mapping=slot_mapping_dict,
-                    batch_descriptor=batch_descriptor,
-                ):
-                    g_hidden[:n] = self.model(
-                        input_ids=g_input_ids[:n],
-                        positions=g_positions[:n],
-                    )
-
-            if self._decode_graph_pool is None:
-                self._decode_graph_pool = graph.pool()
-
-            target_dict[n] = {
-                "graph": graph,
-                "input_ids": g_input_ids,
-                "positions": g_positions,
-                "slot_mapping": g_slot_mapping,
-                "seq_lens": g_seq_lens,
-                "block_tables": g_block_tables,
-                "query_start_loc": g_query_start_loc,
-                "hidden": g_hidden,
-                "attn_metadata": attn_metadata,
-                "slot_mapping_dict": slot_mapping_dict,
-                "batch_descriptor": batch_descriptor,
-            }
-            torch.cuda.synchronize()
-
-    def _get_block_table_tensor(
-        self, seq_ids: torch.Tensor | list[int]
-    ) -> torch.Tensor:
-        """Build a [B, max_blocks] block table tensor from GPU-resident table."""
-        if isinstance(seq_ids, list):
-            seq_ids_t = torch.tensor(
-                seq_ids, dtype=torch.int64, device=self.device
-            )
-        else:
-            seq_ids_t = seq_ids.to(torch.int64)
-        # Return a contiguous copy so callers cannot mutate _block_table_gpu
-        return self._block_table_gpu[seq_ids_t].contiguous()
-
-    def _compute_slot_mapping(
-        self,
-        positions: torch.Tensor,
-        seq_ids: torch.Tensor | list[int],
-    ) -> torch.Tensor:
-        """Compute slot mapping using GPU-resident block table (vectorized).
-
-        For each token, the physical slot is:
-            physical_block * block_size + offset_in_block
-        where:
-            logical_block = position // block_size
-            offset_in_block = position % block_size
-            physical_block = block_table_gpu[seq_id, logical_block]
-        """
-        if isinstance(seq_ids, list):
-            seq_ids_t = torch.tensor(
-                seq_ids, dtype=torch.int64, device=self.device
-            )
-        else:
-            seq_ids_t = seq_ids.to(torch.int64)
-        logical_blocks = (positions // self.block_size).to(torch.int64)
-        offsets = (positions % self.block_size).to(torch.int64)
-        physical_blocks = self._block_table_gpu[
-            seq_ids_t, logical_blocks
-        ].to(torch.int64)
-        return physical_blocks * self.block_size + offsets
-
-    def _build_slot_mapping_dict(
-        self, slot_mapping: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """Build a slot_mapping dict keyed by attention layer names.
-
-        In V1, `unified_kv_cache_update` looks up slot_mapping by layer
-        name: `forward_context.slot_mapping.get(layer_name)`.  If the
-        key doesn't match, the lookup returns None and the KV cache is
-        NOT updated.  We must populate the dict with every attention
-        layer's registered name so each layer gets the slot mapping.
-        """
-        from vllm.model_executor.layers.attention import Attention
-
-        forward_ctx = (
-            self._draft_vllm_config.compilation_config.static_forward_context
-        )
-        mapping: dict[str, torch.Tensor] = {}
-        for layer_name, layer in forward_ctx.items():
-            if isinstance(layer, Attention):
-                mapping[layer_name] = slot_mapping
-        return mapping
-
-    def _build_flash_attn_metadata(
-        self,
-        num_tokens: int,
-        seq_lens_tensor: torch.Tensor,
-        max_seq_len: int,
-        max_query_len: int,
-        query_start_loc: torch.Tensor,
-        block_table: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ):
-        """Build FlashAttentionMetadata for forward passes.
-
-        Constructs the minimal metadata needed by the FlashAttention
-        backend to perform paged attention with our KV cache.
-        """
-        from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
-
-        return FlashAttentionMetadata(
-            num_actual_tokens=num_tokens,
-            max_query_len=max_query_len,
-            query_start_loc=query_start_loc,
-            max_seq_len=max_seq_len,
-            seq_lens=seq_lens_tensor,
-            block_table=block_table,
-            slot_mapping=slot_mapping,
-            # Cascade attention disabled for draft model
-            use_cascade=False,
-            common_prefix_len=0,
-            cu_prefix_query_lens=None,
-            prefix_kv_lens=None,
-            suffix_kv_lens=None,
-            # FA scheduling metadata (None = use FA heuristics)
-            scheduler_metadata=None,
-            prefix_scheduler_metadata=None,
-        )
-
-    # ---------------------------------------------------------------
-    # Forward passes
-    # ---------------------------------------------------------------
 
     @torch.inference_mode()
     def prefill(
