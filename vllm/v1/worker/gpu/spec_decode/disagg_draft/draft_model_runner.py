@@ -81,6 +81,13 @@ class DraftModelRunner(
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = self.draft_config.max_model_len
         self._num_spec_tokens = spec_config.num_speculative_tokens
+        # Total geometric fan-out budget per sequence (matches the
+        # OutcomePredictor's total_budget on the server side). Used by
+        # the CUDA graph capture mixin to size graphs for parallel
+        # fanout (N×K) and KV cleanup (N×(K-1)) call shapes.
+        self._sum_fan_out = (
+            spec_config.disagg_fan_out * (self._num_spec_tokens + 1)
+        )
 
         # KV cache parameters
         self.block_size = vllm_config.cache_config.block_size

@@ -57,20 +57,50 @@ class DraftCudaGraphMixin:
     def _capture_tree_decode_graphs(self) -> None:
         """Capture CUDA graphs for tree_decode_step at common N values.
 
-        Tree decode processes N = B × sum(fan_out_list) branch tokens
-        per step. The exact N depends on both B and the geometric
-        fan-out allocation, so capture a dense set of small sizes
-        (covering F=1/2/3 at B<=8) plus coarser larger sizes for
-        high-concurrency cases. Tree-decode replay pads up to the
-        next captured size, so a miss only costs the padding overhead
-        — but wild mismatches (e.g. N=56 padded to 72) still incur
-        ~30% extra compute, and at F=1 we hit them often enough to
-        regress measurably. Dense capture below N=100 avoids this.
+        Tree decode processes N branch tokens per step. The exact N
+        depends on the call shape:
+
+        - Sequential tree decode: N = B_total × sum(fan_out_list).
+        - Parallel fanout: N = B_total × sum(fan_out_list) × K
+          (one forward over all K depths, mask token at depth>0).
+        - Parallel-fanout KV cleanup: N = B_total × sum(fan_out_list) ×
+          (K-1) (one forward over depths 1..K-1, real tokens replacing
+          the mask KVs).
+
+        Tree-decode replay pads up to the next captured size, so a
+        miss only costs the padding overhead — but wild mismatches
+        (e.g. N=56 padded to 72) still incur ~30% extra compute. Dense
+        capture below N=108 covers F=1/2/3 sequential at B≤8; coarser
+        sizes from 126..504 cover sequential at higher concurrency
+        and small parallel/cleanup calls. The 576..2160 range covers
+        parallel-fanout and cleanup at multi-VS configs (e.g. 3V+1D
+        at c=8 with K=5, fan_out=3 produces N=2160 for parallel and
+        N=1728 for cleanup; without these captures both fall to eager).
         """
         dense = [7, 10, 14, 18, 21, 28, 35, 36, 42, 49, 54, 56,
                  63, 70, 72, 80, 84, 90, 98, 108]
         coarse = [126, 144, 168, 192, 256, 336, 504]
-        sizes = sorted(set(dense + coarse))
+        # Parallel-fanout and KV-cleanup call shapes:
+        #   parallel fanout call: N = B_total × sum_fan_out × K
+        #   KV cleanup call:      N = B_total × sum_fan_out × (K-1)
+        # Capture both for typical B_total values (per-VS B={4,8} ×
+        # N_VS={1,2,3}). Sizes are computed from the live K and
+        # sum_fan_out so they track config changes (different K or
+        # disagg_fan_out) instead of being hardcoded for one config.
+        K = self._num_spec_tokens
+        sum_fan = self._sum_fan_out
+        parallel: set[int] = set()
+        # B_total = per-VS batch × N_VS. Cover per-VS up to 8 across
+        # 1..4 connected verifiers (B_total up to 32). Larger merged
+        # configs fall back to eager — fine since they're far from
+        # the typical deployment sweet spot of 1-3V at c=8.
+        for b_total in (4, 8, 12, 16, 24, 32):
+            n_branches = b_total * sum_fan
+            for multiplier in (K - 1, K):
+                if multiplier <= 0:
+                    continue
+                parallel.add(n_branches * multiplier)
+        sizes = sorted(set(dense + coarse) | parallel)
         logger.info("Capturing CUDA graphs for tree_decode_step: N=%s", sizes)
         self._capture_graphs_for_sizes(sizes, self._tree_graphs)
         self._tree_decode_captured = True
