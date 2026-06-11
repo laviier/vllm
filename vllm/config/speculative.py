@@ -342,11 +342,13 @@ class SpeculativeConfig:
     instead of K sequential autoregressive steps. Requires a draft model
     trained with the parallel prediction (MTP) objective."""
 
-    disagg_mtp_token_id: int = 200019
-    """Token ID of the <our_mtp_token> mask embedding used for parallel
-    fanout. This is the input token fed at depth > 1 positions during
-    single-pass parallel speculation. The model's embedding at this ID
-    must be trained with the MTP objective."""
+    disagg_mtp_token_id: int | None = None
+    """Token ID of the trained mask embedding used for parallel fanout.
+    This is the input token fed at depth > 1 positions during
+    single-pass parallel speculation. Required when
+    ``disagg_parallel_fanout=True``; the model's embedding row at this
+    ID must be trained with the MTP objective. Typically the highest
+    vocab id (e.g. 128256 for Llama-3 + one appended mask token)."""
 
     def compute_hash(self) -> str:
         """

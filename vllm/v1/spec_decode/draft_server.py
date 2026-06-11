@@ -188,7 +188,15 @@ class DraftServer:
         # Parallel fanout: use single-pass MTP-style drafting when the
         # model supports it (configured via speculative_config).
         self._use_parallel_fanout = spec_config.disagg_parallel_fanout
-        self._mtp_token_id: int = spec_config.disagg_mtp_token_id
+        self._mtp_token_id: int | None = spec_config.disagg_mtp_token_id
+        if self._use_parallel_fanout and self._mtp_token_id is None:
+            raise ValueError(
+                "disagg_parallel_fanout=True requires disagg_mtp_token_id "
+                "to be set (the trained mask token's vocab id). For a "
+                "checkpoint produced via BISGlora's extend_vocab, this is "
+                "typically the highest valid vocab id (e.g. 128256 for "
+                "Llama-3 + one appended mask token)."
+            )
 
         # SSD §4.3 fast-backup: on cache miss, return zero drafts to
         # the verifier (saves the full ~17 ms K-step JIT) and let
@@ -1814,6 +1822,22 @@ class DraftServer:
                         branch_block_tables=branch_block_tables,
                         bonus_candidates=bonus_candidates,
                     )
+                    cleanup_logits = self._parallel_fanout_kv_cleanup(
+                        runner=runner,
+                        N=N,
+                        K=K,
+                        seq_ids=seq_ids_cat,
+                        entry_batch_ids=entry_batch_ids,
+                        prefix_lens=prefix_lens,
+                        branch_block_tables=branch_block_tables,
+                        all_tokens=all_tokens,
+                    )
+                    if cleanup_logits is not None:
+                        # Replace contaminated mask-derived logits at
+                        # depths 1+ with cleanup's real-token logits.
+                        # Depth 0 (bonus NTP) was never contaminated.
+                        all_logits = all_logits.clone()
+                        all_logits[:, 1:K, :] = cleanup_logits
                 else:
                     all_tokens, all_logits = self._run_tree_decode(
                         runner=runner,
@@ -2301,6 +2325,91 @@ class DraftServer:
 
         return all_tokens, all_logits
 
+    def _parallel_fanout_kv_cleanup(
+        self,
+        runner: Any,
+        N: int,
+        K: int,
+        seq_ids: torch.Tensor,
+        entry_batch_ids: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        branch_block_tables: torch.Tensor,
+        all_tokens: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Overwrite mask-derived KVs at positions prefix+1..prefix+K-1
+        with KVs from real-token embeddings.
+
+        After parallel fanout, slots ``prefix..prefix+K-1`` of each
+        branch's dedicated block hold KVs computed from the inputs
+        ``[bonus_candidate, mask, mask, ..., mask]``. The mask-token
+        embedding has near-zero norm in this checkpoint, so positions
+        ``prefix+1..prefix+K-1`` contain near-zero KVs that contaminate
+        future rounds (after the branch's block becomes the seq's main
+        block via ``swap_hits``).
+
+        This cleanup re-feeds the model with parallel-fanout's
+        argmax-predicted tokens at those positions, producing real-
+        token-derived KVs that overwrite the mask-derived ones at the
+        same slots. Logits from this cleanup are discarded; we keep
+        ``all_tokens`` as the parallel-fanout result.
+
+        Implementation: one parallel forward over N*(K-1) tokens. Each
+        depth d at position prefix+d attends causally to the prefix
+        plus all earlier depths' KV (which the layer's K/V write phase
+        emits before attention reads, so depth d sees real-token KVs
+        from depths 1..d-1 in the same forward). Equivalent to running
+        K-1 sequential forwards but ~K-1× faster.
+        """
+        if K <= 1:
+            return None
+        D = K - 1
+        total_tokens = N * D
+
+        # input_ids: [N*D] — for branch j depth d (1-indexed 1..K-1),
+        # input is parallel-fanout's predicted token at depth d-1.
+        # Layout: [br0_d1, br0_d2, ..., br0_d{K-1}, br1_d1, ..., brN_d{K-1}]
+        input_ids = all_tokens[:, :D].to(torch.int32).reshape(total_tokens)
+
+        # positions: [N*D] — branch j depth d (1..K-1) at prefix_lens[j] + d
+        depth_offsets = torch.arange(
+            1, K, device=self.device, dtype=torch.int64,
+        )  # [1, 2, ..., K-1] of length D
+        positions = (
+            prefix_lens.unsqueeze(1) + depth_offsets.unsqueeze(0)
+        ).reshape(total_tokens).to(torch.int64)
+
+        # seq_lens: [N*D] — depth d attends causally to prefix +
+        # earlier depths' (real-token, just-cleaned) KVs in the same
+        # forward. seq_len = prefix_lens[j] + d + 1.
+        seq_lens = (
+            prefix_lens.unsqueeze(1) + 1 + depth_offsets.unsqueeze(0)
+        ).reshape(total_tokens).to(torch.int32)
+
+        # block_tables: [N*D, max_blocks] — all D depths in a branch
+        # share the same dedicated block table.
+        block_tables_expanded = branch_block_tables.repeat_interleave(
+            D, dim=0,
+        )
+
+        seq_ids_for_branches = seq_ids[entry_batch_ids]
+        seq_ids_expanded = seq_ids_for_branches.repeat_interleave(D)
+
+        max_context_hint = int(prefix_lens.max().item()) + K
+        # Capture logits — they predict positions prefix+2..prefix+K
+        # using real-token KVs at all earlier depths, so they're cleaner
+        # than parallel-fanout's mask-token-derived logits at the same
+        # positions. Caller may use them to overwrite all_logits[:, 1:].
+        cleanup_logits_flat = runner.tree_decode_step(
+            input_ids=input_ids,
+            positions=positions,
+            seq_lens=seq_lens,
+            seq_ids_expanded=seq_ids_expanded,
+            block_tables=block_tables_expanded,
+            max_seq_len_hint=max_context_hint,
+        )
+        # Reshape [N*D, V] -> [N, D, V]
+        return cleanup_logits_flat.view(N, D, -1)
+
     def _build_standalone_cache(
         self,
         B: int, K: int,
@@ -2399,6 +2508,19 @@ class DraftServer:
                 branch_block_tables=branch_block_tables,
                 bonus_candidates=bonus_candidates,
             )
+            cleanup_logits = self._parallel_fanout_kv_cleanup(
+                runner=runner,
+                N=N,
+                K=K,
+                seq_ids=seq_ids,
+                entry_batch_ids=entry_batch_ids,
+                prefix_lens=prefix_lens,
+                branch_block_tables=branch_block_tables,
+                all_tokens=all_tokens,
+            )
+            if cleanup_logits is not None:
+                all_logits = all_logits.clone()
+                all_logits[:, 1:K, :] = cleanup_logits
         else:
             all_tokens, all_logits = self._run_tree_decode(
                 runner=runner,
