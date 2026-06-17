@@ -215,6 +215,13 @@ class DraftServer(
         self._round_base_lens: dict[int, int] = {}
         self._swap_states: dict[int, Any] = {}
 
+        # Hit-row swap deferred from the SPECULATE handler to the start
+        # of the next cache_build. Set by _handle_speculation_inner /
+        # _handle_speculation_merged_inner, consumed in the prologue of
+        # _run_cache_build / _run_cache_build_merged.
+        self._pending_swap: dict[str, Any] | None = None
+        self._pending_swap_merged: dict[str, Any] | None = None
+
         # Last speculation seq_ids — stored by _handle_speculation_inner,
         # consumed by _handle_speculation for post-response cache building.
         self._last_spec_seq_ids: torch.Tensor | None = None

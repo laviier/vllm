@@ -155,29 +155,45 @@ class DraftServerSpeculateMixin:
         for sid in seq_ids_list:
             self._round_base_lens[sid] = runner._seq_lens.get(sid, 0)
 
-    def _apply_swap_for_hits(
+    def _response_for_hits(
+        self,
+        cache_hits: torch.Tensor,
+        cached_tokens: torch.Tensor,
+        cached_logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Copy cached tokens/logits into the response buffers.
+
+        Returns (hit_tables, hit_prefix_lens) so the caller can stash
+        them for the deferred swap; the synchronous SPECULATE path no
+        longer touches runner block tables / seq_lens. None if the cache
+        has no hit entries to copy from.
+        """
+        hit_tables, hit_prefix_lens = self.cache.get_hit_block_tables(
+            cache_hits
+        )
+        if hit_tables is None or hit_prefix_lens is None:
+            return None
+        hit_mask = cache_hits.bool()
+        draft_tokens[hit_mask] = cached_tokens[hit_mask]
+        draft_logits[hit_mask] = cached_logits[hit_mask]
+        return hit_tables, hit_prefix_lens
+
+    def _apply_pending_swap(
         self,
         runner: Any,
         verify_server_id: str,
         seq_ids: torch.Tensor,
         seq_ids_list: list[int],
         cache_hits: torch.Tensor,
-        cached_tokens: torch.Tensor,
-        cached_logits: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        draft_logits: torch.Tensor,
-    ) -> bool:
-        """Swap dedicated cache blocks into the runner for hit seqs.
-
-        Returns True if any hits were applied (so the caller knows to
-        preserve swap_states); False otherwise.
+        hit_tables: torch.Tensor,
+        hit_prefix_lens: torch.Tensor,
+    ) -> None:
+        """Mutate runner state for a previously-recorded set of cache
+        hits. Called at the start of cache_build to hide swap latency
+        behind the verifier's target forward.
         """
-        hit_tables, hit_prefix_lens = self.cache.get_hit_block_tables(
-            cache_hits
-        )
-        if hit_tables is None or hit_prefix_lens is None:
-            return False
-
         hit_mask = cache_hits.bool()
         hit_seq_ids = seq_ids[hit_mask]
         owned, displaced = runner.swap_block_tables(
@@ -186,24 +202,53 @@ class DraftServerSpeculateMixin:
             prefix_lens=hit_prefix_lens,
             K=self.K,
         )
-        # The hit entries' dedicated blocks were reserved under THIS
-        # VS — cache entries for this round's seq_ids can only come
-        # from this VS's partition because internal seq_ids are
-        # globally unique across VSes.
+        # The hit entries' dedicated blocks were reserved under THIS VS —
+        # cache entries for this round's seq_ids can only come from this
+        # VS's partition because internal seq_ids are globally unique
+        # across VSes.
         for blocks in owned.values():
             runner.exclude_from_dedicated(blocks, verify_server_id)
         if displaced:
             runner._free_list.extend(displaced)
-
         hit_indices = hit_mask.nonzero(as_tuple=True)[0]
         for compact_i, idx in enumerate(hit_indices):
             sid = seq_ids_list[int(idx.item())]
             prefix_len = int(hit_prefix_lens[compact_i].item())
             runner._seq_lens[sid] = prefix_len + self.K
 
-        draft_tokens[hit_mask] = cached_tokens[hit_mask]
-        draft_logits[hit_mask] = cached_logits[hit_mask]
-        return True
+    def _apply_pending_swap_merged(
+        self,
+        runner: Any,
+        seq_ids: torch.Tensor,
+        seq_ids_list: list[int],
+        cache_hits: torch.Tensor,
+        hit_tables: torch.Tensor,
+        hit_prefix_lens: torch.Tensor,
+        sid_to_vs: dict[int, str],
+    ) -> None:
+        """Cross-VS variant of ``_apply_pending_swap``. One merged
+        ``swap_block_tables`` call covers all hit seqs; per-VS scoping
+        for ``exclude_from_dedicated`` uses the ``sid_to_vs`` map.
+        """
+        hit_mask = cache_hits.bool()
+        hit_seq_ids = seq_ids[hit_mask]
+        owned, displaced = runner.swap_block_tables(
+            seq_ids=hit_seq_ids,
+            branch_block_tables=hit_tables,
+            prefix_lens=hit_prefix_lens,
+            K=self.K,
+        )
+        for sid, blocks in owned.items():
+            runner.exclude_from_dedicated(
+                blocks, sid_to_vs.get(sid, "__default__"),
+            )
+        if displaced:
+            runner._free_list.extend(displaced)
+        hit_indices = hit_mask.nonzero(as_tuple=True)[0]
+        for compact_i, idx in enumerate(hit_indices):
+            sid = seq_ids_list[int(idx.item())]
+            prefix_len = int(hit_prefix_lens[compact_i].item())
+            runner._seq_lens[sid] = prefix_len + self.K
 
     def _fill_misses_with_zeros(
         self,
@@ -281,21 +326,35 @@ class DraftServerSpeculateMixin:
             dtype=self.dtype, device=self.device,
         )
 
-        # ---- Step 4: Apply cache hits (swap path) ----
+        # ---- Step 4: Copy cache hits into response (swap deferred) ----
+        # The runner-state mutation (swap_block_tables, _seq_lens,
+        # _free_list) runs at the top of _run_cache_build instead of
+        # here, so the synchronous SPECULATE path returns ~2 ms sooner.
+        # Cache_build awaits the verifier's target forward anyway, so
+        # the deferred swap hides behind that overlap.
         used_swap_for_hits = False
+        pending_swap: dict[str, Any] | None = None
         if num_hits > 0 and cached_logits is not None and runner is not None:
-            with torch.profiler.record_function(f"swap_hits_{num_hits}"):
-                used_swap_for_hits = self._apply_swap_for_hits(
-                    runner=runner,
-                    verify_server_id=verify_server_id,
-                    seq_ids=seq_ids,
-                    seq_ids_list=seq_ids_list,
+            with torch.profiler.record_function(f"copy_hits_{num_hits}"):
+                hit_payload = self._response_for_hits(
                     cache_hits=cache_hits,
                     cached_tokens=cached_tokens,
                     cached_logits=cached_logits,
                     draft_tokens=draft_tokens,
                     draft_logits=draft_logits,
                 )
+                if hit_payload is not None:
+                    hit_tables, hit_prefix_lens = hit_payload
+                    pending_swap = {
+                        "verify_server_id": verify_server_id,
+                        "seq_ids": seq_ids,
+                        "seq_ids_list": seq_ids_list,
+                        "cache_hits": cache_hits,
+                        "hit_tables": hit_tables,
+                        "hit_prefix_lens": hit_prefix_lens,
+                    }
+                    used_swap_for_hits = True
+        self._pending_swap = pending_swap
 
         # ---- Step 5: zero-fill on misses ----
         B_miss = int(miss_mask.sum().item())
@@ -473,41 +532,30 @@ class DraftServerSpeculateMixin:
             dtype=self.dtype, device=self.device,
         )
 
-        # ---- Swap path (split owned blocks per VS) ----
+        # ---- Copy cache hits into response (swap deferred) ----
         used_swap_for_hits = False
+        self._pending_swap_merged = None
         if num_hits > 0 and cached_logits is not None:
             with torch.profiler.record_function(
-                f"swap_hits_merged_{num_hits}"
+                f"copy_hits_merged_{num_hits}"
             ):
                 hit_tables, hit_prefix_lens = (
                     self.cache.get_hit_block_tables(cache_hits)
                 )
                 if hit_tables is not None and hit_prefix_lens is not None:
-                    hit_seq_ids = seq_ids_cat[hit_mask]
-                    owned, displaced = runner.swap_block_tables(
-                        seq_ids=hit_seq_ids,
-                        branch_block_tables=hit_tables,
-                        prefix_lens=hit_prefix_lens,
-                        K=self.K,
-                    )
-                    # Map each sid back to its VS so dedicated-block
-                    # exclusion is scoped correctly.
+                    draft_tokens[hit_mask] = cached_tokens[hit_mask]
+                    draft_logits[hit_mask] = cached_logits[hit_mask]
                     sid_to_vs: dict[int, str] = {}
                     for i, sid in enumerate(seq_ids_list):
                         sid_to_vs[sid] = per_vs[entry_vs[i]]["vs_id"]
-                    for sid, blocks in owned.items():
-                        runner.exclude_from_dedicated(
-                            blocks, sid_to_vs.get(sid, "__default__"),
-                        )
-                    if displaced:
-                        runner._free_list.extend(displaced)
-                    hit_indices = hit_mask.nonzero(as_tuple=True)[0]
-                    for compact_i, idx in enumerate(hit_indices):
-                        sid = seq_ids_list[int(idx.item())]
-                        prefix_len = int(hit_prefix_lens[compact_i].item())
-                        runner._seq_lens[sid] = prefix_len + self.K
-                    draft_tokens[hit_mask] = cached_tokens[hit_mask]
-                    draft_logits[hit_mask] = cached_logits[hit_mask]
+                    self._pending_swap_merged = {
+                        "seq_ids": seq_ids_cat,
+                        "seq_ids_list": seq_ids_list,
+                        "cache_hits": cache_hits,
+                        "hit_tables": hit_tables,
+                        "hit_prefix_lens": hit_prefix_lens,
+                        "sid_to_vs": sid_to_vs,
+                    }
                     used_swap_for_hits = True
 
         # ---- zero-fill on misses (one merged call) ----

@@ -100,6 +100,15 @@ class DraftCudaGraphMixin:
                 if multiplier <= 0:
                     continue
                 parallel.add(n_branches * multiplier)
+        # Deferred-cleanup call shape: H_hit × (K - 1), where H_hit ≤
+        # B_total. Capture every B_total × (K - 1) so a hit-saturated
+        # round at any concurrency hits a graph at the exact requested
+        # size — padding to a larger captured size produced FP-
+        # nondeterminism (different kernel grid → different reduction
+        # order → ~1 % AL drift on mt-bench).
+        if K > 1:
+            for b_total in (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32):
+                parallel.add(b_total * (K - 1))
         sizes = sorted(set(dense + coarse) | parallel)
         logger.info("Capturing CUDA graphs for tree_decode_step: N=%s", sizes)
         self._capture_graphs_for_sizes(sizes, self._tree_graphs)

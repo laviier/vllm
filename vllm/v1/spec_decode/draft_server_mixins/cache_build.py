@@ -81,12 +81,108 @@ class DraftServerCacheBuildMixin:
         with torch.profiler.record_function(
             f"cache_build_B{batch_size}"
         ):
+            # Apply any swap deferred from the synchronous SPECULATE
+            # path. Mutates _seq_lens / block tables and recycles
+            # displaced blocks; running it here (rather than on the
+            # SPECULATE critical path) overlaps with the verifier's
+            # target forward.
+            pending = self._pending_swap
+            self._pending_swap = None
+            if pending is not None:
+                with torch.profiler.record_function(
+                    f"deferred_swap_{int(pending['cache_hits'].sum().item())}"
+                ):
+                    self._apply_pending_swap(runner=runner, **pending)
+                self._deferred_kv_cleanup_winner(runner, pending)
+
             # Snapshot _seq_lens around the build: tree decode mutates them
             # for its branch KV layout, and we need the per-seq lens to stay
             # at the end-of-round value for the next SPECULATE.
             saved = dict(runner._seq_lens)
             self._build_next_cache(batch_size, seq_ids, vs_id)
             runner._seq_lens = saved
+
+    def _deferred_kv_cleanup_winner(
+        self,
+        runner: Any,
+        pending: dict[str, Any],
+    ) -> None:
+        """Refresh dirty mask KVs at the winning branch's history slots.
+
+        Called after :meth:`_apply_pending_swap` (or the merged variant)
+        installs each winning branch's dedicated block as the seq's main
+        block. Slots ``prefix+1..prefix+K-1`` of that block now hold the
+        mask-derived KVs from last round's ``_run_parallel_fanout``. We
+        feed parallel-fanout's own argmax tokens at those positions
+        through one varlen forward, overwriting the mask K/V projections
+        with real-token K/V projections at the same slots.
+
+        The captured logits replace ``_last_draft_logits[hit, 1:K, :]``
+        so the upcoming ``_select_bonus_candidates`` reads cleaned
+        depth-1+ logits — matching what today's broad cleanup produces,
+        but at H_hit×(K-1) tokens instead of N×(K-1).
+        """
+        if not self._use_parallel_fanout or self.K <= 1:
+            return
+        if self._last_draft_tokens is None or self._last_draft_logits is None:
+            return
+        cache_hits = pending["cache_hits"]
+        hit_prefix_lens = pending["hit_prefix_lens"]  # [H]
+        seq_ids = pending["seq_ids"]                  # [B]
+        H = int(cache_hits.sum().item())
+        if H == 0:
+            return
+        K = self.K
+        D = K - 1
+
+        hit_mask = cache_hits.bool()
+        hit_indices = hit_mask.nonzero(as_tuple=True)[0]
+        hit_seq_ids = seq_ids[hit_mask]
+
+        # Inputs at slots prefix+1..prefix+K-1 — parallel-fanout's argmax
+        # tokens at depths 0..K-2 (== _last_draft_tokens[hit, 0..K-2]).
+        input_ids = (
+            self._last_draft_tokens[hit_indices, :D]
+            .to(torch.int32).reshape(H * D)
+        )
+
+        depth_offsets = torch.arange(
+            1, K, device=self.device, dtype=torch.int64,
+        )  # [1..K-1]
+        positions = (
+            hit_prefix_lens.to(torch.int64).unsqueeze(1)
+            + depth_offsets.unsqueeze(0)
+        ).reshape(H * D)
+        seq_lens = (
+            hit_prefix_lens.to(torch.int32).unsqueeze(1)
+            + 1
+            + depth_offsets.to(torch.int32).unsqueeze(0)
+        ).reshape(H * D)
+
+        # All depths in a hit seq share the seq's main block table —
+        # which is now the just-swapped-in dedicated block.
+        block_tables = (
+            runner._block_table_gpu[hit_seq_ids]
+            .repeat_interleave(D, dim=0)
+        )
+        seq_ids_expanded = hit_seq_ids.repeat_interleave(D)
+        max_context_hint = int(hit_prefix_lens.max().item()) + K
+
+        with torch.profiler.record_function(f"deferred_cleanup_H{H}"):
+            cleanup_logits_flat = runner.tree_decode_step(
+                input_ids=input_ids,
+                positions=positions,
+                seq_lens=seq_lens,
+                seq_ids_expanded=seq_ids_expanded,
+                block_tables=block_tables,
+                max_seq_len_hint=max_context_hint,
+            )
+        # [H*D, V] -> [H, D, V] and splice into _last_draft_logits.
+        cleanup_logits = cleanup_logits_flat.view(H, D, -1)
+        # Clone to avoid mutating cached tensors that other code paths
+        # may still hold references to.
+        self._last_draft_logits = self._last_draft_logits.clone()
+        self._last_draft_logits[hit_indices, 1:K, :] = cleanup_logits
 
     @staticmethod
     async def _await_cache_build_tasks(
@@ -134,6 +230,19 @@ class DraftServerCacheBuildMixin:
         with torch.profiler.record_function(
             f"cache_build_merged_n{len(slice_metas)}"
         ):
+            # Apply any swap deferred from the merged SPECULATE handler.
+            pending_merged = self._pending_swap_merged
+            self._pending_swap_merged = None
+            if pending_merged is not None:
+                with torch.profiler.record_function(
+                    "deferred_swap_merged_"
+                    f"{int(pending_merged['cache_hits'].sum().item())}"
+                ):
+                    self._apply_pending_swap_merged(
+                        runner=runner, **pending_merged,
+                    )
+                self._deferred_kv_cleanup_winner(runner, pending_merged)
+
             saved = dict(runner._seq_lens)
             try:
                 # Reset and recycle per-VS upfront.
@@ -344,7 +453,11 @@ class DraftServerCacheBuildMixin:
                         # head_dim); block dim is 0.
                         layer_kv[dst_flat] = layer_kv[src_flat]
 
-                # ONE merged tree decode (or parallel fanout).
+                # ONE merged tree decode (or parallel fanout). Mask KVs
+                # at depths 1..K-1 are dirty in the dedicated blocks
+                # we just wrote; they get cleaned next round in
+                # ``_deferred_kv_cleanup_winner`` for whichever branch
+                # wins the next-round lookup.
                 if self._use_parallel_fanout:
                     all_tokens, all_logits = self._run_parallel_fanout(
                         runner=runner,
@@ -356,22 +469,6 @@ class DraftServerCacheBuildMixin:
                         branch_block_tables=branch_block_tables,
                         bonus_candidates=bonus_candidates,
                     )
-                    cleanup_logits = self._parallel_fanout_kv_cleanup(
-                        runner=runner,
-                        N=N,
-                        K=K,
-                        seq_ids=seq_ids_cat,
-                        entry_batch_ids=entry_batch_ids,
-                        prefix_lens=prefix_lens,
-                        branch_block_tables=branch_block_tables,
-                        all_tokens=all_tokens,
-                    )
-                    if cleanup_logits is not None:
-                        # Replace contaminated mask-derived logits at
-                        # depths 1+ with cleanup's real-token logits.
-                        # Depth 0 (bonus NTP) was never contaminated.
-                        all_logits = all_logits.clone()
-                        all_logits[:, 1:K, :] = cleanup_logits
                 else:
                     all_tokens, all_logits = self._run_tree_decode(
                         runner=runner,
@@ -708,6 +805,10 @@ class DraftServerCacheBuildMixin:
         branch_block_tables, prefix_lens = alloc
 
         if self._use_parallel_fanout:
+            # Mask KVs at depths 1..K-1 are dirty in the dedicated blocks
+            # we write here; they get cleaned next round in
+            # ``_deferred_kv_cleanup_winner`` for the branch that wins
+            # the next lookup.
             all_tokens, all_logits = self._run_parallel_fanout(
                 runner=runner,
                 N=N,
@@ -718,19 +819,6 @@ class DraftServerCacheBuildMixin:
                 branch_block_tables=branch_block_tables,
                 bonus_candidates=bonus_candidates,
             )
-            cleanup_logits = self._parallel_fanout_kv_cleanup(
-                runner=runner,
-                N=N,
-                K=K,
-                seq_ids=seq_ids,
-                entry_batch_ids=entry_batch_ids,
-                prefix_lens=prefix_lens,
-                branch_block_tables=branch_block_tables,
-                all_tokens=all_tokens,
-            )
-            if cleanup_logits is not None:
-                all_logits = all_logits.clone()
-                all_logits[:, 1:K, :] = cleanup_logits
         else:
             all_tokens, all_logits = self._run_tree_decode(
                 runner=runner,
