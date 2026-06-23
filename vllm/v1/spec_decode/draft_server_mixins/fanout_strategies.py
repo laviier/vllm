@@ -10,7 +10,7 @@ Two methods that produce the K cached draft tokens per branch:
   a mask-token at depths 1..K-1. Requires a drafter trained with the
   parallel prediction (MTP) objective. The mask-derived KVs at depths
   1..K-1 are dirty after this forward; they get cleaned next round in
-  ``_deferred_kv_cleanup_winner`` for the branch whose lookup wins.
+  ``_fused_cleanup_and_glue`` for the branch whose lookup wins.
 """
 
 from __future__ import annotations

@@ -109,6 +109,14 @@ class DraftCudaGraphMixin:
         if K > 1:
             for b_total in (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32):
                 parallel.add(b_total * (K - 1))
+        # Fused cleanup+glue call shape: H × K + (B_total − H), where
+        # H is the hit count this round. Land at exact captured sizes
+        # for the all-hit (H=B → B × K) and all-miss (H=0 → B) extremes
+        # plus typical mixed shapes. Reuses dense+coarse for small
+        # values; adds B × K for B in {1..8, 12, 16, 24, 32}.
+        for b_total in (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32):
+            parallel.add(b_total)              # all-miss
+            parallel.add(b_total * K)          # all-hit
         sizes = sorted(set(dense + coarse) | parallel)
         logger.info("Capturing CUDA graphs for tree_decode_step: N=%s", sizes)
         self._capture_graphs_for_sizes(sizes, self._tree_graphs)

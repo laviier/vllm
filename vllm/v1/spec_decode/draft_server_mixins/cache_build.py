@@ -93,7 +93,11 @@ class DraftServerCacheBuildMixin:
                     f"deferred_swap_{int(pending['cache_hits'].sum().item())}"
                 ):
                     self._apply_pending_swap(runner=runner, **pending)
-                self._deferred_kv_cleanup_winner(runner, pending)
+            # Fused cleanup+glue runs whether or not there are hits — on
+            # cold rounds with all-miss it still produces glue logits for
+            # _select_bonus_candidates (replaces today's runner.glue_decode
+            # call inside _build_next_cache).
+            self._fused_cleanup_and_glue(runner, pending)
 
             # Snapshot _seq_lens around the build: tree decode mutates them
             # for its branch KV layout, and we need the per-seq lens to stay
@@ -102,87 +106,197 @@ class DraftServerCacheBuildMixin:
             self._build_next_cache(batch_size, seq_ids, vs_id)
             runner._seq_lens = saved
 
-    def _deferred_kv_cleanup_winner(
+    def _fused_cleanup_and_glue(
         self,
         runner: Any,
-        pending: dict[str, Any],
+        pending: dict[str, Any] | None,
     ) -> None:
-        """Refresh dirty mask KVs at the winning branch's history slots.
+        """Run cleanup (KV refresh on hit seqs) and glue_decode in one
+        fused varlen forward, before ``_build_next_cache`` runs.
 
-        Called after :meth:`_apply_pending_swap` (or the merged variant)
-        installs each winning branch's dedicated block as the seq's main
-        block. Slots ``prefix+1..prefix+K-1`` of that block now hold the
-        mask-derived KVs from last round's ``_run_parallel_fanout``. We
-        feed parallel-fanout's own argmax tokens at those positions
-        through one varlen forward, overwriting the mask K/V projections
-        with real-token K/V projections at the same slots.
+        Hit seqs contribute K tokens each: K-1 cleanup tokens at slots
+        ``prefix+1..prefix+K-1`` (overwriting parallel_fanout's mask
+        KVs), plus 1 glue token at slot ``prefix+K = _seq_lens[sid]``
+        (the bonus_t's home in seq main).
 
-        The captured logits replace ``_last_draft_logits[hit, 1:K, :]``
-        so the upcoming ``_select_bonus_candidates`` reads cleaned
-        depth-1+ logits — matching what today's broad cleanup produces,
-        but at H_hit×(K-1) tokens instead of N×(K-1).
+        Miss seqs contribute 1 glue token each at slot ``_seq_lens[sid]``
+        (zero-fallback recovery; input is the bonus token).
+
+        Stashes the per-seq glue logits as ``self._pending_glue_logits``
+        for the upcoming ``_select_bonus_candidates``, and splices the
+        per-hit cleanup logits into ``self._last_draft_logits[hit, 1:K]``.
+
+        The fused forward also advances ``_seq_lens[sid] += 1`` for every
+        seq, mirroring the side effect today's separate ``glue_decode``
+        has on the runner.
         """
-        if not self._use_parallel_fanout or self.K <= 1:
+        if (
+            self._last_draft_tokens is None
+            or self._last_draft_logits is None
+            or self._last_bonus_tokens is None
+        ):
+            # Cold start before the first SPECULATE round populates
+            # _last_*. Caller falls back to runner.glue_decode for the
+            # cold path; nothing to fuse here.
             return
-        if self._last_draft_tokens is None or self._last_draft_logits is None:
-            return
-        cache_hits = pending["cache_hits"]
-        hit_prefix_lens = pending["hit_prefix_lens"]  # [H]
-        seq_ids = pending["seq_ids"]                  # [B]
-        H = int(cache_hits.sum().item())
-        if H == 0:
-            return
+        # _last_miss_mask aligns with this round's seqs (stashed by the
+        # SPECULATE handler at the same time as _last_*). The zeros
+        # fallback is unreachable under the early return above (any
+        # round with miss rows also stashed _last_miss_mask), but kept
+        # as defense in depth so a future change that decouples these
+        # stashes doesn't silently send mask=False through to glue
+        # input selection.
+        miss_mask_full = (
+            self._last_miss_mask if self._last_miss_mask is not None
+            else torch.zeros_like(self._last_bonus_tokens, dtype=torch.bool)
+        )
+        bonus_tokens = self._last_bonus_tokens                  # [B]
+        last_draft_last_col = self._last_draft_tokens[:, -1]    # [B]
+        B = bonus_tokens.shape[0]
         K = self.K
         D = K - 1
 
-        hit_mask = cache_hits.bool()
-        hit_indices = hit_mask.nonzero(as_tuple=True)[0]
-        hit_seq_ids = seq_ids[hit_mask]
+        # Per-seq glue position = _seq_lens[sid]. Read in seq_ids order.
+        if pending is not None:
+            seq_ids_full = pending["seq_ids"]                   # [B]
+        else:
+            # No swap pending (cold start / all-miss round): the SPECULATE
+            # handler stashed _last_spec_seq_ids at the same time as the
+            # other _last_* fields.
+            seq_ids_full = self._last_spec_seq_ids
+            if seq_ids_full is None:
+                return
+        if seq_ids_full.shape[0] != B:
+            return
 
-        # Inputs at slots prefix+1..prefix+K-1 — parallel-fanout's argmax
-        # tokens at depths 0..K-2 (== _last_draft_tokens[hit, 0..K-2]).
-        input_ids = (
-            self._last_draft_tokens[hit_indices, :D]
-            .to(torch.int32).reshape(H * D)
+        seq_ids_list = seq_ids_full.tolist()
+        glue_positions_cpu = [
+            int(runner._seq_lens.get(int(sid), 0)) for sid in seq_ids_list
+        ]
+        glue_positions = torch.tensor(
+            glue_positions_cpu, dtype=torch.int64, device=self.device,
         )
+        # Per-seq glue input: bonus for miss rows (zero-fallback), last
+        # cached draft for hit rows.
+        glue_input = torch.where(
+            miss_mask_full, bonus_tokens, last_draft_last_col,
+        ).to(torch.int32)
 
-        depth_offsets = torch.arange(
-            1, K, device=self.device, dtype=torch.int64,
-        )  # [1..K-1]
-        positions = (
-            hit_prefix_lens.to(torch.int64).unsqueeze(1)
-            + depth_offsets.unsqueeze(0)
-        ).reshape(H * D)
-        seq_lens = (
-            hit_prefix_lens.to(torch.int32).unsqueeze(1)
-            + 1
-            + depth_offsets.to(torch.int32).unsqueeze(0)
-        ).reshape(H * D)
-
-        # All depths in a hit seq share the seq's main block table —
-        # which is now the just-swapped-in dedicated block.
-        block_tables = (
-            runner._block_table_gpu[hit_seq_ids]
-            .repeat_interleave(D, dim=0)
+        # Hit-side cleanup payload (only meaningful when parallel fanout
+        # is active and last round's branches actually got installed).
+        do_cleanup = (
+            self._use_parallel_fanout
+            and K > 1
+            and pending is not None
         )
-        seq_ids_expanded = hit_seq_ids.repeat_interleave(D)
-        max_context_hint = int(hit_prefix_lens.max().item()) + K
+        if do_cleanup:
+            cache_hits = pending["cache_hits"]
+            hit_prefix_lens = pending["hit_prefix_lens"]            # [H]
+            hit_mask = cache_hits.bool()
+            H = int(cache_hits.sum().item())
+        else:
+            hit_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
+            hit_prefix_lens = None
+            H = 0
 
-        with torch.profiler.record_function(f"deferred_cleanup_H{H}"):
-            cleanup_logits_flat = runner.tree_decode_step(
+        # ---- Build fused varlen input ----
+        # Layout per seq, in seq_ids_full order:
+        #   hit seq i (if do_cleanup):
+        #     positions[seq_i] = [prefix_i+1, prefix_i+2, ..., prefix_i+K-1, glue_pos_i]
+        #     inputs   [seq_i] = [_last_draft_tokens[i,0..K-2], glue_input[i]]
+        #     count = K
+        #   miss/non-hit seq i:
+        #     positions[seq_i] = [glue_pos_i]
+        #     inputs   [seq_i] = [glue_input[i]]
+        #     count = 1
+        # We build flat tensors of total length (H * K + (B - H) * 1).
+        if H > 0:
+            hit_indices = hit_mask.nonzero(as_tuple=True)[0]   # [H]
+            assert hit_prefix_lens is not None  # for type checker
+            depth_offsets = torch.arange(
+                1, K, device=self.device, dtype=torch.int64,
+            )                                                   # [K-1]
+            cleanup_positions = (
+                hit_prefix_lens.to(torch.int64).unsqueeze(1)
+                + depth_offsets.unsqueeze(0)
+            )                                                   # [H, K-1]
+            cleanup_inputs = self._last_draft_tokens[hit_indices, :D]
+            cleanup_inputs = cleanup_inputs.to(torch.int32)     # [H, K-1]
+            hit_glue_pos = glue_positions[hit_indices].unsqueeze(1)  # [H,1]
+            hit_glue_inp = glue_input[hit_indices].unsqueeze(1)      # [H,1]
+            # Per-hit-seq segment: [cleanup..., glue]
+            hit_positions = torch.cat(
+                [cleanup_positions, hit_glue_pos], dim=1,
+            ).reshape(-1)                                       # [H*K]
+            hit_inputs = torch.cat(
+                [cleanup_inputs, hit_glue_inp], dim=1,
+            ).reshape(-1)                                       # [H*K]
+        else:
+            hit_indices = torch.empty(0, dtype=torch.int64, device=self.device)
+            hit_positions = torch.empty(0, dtype=torch.int64, device=self.device)
+            hit_inputs = torch.empty(0, dtype=torch.int32, device=self.device)
+
+        # Non-hit (miss + first-round-no-swap) seqs: 1 glue token each.
+        nonhit_mask = ~hit_mask
+        nonhit_indices = nonhit_mask.nonzero(as_tuple=True)[0]
+        nonhit_positions = glue_positions[nonhit_indices]
+        nonhit_inputs = glue_input[nonhit_indices]
+        nB = int(nonhit_indices.shape[0])
+
+        # Concatenate: hits first, then non-hits.
+        positions = torch.cat([hit_positions, nonhit_positions], dim=0)
+        input_ids = torch.cat([hit_inputs, nonhit_inputs], dim=0)
+        N_fused = positions.shape[0]
+        if N_fused == 0:
+            return
+
+        # seq_lens (causal): position + 1.
+        seq_lens = (positions + 1).to(torch.int32)
+
+        # Per-token block_tables: each token attends over its seq's main
+        # block table (post-swap for hits, unchanged for non-hits).
+        per_token_seq_ids = torch.cat([
+            seq_ids_full[hit_indices].repeat_interleave(K),
+            seq_ids_full[nonhit_indices],
+        ], dim=0)
+        block_tables = runner._block_table_gpu[per_token_seq_ids]
+
+        max_context_hint = int(positions.max().item()) + 1
+
+        with torch.profiler.record_function(
+            f"fused_cleanup_glue_H{H}_M{nB}"
+        ):
+            logits_flat = runner.tree_decode_step(
                 input_ids=input_ids,
                 positions=positions,
                 seq_lens=seq_lens,
-                seq_ids_expanded=seq_ids_expanded,
+                seq_ids_expanded=per_token_seq_ids,
                 block_tables=block_tables,
                 max_seq_len_hint=max_context_hint,
             )
-        # [H*D, V] -> [H, D, V] and splice into _last_draft_logits.
-        cleanup_logits = cleanup_logits_flat.view(H, D, -1)
-        # Clone to avoid mutating cached tensors that other code paths
-        # may still hold references to.
-        self._last_draft_logits = self._last_draft_logits.clone()
-        self._last_draft_logits[hit_indices, 1:K, :] = cleanup_logits
+
+        # ---- Split outputs ----
+        # First H*K rows: per-hit segments [cleanup_0..K-2, glue].
+        # Next nB rows: per-non-hit glue.
+        glue_logits = torch.zeros(
+            B, self.vocab_size, dtype=self.dtype, device=self.device,
+        )
+        if H > 0:
+            hit_logits = logits_flat[: H * K].view(H, K, -1)
+            cleanup_logits = hit_logits[:, :D, :]               # [H, K-1, V]
+            hit_glue_logits = hit_logits[:, D, :]               # [H, V]
+            self._last_draft_logits = self._last_draft_logits.clone()
+            self._last_draft_logits[hit_indices, 1:K, :] = cleanup_logits
+            glue_logits[hit_indices] = hit_glue_logits
+        if nB > 0:
+            nonhit_glue_logits = logits_flat[H * K :]            # [nB, V]
+            glue_logits[nonhit_indices] = nonhit_glue_logits
+
+        self._pending_glue_logits = glue_logits
+
+        # Mirror glue_decode's _seq_lens advance (one per seq).
+        for sid, pos in zip(seq_ids_list, glue_positions_cpu):
+            runner._seq_lens[int(sid)] = pos + 1
 
     @staticmethod
     async def _await_cache_build_tasks(
@@ -230,18 +344,13 @@ class DraftServerCacheBuildMixin:
         with torch.profiler.record_function(
             f"cache_build_merged_n{len(slice_metas)}"
         ):
-            # Apply any swap deferred from the merged SPECULATE handler.
+            # Merged path runs swap_block_tables synchronously in the
+            # SPECULATE handler (deferring it regressed multi-VS TPOT
+            # by 1-3 %). The fused cleanup+glue forward then refreshes
+            # mask KVs and produces glue logits in one varlen forward.
             pending_merged = self._pending_swap_merged
             self._pending_swap_merged = None
-            if pending_merged is not None:
-                with torch.profiler.record_function(
-                    "deferred_swap_merged_"
-                    f"{int(pending_merged['cache_hits'].sum().item())}"
-                ):
-                    self._apply_pending_swap_merged(
-                        runner=runner, **pending_merged,
-                    )
-                self._deferred_kv_cleanup_winner(runner, pending_merged)
+            self._fused_cleanup_and_glue(runner, pending_merged)
 
             saved = dict(runner._seq_lens)
             try:
@@ -287,20 +396,25 @@ class DraftServerCacheBuildMixin:
                     merged_miss_mask = torch.cat(
                         [sm["miss_mask"] for sm in slice_metas], dim=0,
                     )
-                if (
-                    merged_miss_mask is not None
-                    and bool(merged_miss_mask.any().item())
-                ):
-                    glue_input = draft_tokens_cat[:, -1].clone()
-                    glue_input[merged_miss_mask] = bonus_cat[
-                        merged_miss_mask
-                    ]
+                if self._pending_glue_logits is not None:
+                    glue_logits = self._pending_glue_logits
+                    self._pending_glue_logits = None
                 else:
-                    glue_input = draft_tokens_cat[:, -1]
-                # ONE merged glue_decode (advances _seq_lens by 1 per seq).
-                glue_logits = runner.glue_decode(
-                    tokens=glue_input, seq_ids=seq_ids_cat,
-                )
+                    if (
+                        merged_miss_mask is not None
+                        and bool(merged_miss_mask.any().item())
+                    ):
+                        glue_input = draft_tokens_cat[:, -1].clone()
+                        glue_input[merged_miss_mask] = bonus_cat[
+                            merged_miss_mask
+                        ]
+                    else:
+                        glue_input = draft_tokens_cat[:, -1]
+                    # Advances _seq_lens by 1 per seq (mirrored by the
+                    # fused-prologue path).
+                    glue_logits = runner.glue_decode(
+                        tokens=glue_input, seq_ids=seq_ids_cat,
+                    )
 
                 # Zero-fallback miss rows: replace k=0 logits with
                 # glue_logits so bonus candidates are real (see
@@ -456,7 +570,7 @@ class DraftServerCacheBuildMixin:
                 # ONE merged tree decode (or parallel fanout). Mask KVs
                 # at depths 1..K-1 are dirty in the dedicated blocks
                 # we just wrote; they get cleaned next round in
-                # ``_deferred_kv_cleanup_winner`` for whichever branch
+                # ``_fused_cleanup_and_glue`` for whichever branch
                 # wins the next-round lookup.
                 if self._use_parallel_fanout:
                     all_tokens, all_logits = self._run_parallel_fanout(
@@ -749,16 +863,22 @@ class DraftServerCacheBuildMixin:
 
         # Glue decode gives us the K+1th position's logits, and
         # advances _seq_lens by one — we undo that at the end.
-        # Per-row glue input: draft_tokens[:,-1] for hit rows (came
-        # from the cache), bonus token for miss rows (got zeros).
-        if miss_mask is not None and bool(miss_mask.any().item()):
-            glue_input = draft_tokens[:, -1].clone()
-            glue_input[miss_mask] = rec_tokens[miss_mask]
+        # Glue logits and the +1 _seq_lens advance were already produced
+        # by ``_fused_cleanup_and_glue`` in the cache_build prologue.
+        # Fall back to a fresh glue_decode if the prologue didn't run
+        # (e.g. cold start before any cache hits exist).
+        if self._pending_glue_logits is not None:
+            glue_logits = self._pending_glue_logits
+            self._pending_glue_logits = None
         else:
-            glue_input = draft_tokens[:, -1]
-        glue_logits = runner.glue_decode(
-            tokens=glue_input, seq_ids=seq_ids
-        )
+            if miss_mask is not None and bool(miss_mask.any().item()):
+                glue_input = draft_tokens[:, -1].clone()
+                glue_input[miss_mask] = rec_tokens[miss_mask]
+            else:
+                glue_input = draft_tokens[:, -1]
+            glue_logits = runner.glue_decode(
+                tokens=glue_input, seq_ids=seq_ids
+            )
 
         # Zero-fallback miss rows: draft_logits is all zeros (no JIT
         # ran). _select_bonus_candidates would compute top-F over zeros
@@ -807,7 +927,7 @@ class DraftServerCacheBuildMixin:
         if self._use_parallel_fanout:
             # Mask KVs at depths 1..K-1 are dirty in the dedicated blocks
             # we write here; they get cleaned next round in
-            # ``_deferred_kv_cleanup_winner`` for the branch that wins
+            # ``_fused_cleanup_and_glue`` for the branch that wins
             # the next lookup.
             all_tokens, all_logits = self._run_parallel_fanout(
                 runner=runner,

@@ -222,6 +222,17 @@ class DraftServer(
         self._pending_swap: dict[str, Any] | None = None
         self._pending_swap_merged: dict[str, Any] | None = None
 
+        # Glue logits computed by the fused cleanup+glue forward in
+        # cache_build's prologue, consumed by ``_build_next_cache`` /
+        # ``_run_cache_build_merged`` in place of running ``glue_decode``
+        # again. Shape [B_total, V] aligned with this round's seq_ids.
+        # Single-VS and merged-VS paths are mutually exclusive per
+        # round (one of ``_handle_speculation`` /
+        # ``_handle_speculation_merged`` runs, never both), so the
+        # producer/consumer pair is always a single round of the same
+        # path.
+        self._pending_glue_logits: torch.Tensor | None = None
+
         # Last speculation seq_ids — stored by _handle_speculation_inner,
         # consumed by _handle_speculation for post-response cache building.
         self._last_spec_seq_ids: torch.Tensor | None = None

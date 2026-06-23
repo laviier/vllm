@@ -532,12 +532,20 @@ class DraftServerSpeculateMixin:
             dtype=self.dtype, device=self.device,
         )
 
-        # ---- Copy cache hits into response (swap deferred) ----
+        # ---- Apply cache hits (swap inline on merged path) ----
+        # Multi-VS deployments showed a small TPOT/ITL regression when
+        # the swap was deferred to cache_build's prologue (2V/3V at c=8
+        # tracked +1-3 % at 1B sequential), because the cross-VS merge
+        # peek window leaves less slack for the next round to absorb
+        # cache_build prologue work. Keep swap synchronous on the merged
+        # path; the single-VS path still defers via _pending_swap.
+        # Hit metadata is still stashed in _pending_swap_merged for the
+        # parallel-fanout KV cleanup step at the top of cache_build.
         used_swap_for_hits = False
         self._pending_swap_merged = None
         if num_hits > 0 and cached_logits is not None:
             with torch.profiler.record_function(
-                f"copy_hits_merged_{num_hits}"
+                f"swap_hits_merged_{num_hits}"
             ):
                 hit_tables, hit_prefix_lens = (
                     self.cache.get_hit_block_tables(cache_hits)
@@ -548,6 +556,15 @@ class DraftServerSpeculateMixin:
                     sid_to_vs: dict[int, str] = {}
                     for i, sid in enumerate(seq_ids_list):
                         sid_to_vs[sid] = per_vs[entry_vs[i]]["vs_id"]
+                    self._apply_pending_swap_merged(
+                        runner=runner,
+                        seq_ids=seq_ids_cat,
+                        seq_ids_list=seq_ids_list,
+                        cache_hits=cache_hits,
+                        hit_tables=hit_tables,
+                        hit_prefix_lens=hit_prefix_lens,
+                        sid_to_vs=sid_to_vs,
+                    )
                     self._pending_swap_merged = {
                         "seq_ids": seq_ids_cat,
                         "seq_ids_list": seq_ids_list,
