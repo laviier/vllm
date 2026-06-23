@@ -89,9 +89,10 @@ class DraftServerCacheBuildMixin:
             pending = self._pending_swap
             self._pending_swap = None
             if pending is not None:
-                with torch.profiler.record_function(
-                    f"deferred_swap_{int(pending['cache_hits'].sum().item())}"
-                ):
+                # Annotation label drops the hit count (would force a
+                # CPU↔GPU sync just to format the string); inspect the
+                # tensor in the trace if you need the per-round count.
+                with torch.profiler.record_function("deferred_swap"):
                     self._apply_pending_swap(runner=runner, **pending)
             # Fused cleanup+glue runs whether or not there are hits — on
             # cold rounds with all-miss it still produces glue logits for
@@ -418,11 +419,11 @@ class DraftServerCacheBuildMixin:
 
                 # Zero-fallback miss rows: replace k=0 logits with
                 # glue_logits so bonus candidates are real (see
-                # _build_standalone_cache for full reasoning).
-                if (
-                    merged_miss_mask is not None
-                    and bool(merged_miss_mask.any().item())
-                ):
+                # _build_standalone_cache for full reasoning). Run
+                # unconditionally — masked assignment is a no-op when
+                # the mask is all-False; gating with .any().item() was
+                # a CPU↔GPU sync per round.
+                if merged_miss_mask is not None:
                     draft_logits_cat = draft_logits_cat.clone()
                     draft_logits_cat[merged_miss_mask, 0] = (
                         glue_logits[merged_miss_mask]
@@ -504,12 +505,13 @@ class DraftServerCacheBuildMixin:
                 # as _allocate_branch_blocks_and_copy_kv but using
                 # already-allocated dedicated_blocks).
                 M = runner.max_num_blocks
+                # seq_ids_list was already materialized above (line ~376).
+                # Use it directly instead of per-element seq_ids_cat[b].item(),
+                # which adds B_total CPU↔GPU syncs.
                 base_lens_t = torch.tensor(
                     [
-                        self._round_base_lens.get(
-                            int(seq_ids_cat[b].item()), 0,
-                        )
-                        for b in range(B_total)
+                        self._round_base_lens.get(sid, 0)
+                        for sid in seq_ids_list
                     ],
                     dtype=torch.int64,
                     device=self.device,
@@ -780,10 +782,13 @@ class DraftServerCacheBuildMixin:
         runner.reserve_dedicated_blocks(dedicated_blocks, vs_id)
 
         B = seq_ids.shape[0]
+        # Materialize seq_ids once instead of per-element .item() calls
+        # (each would be a CPU↔GPU sync).
+        seq_ids_list = seq_ids.tolist()
         base_lens_t = torch.tensor(
             [
-                self._round_base_lens.get(int(seq_ids[b].item()), 0)
-                for b in range(B)
+                self._round_base_lens.get(sid, 0)
+                for sid in seq_ids_list
             ],
             dtype=torch.int64,
             device=self.device,
@@ -887,7 +892,10 @@ class DraftServerCacheBuildMixin:
         # k=0 branch's bonus candidates align with what the verifier
         # will sample next round. Higher-k entries are unreachable
         # (verifier accepted 0 of zeros) so we leave them as zeros.
-        if miss_mask is not None and bool(miss_mask.any().item()):
+        # Run unconditionally — the masked assignment is a no-op when
+        # miss_mask is all-False, and the prior gating .any().item()
+        # was a CPU↔GPU sync per round.
+        if miss_mask is not None:
             draft_logits = draft_logits.clone()
             draft_logits[miss_mask, 0] = glue_logits[miss_mask]
 
