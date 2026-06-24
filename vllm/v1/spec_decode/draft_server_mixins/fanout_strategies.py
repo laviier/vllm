@@ -118,16 +118,16 @@ class DraftServerFanoutMixin:
         input_ids[depth0_indices] = bonus_candidates.to(torch.int32)
 
         # --- Build positions: [N*K] ---
-        # Branch j, depth d → prefix_lens[j] + d
-        # Each branch starts at its prefix_len (which already includes
-        # the verified prefix + accepted spec tokens up to k_j)
-        positions = torch.zeros(
-            total_tokens, dtype=torch.int64, device=self.device
-        )
+        # Branch j, depth d → prefix_lens[j] + d. Vectorized via
+        # broadcast: prefix_lens[N,1] + depth_offsets[1,K] → [N,K]
+        # → reshape to [N*K]. Replaces a Python loop over N (~430 at
+        # 3V c=8) that issued ~3 dispatches per iteration (select +
+        # add + copy_ slice).
         depth_offsets = torch.arange(K, device=self.device, dtype=torch.int64)
-        for branch_idx in range(N):
-            start = branch_idx * K
-            positions[start:start + K] = prefix_lens[branch_idx] + depth_offsets
+        positions = (
+            prefix_lens.to(torch.int64).unsqueeze(1)
+            + depth_offsets.unsqueeze(0)
+        ).reshape(total_tokens)
 
         # --- Build seq_lens: [N*K] ---
         # Causal MTP: depth-d in a branch attends to the prefix PLUS the
@@ -142,14 +142,11 @@ class DraftServerFanoutMixin:
         # which hid earlier depths from later ones. With a causal-trained
         # model that produced a per-position acceptance cliff (P0 70% →
         # P2 22% → P3 17%) because depths 2+ were running blind.
-        seq_lens = torch.zeros(
-            total_tokens, dtype=torch.int32, device=self.device
-        )
-        for branch_idx in range(N):
-            start = branch_idx * K
-            seq_lens[start:start + K] = (
-                prefix_lens[branch_idx] + 1 + depth_offsets
-            ).to(torch.int32)
+        seq_lens = (
+            prefix_lens.to(torch.int32).unsqueeze(1)
+            + 1
+            + depth_offsets.to(torch.int32).unsqueeze(0)
+        ).reshape(total_tokens)
 
         # --- Build block_tables: [N*K, max_blocks] ---
         # All depths in a branch share the same block table (they all

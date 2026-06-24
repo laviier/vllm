@@ -719,22 +719,38 @@ class DraftServerCacheBuildMixin:
         _, topk_indices = torch.topk(masked_logits, max_fan_out, dim=-1)
 
         branches_per_seq = sum(fan_out_list)
-        per_seq_k: list[torch.Tensor] = []
-        per_seq_cand_slots: list[torch.Tensor] = []
-        for k, F_k in enumerate(fan_out_list):
-            if F_k <= 0:
-                continue
-            per_seq_k.append(torch.full(
-                (F_k,), k, dtype=torch.int64, device=self.device
-            ))
-            per_seq_cand_slots.append(torch.arange(
-                F_k, dtype=torch.int64, device=self.device,
-            ))
-        empty = torch.zeros(0, dtype=torch.int64, device=self.device)
-        per_seq_k_flat = torch.cat(per_seq_k) if per_seq_k else empty
-        per_seq_cand_flat = (
-            torch.cat(per_seq_cand_slots) if per_seq_cand_slots else empty
-        )
+        # Fast path: ``fan_out_list`` matches the OutcomePredictor's
+        # configured value (the common case — shrinkage only fires
+        # when ``B * sum(fan_out) > MAX_BRANCHES``, which we never
+        # reach at the supported concurrencies). Reuse the flat
+        # indexing tensors precomputed at init instead of rebuilding
+        # them every round.
+        if (
+            self.outcome_predictor is not None
+            and fan_out_list == self.outcome_predictor.fan_out_list
+        ):
+            per_seq_k_flat = self.outcome_predictor.per_seq_k_flat
+            per_seq_cand_flat = self.outcome_predictor.per_seq_cand_flat
+        else:
+            per_seq_k_chunks: list[torch.Tensor] = []
+            per_seq_cand_chunks: list[torch.Tensor] = []
+            for k, F_k in enumerate(fan_out_list):
+                if F_k <= 0:
+                    continue
+                per_seq_k_chunks.append(torch.full(
+                    (F_k,), k, dtype=torch.int64, device=self.device
+                ))
+                per_seq_cand_chunks.append(torch.arange(
+                    F_k, dtype=torch.int64, device=self.device,
+                ))
+            empty = torch.zeros(0, dtype=torch.int64, device=self.device)
+            per_seq_k_flat = (
+                torch.cat(per_seq_k_chunks) if per_seq_k_chunks else empty
+            )
+            per_seq_cand_flat = (
+                torch.cat(per_seq_cand_chunks) if per_seq_cand_chunks
+                else empty
+            )
 
         k_positions = per_seq_k_flat.unsqueeze(0).expand(
             B, branches_per_seq

@@ -172,6 +172,33 @@ class OutcomePredictor:
         )
         self.max_fan_out = max(self.fan_out_list)
 
+        # Precomputed flat indexing tensors used by
+        # ``_select_bonus_candidates`` every round. They depend only on
+        # ``fan_out_list`` (fixed at init), so building them once at
+        # startup eliminates ~14 small kernel launches per round.
+        # Layout: for fan_out_list = [F_0, F_1, ..., F_K], the flats
+        # are the concatenation of (k repeated F_k times) and
+        # (arange(F_k)) for each k where F_k > 0.
+        per_seq_k_chunks: list[torch.Tensor] = []
+        per_seq_cand_chunks: list[torch.Tensor] = []
+        for k, F_k in enumerate(self.fan_out_list):
+            if F_k <= 0:
+                continue
+            per_seq_k_chunks.append(torch.full(
+                (F_k,), k, dtype=torch.int64, device=device,
+            ))
+            per_seq_cand_chunks.append(torch.arange(
+                F_k, dtype=torch.int64, device=device,
+            ))
+        empty = torch.zeros(0, dtype=torch.int64, device=device)
+        self.per_seq_k_flat = (
+            torch.cat(per_seq_k_chunks) if per_seq_k_chunks else empty
+        )
+        self.per_seq_cand_flat = (
+            torch.cat(per_seq_cand_chunks) if per_seq_cand_chunks else empty
+        )
+        self.branches_per_seq = sum(self.fan_out_list)
+
         logger.info(
             "Disagg draft OutcomePredictor: K=%d, total_budget=%d, fan_out=%s",
             self.K,
