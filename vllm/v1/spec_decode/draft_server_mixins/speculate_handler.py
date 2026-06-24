@@ -210,11 +210,12 @@ class DraftServerSpeculateMixin:
             runner.exclude_from_dedicated(blocks, verify_server_id)
         if displaced:
             runner._free_list.extend(displaced)
-        hit_indices = hit_mask.nonzero(as_tuple=True)[0]
-        for compact_i, idx in enumerate(hit_indices):
-            sid = seq_ids_list[int(idx.item())]
-            prefix_len = int(hit_prefix_lens[compact_i].item())
-            runner._seq_lens[sid] = prefix_len + self.K
+        # Materialize once to avoid 2*H per-element CPU↔GPU syncs.
+        hit_indices_list = hit_mask.nonzero(as_tuple=True)[0].tolist()
+        hit_prefix_lens_list = hit_prefix_lens.tolist()
+        for compact_i, batch_i in enumerate(hit_indices_list):
+            sid = seq_ids_list[batch_i]
+            runner._seq_lens[sid] = hit_prefix_lens_list[compact_i] + self.K
 
     def _apply_pending_swap_merged(
         self,
@@ -244,11 +245,12 @@ class DraftServerSpeculateMixin:
             )
         if displaced:
             runner._free_list.extend(displaced)
-        hit_indices = hit_mask.nonzero(as_tuple=True)[0]
-        for compact_i, idx in enumerate(hit_indices):
-            sid = seq_ids_list[int(idx.item())]
-            prefix_len = int(hit_prefix_lens[compact_i].item())
-            runner._seq_lens[sid] = prefix_len + self.K
+        # Materialize once to avoid 2*H per-element CPU↔GPU syncs.
+        hit_indices_list = hit_mask.nonzero(as_tuple=True)[0].tolist()
+        hit_prefix_lens_list = hit_prefix_lens.tolist()
+        for compact_i, batch_i in enumerate(hit_indices_list):
+            sid = seq_ids_list[batch_i]
+            runner._seq_lens[sid] = hit_prefix_lens_list[compact_i] + self.K
 
     def _fill_misses_with_zeros(
         self,
