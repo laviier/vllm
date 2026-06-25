@@ -660,32 +660,3 @@ class DraftServerSpeculateMixin:
             self._run_cache_build_merged(slice_metas)
         )
 
-
-    # ------------------------------------------------------------------
-    # Zero-fallback (cache miss path)
-    # ------------------------------------------------------------------
-
-    def _zero_drafts_for_misses(
-        self,
-        bonus_tokens: torch.Tensor,
-        B_miss: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return zero drafts (with bonus at position 0) for cache-miss
-        rows — SSD §4.3 fast backup. Saves the K-step drafter forward
-        on the speculate critical path; cache_build runs glue_decode
-        on the bonus token to seed cache entries for the next round.
-        Caller marks ``self._last_miss_mask`` so cache_build knows
-        which rows need bonus-token glue_decode (instead of drafted-
-        token glue_decode).
-        """
-        with torch.profiler.record_function(f"miss_zero_B{B_miss}"):
-            tokens = torch.zeros(
-                B_miss, self.K, dtype=torch.int64, device=self.device,
-            )
-            tokens[:, 0] = bonus_tokens
-            logits = torch.zeros(
-                B_miss, self.K, self.vocab_size,
-                dtype=self.dtype, device=self.device,
-            )
-        return tokens, logits
-
