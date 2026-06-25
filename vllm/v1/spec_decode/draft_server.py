@@ -106,9 +106,16 @@ class DraftServerMetrics:
             ),
         )
 
-        # Internal accumulators for rolling cache hit rate.
+        # Internal accumulators for rolling cache hit rate. Hits live
+        # on the GPU as a 0-d tensor so SPECULATE can ``+= sum()`` the
+        # cache_hits mask without a sync; we materialize the running
+        # total only when the gauge is refreshed (every
+        # ``_hit_rate_sync_period`` rounds).
         self._total_lookups: int = 0
         self._total_hits: int = 0
+        self._pending_hits_gpu: torch.Tensor | None = None
+        self._hit_rate_sync_round: int = 0
+        self._hit_rate_sync_period: int = 64
 
         # Cross-VS SPECULATE merge counters (Option A).
         self.draft_speculate_total = prometheus_client.Counter(

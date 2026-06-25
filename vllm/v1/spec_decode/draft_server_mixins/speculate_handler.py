@@ -155,6 +155,31 @@ class DraftServerSpeculateMixin:
         for sid in seq_ids_list:
             self._round_base_lens[sid] = runner._seq_lens.get(sid, 0)
 
+    def _accumulate_hit_metrics(
+        self, cache_hits: torch.Tensor, batch: int
+    ) -> None:
+        """Update the rolling cache-hit-rate gauge without a per-round
+        sync. Accumulates ``cache_hits.sum()`` lazily into a 0-d GPU
+        tensor and only ``.item()``-s it once every
+        ``_hit_rate_sync_period`` rounds.
+        """
+        m = self.metrics
+        m._total_lookups += batch
+        pending = m._pending_hits_gpu
+        if pending is None:
+            m._pending_hits_gpu = cache_hits.sum()
+        else:
+            m._pending_hits_gpu = pending + cache_hits.sum()
+        m._hit_rate_sync_round += 1
+        if m._hit_rate_sync_round >= m._hit_rate_sync_period:
+            m._total_hits += int(m._pending_hits_gpu.item())
+            m._pending_hits_gpu = None
+            m._hit_rate_sync_round = 0
+            if m._total_lookups > 0:
+                m.draft_cache_hit_rate.set(
+                    m._total_hits / m._total_lookups
+                )
+
     def _response_for_hits(
         self,
         cache_hits: torch.Tensor,
@@ -256,21 +281,21 @@ class DraftServerSpeculateMixin:
         self,
         bonus_tokens: torch.Tensor,
         miss_mask: torch.Tensor,
-        B_miss: int,
         draft_tokens: torch.Tensor,
         draft_logits: torch.Tensor,
     ) -> None:
-        """Write zero drafts (with bonus at position 0) into the miss
-        subset of ``draft_tokens`` / ``draft_logits``. SSD §4.3 fast
-        backup: keep the speculate path off the K-step drafter forward.
-        Cache_build seeds real cache entries via ``glue_decode(bonus)``.
+        """Write the bonus token into position 0 of every miss row. The
+        rest of ``draft_tokens`` / ``draft_logits`` is already zero from
+        the caller's ``torch.zeros`` allocation, so we only need to
+        overwrite the seed slot. SSD §4.3 fast backup: keep the
+        speculate path off the K-step drafter forward. Cache_build
+        seeds real cache entries via ``glue_decode(bonus)``.
+
+        Safe to call when ``miss_mask`` is all-False (the masked write
+        becomes a no-op) — the caller doesn't need to gate this on a
+        host-side ``B_miss`` count.
         """
-        miss_bonus = bonus_tokens[miss_mask]
-        zero_tokens, zero_logits = self._zero_drafts_for_misses(
-            miss_bonus, B_miss=B_miss,
-        )
-        draft_tokens[miss_mask] = zero_tokens
-        draft_logits[miss_mask] = zero_logits
+        draft_tokens[miss_mask, 0] = bonus_tokens[miss_mask]
 
     async def _handle_speculation_inner(
         self,
@@ -309,16 +334,10 @@ class DraftServerSpeculateMixin:
                 )
             )
 
-        num_hits = int(cache_hits.sum().item())
         hit_mask = cache_hits.bool()
         miss_mask = ~hit_mask
 
-        self.metrics._total_lookups += B
-        self.metrics._total_hits += num_hits
-        if self.metrics._total_lookups > 0:
-            self.metrics.draft_cache_hit_rate.set(
-                self.metrics._total_hits / self.metrics._total_lookups
-            )
+        self._accumulate_hit_metrics(cache_hits, B)
 
         draft_tokens = torch.zeros(
             B, self.K, dtype=torch.int64, device=self.device,
@@ -334,10 +353,14 @@ class DraftServerSpeculateMixin:
         # here, so the synchronous SPECULATE path returns ~2 ms sooner.
         # Cache_build awaits the verifier's target forward anyway, so
         # the deferred swap hides behind that overlap.
+        #
+        # The body is safe under zero hits: ``_response_for_hits``
+        # returns ``None`` when ``get_hit_block_tables`` finds no
+        # matches, so we skip the host-side ``num_hits`` sync entirely.
         used_swap_for_hits = False
         pending_swap: dict[str, Any] | None = None
-        if num_hits > 0 and cached_logits is not None and runner is not None:
-            with torch.profiler.record_function(f"copy_hits_{num_hits}"):
+        if cached_logits is not None and runner is not None:
+            with torch.profiler.record_function("copy_hits"):
                 hit_payload = self._response_for_hits(
                     cache_hits=cache_hits,
                     cached_tokens=cached_tokens,
@@ -359,16 +382,16 @@ class DraftServerSpeculateMixin:
         self._pending_swap = pending_swap
 
         # ---- Step 5: zero-fill on misses ----
-        B_miss = int(miss_mask.sum().item())
-        if B_miss > 0:
-            with torch.profiler.record_function(f"miss_fill_B{B_miss}"):
-                self._fill_misses_with_zeros(
-                    bonus_tokens=bonus_tokens,
-                    miss_mask=miss_mask,
-                    B_miss=B_miss,
-                    draft_tokens=draft_tokens,
-                    draft_logits=draft_logits,
-                )
+        # Unconditional: the masked assign is a no-op when miss_mask
+        # is all-False, so we avoid the .sum().item() sync that used
+        # to gate this path.
+        with torch.profiler.record_function("miss_fill"):
+            self._fill_misses_with_zeros(
+                bonus_tokens=bonus_tokens,
+                miss_mask=miss_mask,
+                draft_tokens=draft_tokens,
+                draft_logits=draft_logits,
+            )
 
         if not used_swap_for_hits:
             for sid in seq_ids_list:
@@ -516,15 +539,9 @@ class DraftServerSpeculateMixin:
                     bonus_tokens=bonus_cat,
                 )
             )
-        num_hits = int(cache_hits.sum().item())
         hit_mask = cache_hits.bool()
         miss_mask = ~hit_mask
-        self.metrics._total_lookups += B_total
-        self.metrics._total_hits += num_hits
-        if self.metrics._total_lookups > 0:
-            self.metrics.draft_cache_hit_rate.set(
-                self.metrics._total_hits / self.metrics._total_lookups
-            )
+        self._accumulate_hit_metrics(cache_hits, B_total)
 
         draft_tokens = torch.zeros(
             B_total, self.K, dtype=torch.int64, device=self.device,
@@ -543,12 +560,14 @@ class DraftServerSpeculateMixin:
         # path; the single-VS path still defers via _pending_swap.
         # Hit metadata is still stashed in _pending_swap_merged for the
         # parallel-fanout KV cleanup step at the top of cache_build.
+        #
+        # No host-side hit count is needed: ``get_hit_block_tables``
+        # returns ``(None, None)`` on zero hits and the inner guard
+        # below skips everything cleanly.
         used_swap_for_hits = False
         self._pending_swap_merged = None
-        if num_hits > 0 and cached_logits is not None:
-            with torch.profiler.record_function(
-                f"swap_hits_merged_{num_hits}"
-            ):
+        if cached_logits is not None:
+            with torch.profiler.record_function("swap_hits_merged"):
                 hit_tables, hit_prefix_lens = (
                     self.cache.get_hit_block_tables(cache_hits)
                 )
@@ -578,18 +597,14 @@ class DraftServerSpeculateMixin:
                     used_swap_for_hits = True
 
         # ---- zero-fill on misses (one merged call) ----
-        B_miss = int(miss_mask.sum().item())
-        if B_miss > 0:
-            with torch.profiler.record_function(
-                f"miss_fill_merged_B{B_miss}"
-            ):
-                self._fill_misses_with_zeros(
-                    bonus_tokens=bonus_cat,
-                    miss_mask=miss_mask,
-                    B_miss=B_miss,
-                    draft_tokens=draft_tokens,
-                    draft_logits=draft_logits,
-                )
+        # Unconditional: see notes on single-VS path.
+        with torch.profiler.record_function("miss_fill_merged"):
+            self._fill_misses_with_zeros(
+                bonus_tokens=bonus_cat,
+                miss_mask=miss_mask,
+                draft_tokens=draft_tokens,
+                draft_logits=draft_logits,
+            )
 
         if not used_swap_for_hits:
             for sid in seq_ids_list:

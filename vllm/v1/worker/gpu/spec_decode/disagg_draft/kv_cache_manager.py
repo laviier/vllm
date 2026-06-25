@@ -187,46 +187,79 @@ class DraftKVCacheMixin:
         Overwrites only the write-range columns (logical blocks the
         branch's tree decode wrote into). Returns (owned_blocks_by_sid,
         displaced) so the caller can recycle displaced blocks.
+
+        Materializes the three input tensors once each (3 syncs total)
+        and batches the GPU block-table writes into a single
+        ``index_put_``; older versions did B × W per-element ``.item()``
+        + scalar writes, which was 50-100 syncs per merged swap.
         """
         bs = self.block_size
         M = self.max_num_blocks
         B = seq_ids.shape[0]
         owned_blocks: dict[int, list[int]] = {}
         displaced: list[int] = []
+        if B == 0:
+            return owned_blocks, displaced
+
+        seq_ids_list = seq_ids.tolist()
+        prefix_lens_list = prefix_lens.tolist()
+        # Only need the leading max-W columns; W = ceil((K + bs - 1)/bs)
+        # at worst, but we hand the whole row to Python since the call
+        # rate is low and the row is short (M ~ a few hundred).
+        branch_tbl_list = branch_block_tables.tolist()
+        cap = self._block_table_gpu.shape[0]
+
+        write_rows: list[int] = []
+        write_cols: list[int] = []
+        write_vals: list[int] = []
 
         for i in range(B):
-            sid = int(seq_ids[i].item())
-            if sid >= self._block_table_gpu.shape[0]:
+            sid = seq_ids_list[i]
+            if sid >= cap:
                 logger.warning(
                     "swap_block_tables: seq_id %d out of bounds, skipping",
                     sid,
                 )
                 continue
 
-            prefix_len = int(prefix_lens[i].item())
+            prefix_len = prefix_lens_list[i]
             first_write_blk = prefix_len // bs
             last_write_blk = (prefix_len + K - 1) // bs
+            end_blk = min(last_write_blk + 1, M)
 
-            owned = []
-            for blk_idx in range(
-                first_write_blk, min(last_write_blk + 1, M)
-            ):
-                if (sid in self._block_tables
-                        and blk_idx < len(self._block_tables[sid])):
-                    old_blk = self._block_tables[sid][blk_idx]
+            host_blocks = self._block_tables.get(sid)
+            row_branch = branch_tbl_list[i]
+            owned: list[int] = []
+            for blk_idx in range(first_write_blk, end_blk):
+                if host_blocks is not None and blk_idx < len(host_blocks):
+                    old_blk = host_blocks[blk_idx]
                     if old_blk != 0:
                         displaced.append(old_blk)
 
-                new_block_id = int(branch_block_tables[i, blk_idx].item())
-                self._block_table_gpu[sid, blk_idx] = new_block_id
+                new_block_id = row_branch[blk_idx]
                 owned.append(new_block_id)
+                write_rows.append(sid)
+                write_cols.append(blk_idx)
+                write_vals.append(new_block_id)
 
-                if sid in self._block_tables:
-                    while len(self._block_tables[sid]) <= blk_idx:
-                        self._block_tables[sid].append(0)
-                    self._block_tables[sid][blk_idx] = new_block_id
+                if host_blocks is not None:
+                    while len(host_blocks) <= blk_idx:
+                        host_blocks.append(0)
+                    host_blocks[blk_idx] = new_block_id
 
             owned_blocks[sid] = owned
+
+        if write_rows:
+            row_t = torch.tensor(
+                write_rows, dtype=torch.int64, device=self.device,
+            )
+            col_t = torch.tensor(
+                write_cols, dtype=torch.int64, device=self.device,
+            )
+            val_t = torch.tensor(
+                write_vals, dtype=torch.int32, device=self.device,
+            )
+            self._block_table_gpu.index_put_((row_t, col_t), val_t)
 
         return owned_blocks, displaced
 
