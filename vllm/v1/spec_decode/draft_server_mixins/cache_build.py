@@ -463,6 +463,16 @@ class DraftServerCacheBuildMixin:
                 entry_owner = [
                     vs_of_seq[bi] for bi in entry_batch_ids_cpu
                 ]
+                # Hoisted: build the GPU tensor now so its CPU→GPU
+                # copy queues alongside the upcoming block alloc /
+                # KV-copy / parallel_fanout work instead of after them.
+                # Originally created at line ~601 right before the
+                # populate loop, where the trace showed it stalling
+                # 17 ms on cudaStreamSynchronize waiting for
+                # parallel_fanout's tail kernels to drain.
+                entry_owner_t = torch.tensor(
+                    entry_owner, dtype=torch.int64, device=self.device,
+                )
 
                 # ONE merged block allocation. Block reservation is
                 # per-VS, so split allocated blocks by entry_owner.
@@ -597,10 +607,9 @@ class DraftServerCacheBuildMixin:
                         bonus_candidates=bonus_candidates,
                     )
 
-                # Split populate per VS by entry_owner.
-                entry_owner_t = torch.tensor(
-                    entry_owner, dtype=torch.int64, device=self.device,
-                )
+                # Split populate per VS by entry_owner. ``entry_owner_t``
+                # was hoisted above to overlap its CPU→GPU copy with
+                # earlier GPU work.
                 seq_ids_per_branch = seq_ids_cat[entry_batch_ids]
                 for vs_idx, sm in enumerate(slice_metas):
                     mask = entry_owner_t == vs_idx
