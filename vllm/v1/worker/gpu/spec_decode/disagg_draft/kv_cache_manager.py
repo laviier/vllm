@@ -120,6 +120,32 @@ class DraftKVCacheMixin:
         self._next_free_block += 1
         return blk
 
+    def _alloc_n_blocks(self, n: int) -> list[int]:
+        """Return ``n`` free block IDs in one go, preferring the free
+        list. Equivalent to ``n`` consecutive ``_alloc_one_block`` calls
+        but folds the per-element Python overhead into two slice ops.
+        """
+        if n <= 0:
+            return []
+        from_free = min(n, len(self._free_list))
+        if from_free:
+            blocks = self._free_list[-from_free:]
+            blocks.reverse()  # match _alloc_one_block().pop() order
+            del self._free_list[-from_free:]
+        else:
+            blocks = []
+        remaining = n - from_free
+        if remaining:
+            new_end = self._next_free_block + remaining
+            if new_end > self.num_kv_blocks:
+                raise RuntimeError(
+                    f"Draft KV cache exhausted: {new_end} > "
+                    f"{self.num_kv_blocks} (free_list empty)"
+                )
+            blocks.extend(range(self._next_free_block, new_end))
+            self._next_free_block = new_end
+        return blocks
+
     def allocate_blocks(self, seq_id: int, num_tokens: int) -> list[int]:
         """Allocate KV blocks for a sequence, recycling any prior ones."""
         if seq_id >= self._block_table_gpu.shape[0]:
@@ -133,9 +159,7 @@ class DraftKVCacheMixin:
         num_blocks_needed = (
             (num_tokens + self.block_size - 1) // self.block_size
         )
-        blocks = [
-            self._alloc_one_block() for _ in range(num_blocks_needed)
-        ]
+        blocks = self._alloc_n_blocks(num_blocks_needed)
         self._block_tables[seq_id] = blocks
         self._block_table_gpu[seq_id].zero_()
         self._block_table_gpu[seq_id, :len(blocks)] = torch.tensor(
@@ -166,7 +190,7 @@ class DraftKVCacheMixin:
             return
 
         extra = needed_blocks - current_blocks
-        new_blocks = [self._alloc_one_block() for _ in range(extra)]
+        new_blocks = self._alloc_n_blocks(extra)
         self._block_tables[seq_id].extend(new_blocks)
         start = current_blocks
         self._block_table_gpu[seq_id, start:start + extra] = torch.tensor(

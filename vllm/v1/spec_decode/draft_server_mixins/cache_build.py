@@ -491,10 +491,7 @@ class DraftServerCacheBuildMixin:
                                 post_glue_lens[sid] - 1
                             )
                     return
-                dedicated_blocks = [
-                    runner._alloc_one_block()
-                    for _ in range(total_needed)
-                ]
+                dedicated_blocks = runner._alloc_n_blocks(total_needed)
                 # Reserve dedicated blocks per VS (chunk
                 # dedicated_blocks by entry owner).
                 blocks_by_vs: dict[int, list[int]] = {
@@ -802,9 +799,7 @@ class DraftServerCacheBuildMixin:
         if available < total_needed:
             return None
 
-        dedicated_blocks = [
-            runner._alloc_one_block() for _ in range(total_needed)
-        ]
+        dedicated_blocks = runner._alloc_n_blocks(total_needed)
         runner.reserve_dedicated_blocks(dedicated_blocks, vs_id)
 
         B = seq_ids.shape[0]
