@@ -555,18 +555,19 @@ class DraftServerCacheBuildMixin:
                     .unsqueeze(1)
                     .expand_as(tbl_indices)
                 )
+                # Read parent block IDs BEFORE mutating branch_block_tables:
+                # at this point it's still a clean copy of the parent table,
+                # so we can skip a second _block_table_gpu gather.
+                src_indices_i64 = tbl_indices.clamp(max=M - 1).to(torch.int64)
+                src_block_ids = branch_block_tables[
+                    n_idx, src_indices_i64,
+                ].to(torch.int64)
+
                 branch_block_tables[
                     n_idx[valid], tbl_indices[valid].to(torch.int64),
                 ] = ded_tensor[valid].to(torch.int32)
 
                 # KV copy from parent into newly-reserved blocks.
-                parent_tables = runner._block_table_gpu[
-                    seq_ids_for_branches
-                ]
-                src_indices = tbl_indices.clamp(max=M - 1)
-                src_block_ids = parent_tables[
-                    n_idx, src_indices.to(torch.int64),
-                ].to(torch.int64)
                 dst_block_ids = ded_tensor
                 copy_mask = (
                     valid & (src_block_ids != dst_block_ids)
@@ -840,15 +841,18 @@ class DraftServerCacheBuildMixin:
             .unsqueeze(1)
             .expand_as(tbl_indices)
         )
+        # Read parent block IDs BEFORE mutating branch_block_tables:
+        # at this point it's still a clean copy of the parent table,
+        # so we can skip a second _block_table_gpu gather.
+        src_indices_i64 = tbl_indices.clamp(max=M - 1).to(torch.int64)
+        src_block_ids = branch_block_tables[
+            n_idx, src_indices_i64,
+        ].to(torch.int64)
+
         branch_block_tables[
             n_idx[valid], tbl_indices[valid].to(torch.int64)
         ] = ded_tensor[valid].to(torch.int32)
 
-        parent_tables = runner._block_table_gpu[seq_ids_for_branches]
-        src_indices = tbl_indices.clamp(max=M - 1)
-        src_block_ids = parent_tables[
-            n_idx, src_indices.to(torch.int64)
-        ].to(torch.int64)
         dst_block_ids = ded_tensor
         copy_mask = valid & (src_block_ids != dst_block_ids)
         if copy_mask.any() and runner.kv_caches is not None:
