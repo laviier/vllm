@@ -367,9 +367,16 @@ class DraftServerCacheBuildMixin:
                 draft_tokens_cat = torch.cat(
                     [sm["draft_tokens"] for sm in slice_metas], dim=0,
                 )
-                draft_logits_cat = torch.cat(
-                    [sm["draft_logits"] for sm in slice_metas], dim=0,
-                )
+                # Note: sm["draft_logits"] is intentionally NOT
+                # concatenated here. ``_select_bonus_candidates`` below
+                # reads ``self._last_draft_logits`` instead, which
+                # carries the cleanup splice from
+                # ``_fused_cleanup_and_glue`` (positions 1..K-1 of HIT
+                # rows refreshed with real-context logits). Feeding
+                # the un-spliced per-VS slice would produce nonsense
+                # bonus candidates at HIT rows because mask-context
+                # logits at positions 1..K-1 are near-flat for the
+                # parallel-MTP drafter.
                 bonus_cat = torch.cat(
                     [sm["bonus_tokens"] for sm in slice_metas], dim=0,
                 )
@@ -417,6 +424,12 @@ class DraftServerCacheBuildMixin:
                         tokens=glue_input, seq_ids=seq_ids_cat,
                     )
 
+                # Use ``self._last_draft_logits`` (cleanup-spliced) as
+                # the source for ``_select_bonus_candidates``; the per-
+                # VS slice in slice_metas is the un-spliced version
+                # from the speculate handler (see note where it would
+                # have been concatenated above).
+                draft_logits_for_select = self._last_draft_logits
                 # Zero-fallback miss rows: replace k=0 logits with
                 # glue_logits so bonus candidates are real (see
                 # _build_standalone_cache for full reasoning). Run
@@ -424,8 +437,10 @@ class DraftServerCacheBuildMixin:
                 # the mask is all-False; gating with .any().item() was
                 # a CPU↔GPU sync per round.
                 if merged_miss_mask is not None:
-                    draft_logits_cat = draft_logits_cat.clone()
-                    draft_logits_cat[merged_miss_mask, 0] = (
+                    draft_logits_for_select = (
+                        draft_logits_for_select.clone()
+                    )
+                    draft_logits_for_select[merged_miss_mask, 0] = (
                         glue_logits[merged_miss_mask]
                     )
 
@@ -444,7 +459,7 @@ class DraftServerCacheBuildMixin:
                     B=B_total,
                     fan_out_list=fan_out_list,
                     max_fan_out=max_fan_out,
-                    draft_logits=draft_logits_cat,
+                    draft_logits=draft_logits_for_select,
                     draft_tokens=draft_tokens_cat,
                     rec_tokens=bonus_cat,
                     glue_logits=glue_logits,
