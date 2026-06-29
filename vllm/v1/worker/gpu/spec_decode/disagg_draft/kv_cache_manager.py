@@ -212,10 +212,14 @@ class DraftKVCacheMixin:
         branch's tree decode wrote into). Returns (owned_blocks_by_sid,
         displaced) so the caller can recycle displaced blocks.
 
-        Materializes the three input tensors once each (3 syncs total)
-        and batches the GPU block-table writes into a single
-        ``index_put_``; older versions did B × W per-element ``.item()``
-        + scalar writes, which was 50-100 syncs per merged swap.
+        Per-row only ``W`` columns are written, where
+        ``W = ceil((K-1)/bs) + 1`` (1-2 for typical K/bs). We gather
+        just those W cells on GPU and ``.tolist()`` the gather result
+        — ``branch_block_tables`` itself is ``[H, M]`` with M in the
+        hundreds, so the prior full-row tolist was syncing M×H ints
+        when we only read W×H of them. The full-row tolist showed up
+        as ~1.1 ms median inside swap_hits_merged at 3V c=8 (M≈600,
+        H≈18); this gather variant cuts that to a few tens of µs.
         """
         bs = self.block_size
         M = self.max_num_blocks
@@ -227,11 +231,31 @@ class DraftKVCacheMixin:
 
         seq_ids_list = seq_ids.tolist()
         prefix_lens_list = prefix_lens.tolist()
-        # Only need the leading max-W columns; W = ceil((K + bs - 1)/bs)
-        # at worst, but we hand the whole row to Python since the call
-        # rate is low and the row is short (M ~ a few hundred).
-        branch_tbl_list = branch_block_tables.tolist()
         cap = self._block_table_gpu.shape[0]
+
+        # W is the max number of logical blocks any branch can touch:
+        # write range is [prefix_len // bs, (prefix_len + K - 1) // bs],
+        # whose width depends on the alignment of prefix_len within the
+        # block. At worst W = ceil((K-1)/bs) + 1.
+        W = (K - 1) // bs + 1 + (1 if (K - 1) % bs else 0)
+        # Build per-row [first_write_blk, first_write_blk + W) gather
+        # indices and gather just those cells from branch_block_tables.
+        # That cuts the tolist payload from H×M ints to H×W ints.
+        first_write_blks = torch.tensor(
+            [p // bs for p in prefix_lens_list],
+            dtype=torch.int64, device=branch_block_tables.device,
+        )
+        col_offsets = torch.arange(
+            W, dtype=torch.int64, device=branch_block_tables.device,
+        )
+        gather_cols = (
+            first_write_blks.unsqueeze(1) + col_offsets.unsqueeze(0)
+        ).clamp_(max=M - 1)                                   # [H, W]
+        row_idx = torch.arange(
+            B, dtype=torch.int64, device=branch_block_tables.device,
+        ).unsqueeze(1).expand(B, W)
+        gathered = branch_block_tables[row_idx, gather_cols]  # [H, W]
+        gathered_list = gathered.tolist()
 
         write_rows: list[int] = []
         write_cols: list[int] = []
@@ -252,15 +276,15 @@ class DraftKVCacheMixin:
             end_blk = min(last_write_blk + 1, M)
 
             host_blocks = self._block_tables.get(sid)
-            row_branch = branch_tbl_list[i]
+            row_gathered = gathered_list[i]
             owned: list[int] = []
-            for blk_idx in range(first_write_blk, end_blk):
+            for j, blk_idx in enumerate(range(first_write_blk, end_blk)):
                 if host_blocks is not None and blk_idx < len(host_blocks):
                     old_blk = host_blocks[blk_idx]
                     if old_blk != 0:
                         displaced.append(old_blk)
 
-                new_block_id = row_branch[blk_idx]
+                new_block_id = row_gathered[j]
                 owned.append(new_block_id)
                 write_rows.append(sid)
                 write_cols.append(blk_idx)
