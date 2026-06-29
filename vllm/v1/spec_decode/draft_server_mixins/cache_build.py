@@ -472,11 +472,17 @@ class DraftServerCacheBuildMixin:
                 vs_of_seq: list[int] = []
                 for vs_idx, sm in enumerate(slice_metas):
                     vs_of_seq.extend([vs_idx] * sm["B"])
-                # entry_batch_ids: [N] int64 mapping branch i -> batch
-                # row in the concatenated batch.
-                entry_batch_ids_cpu = entry_batch_ids.tolist()
+                # entry_batch_ids is a deterministic
+                # ``arange(B_total).repeat_interleave(entries_per_seq)``
+                # pattern produced by ``_select_bonus_candidates``; we
+                # reconstruct the host-side equivalent without a GPU→CPU
+                # sync. The prior ``entry_batch_ids.tolist()`` showed
+                # up as ~1.17 ms in the inter-phase band of every
+                # merged cb cycle because it forced the
+                # ``_select_bonus_candidates`` GPU queue to drain.
                 entry_owner = [
-                    vs_of_seq[bi] for bi in entry_batch_ids_cpu
+                    vs_of_seq[b] for b in range(B_total)
+                    for _ in range(entries_per_seq)
                 ]
                 # Hoisted: build the GPU tensor now so its CPU→GPU
                 # copy queues alongside the upcoming block alloc /
