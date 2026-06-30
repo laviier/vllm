@@ -381,7 +381,19 @@ class DraftServerCacheBuildMixin:
                     [sm["bonus_tokens"] for sm in slice_metas], dim=0,
                 )
                 B_total = seq_ids_cat.shape[0]
-                seq_ids_list = seq_ids_cat.tolist()
+                # The CPU-side seq_ids list was already materialized
+                # in the SPECULATE handler (where the sync overlapped
+                # with verifier-side work); re-using its per-VS slices
+                # here avoids a fresh ``seq_ids_cat.tolist()`` host
+                # sync that would drain the cleanup_glue GPU queue.
+                # That sync was ~2.2 ms / cycle in the inter-phase
+                # Python band at 3V c=8.
+                if all("seq_ids_cpu" in sm for sm in slice_metas):
+                    seq_ids_list = [
+                        sid for sm in slice_metas for sid in sm["seq_ids_cpu"]
+                    ]
+                else:
+                    seq_ids_list = seq_ids_cat.tolist()
 
                 # Geometric fan-out (shared across VSes).
                 fan_out_list = self._shrink_fan_out_to_budget(

@@ -648,6 +648,12 @@ class DraftServerSpeculateMixin:
                 "vs_id": p["vs_id"],
                 "B": B,
                 "seq_ids": seq_ids_cat[sl].clone(),
+                # Stash the per-VS CPU seq_ids slice so the merged
+                # cache_build path can avoid a fresh
+                # ``seq_ids_cat.tolist()`` host sync — that sync
+                # drained the cleanup_glue GPU queue and cost ~2.2 ms
+                # per cycle in the inter-phase Python band at 3V c=8.
+                "seq_ids_cpu": seq_ids_list[offset:offset + B],
                 "bonus_tokens": bonus_cat[sl].clone(),
                 "draft_tokens": draft_tokens[sl].clone(),
                 "draft_logits": draft_logits[sl].clone(),
