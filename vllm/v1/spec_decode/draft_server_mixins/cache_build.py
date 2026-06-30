@@ -408,14 +408,17 @@ class DraftServerCacheBuildMixin:
                     glue_logits = self._pending_glue_logits
                     self._pending_glue_logits = None
                 else:
-                    if (
-                        merged_miss_mask is not None
-                        and bool(merged_miss_mask.any().item())
-                    ):
-                        glue_input = draft_tokens_cat[:, -1].clone()
-                        glue_input[merged_miss_mask] = bonus_cat[
-                            merged_miss_mask
-                        ]
+                    # Unconditional ``torch.where`` avoids the
+                    # ``mask.any().item()`` host sync; result is just
+                    # the last-col tokens when the mask is all-False.
+                    # When all 3V cb_merged_n3 rounds drained on this
+                    # sync, it cost ~0.5-1 ms each.
+                    if merged_miss_mask is not None:
+                        glue_input = torch.where(
+                            merged_miss_mask,
+                            bonus_cat,
+                            draft_tokens_cat[:, -1],
+                        )
                     else:
                         glue_input = draft_tokens_cat[:, -1]
                     # Advances _seq_lens by 1 per seq (mirrored by the
@@ -586,11 +589,17 @@ class DraftServerCacheBuildMixin:
                 ] = ded_tensor[valid].to(torch.int32)
 
                 # KV copy from parent into newly-reserved blocks.
+                # Run unconditionally — when copy_mask is all-False
+                # the per-layer index_put_ is a 0-element no-op, and
+                # in practice copy_mask is almost always True (parent
+                # and dedicated block IDs differ for the blocks being
+                # written). The prior ``copy_mask.any()`` guard cost a
+                # full GPU-queue sync just to skip 32 empty kernels.
                 dst_block_ids = ded_tensor
                 copy_mask = (
                     valid & (src_block_ids != dst_block_ids)
                 )
-                if copy_mask.any() and runner.kv_caches is not None:
+                if runner.kv_caches is not None:
                     src_flat = src_block_ids[copy_mask]
                     dst_flat = dst_block_ids[copy_mask]
                     for layer_kv in runner.kv_caches:
@@ -871,7 +880,8 @@ class DraftServerCacheBuildMixin:
 
         dst_block_ids = ded_tensor
         copy_mask = valid & (src_block_ids != dst_block_ids)
-        if copy_mask.any() and runner.kv_caches is not None:
+        # Run unconditionally — see note on the merged-path variant.
+        if runner.kv_caches is not None:
             src_flat = src_block_ids[copy_mask]
             dst_flat = dst_block_ids[copy_mask]
             for layer_kv in runner.kv_caches:
@@ -921,9 +931,13 @@ class DraftServerCacheBuildMixin:
             glue_logits = self._pending_glue_logits
             self._pending_glue_logits = None
         else:
-            if miss_mask is not None and bool(miss_mask.any().item()):
-                glue_input = draft_tokens[:, -1].clone()
-                glue_input[miss_mask] = rec_tokens[miss_mask]
+            # Unconditional ``torch.where`` avoids the host sync;
+            # result is the last-col tokens when the mask is all-False.
+            # Mirrors the fix on the merged path.
+            if miss_mask is not None:
+                glue_input = torch.where(
+                    miss_mask, rec_tokens, draft_tokens[:, -1]
+                )
             else:
                 glue_input = draft_tokens[:, -1]
             glue_logits = runner.glue_decode(
