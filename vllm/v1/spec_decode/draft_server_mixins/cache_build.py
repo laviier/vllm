@@ -158,8 +158,14 @@ class DraftServerCacheBuildMixin:
         D = K - 1
 
         # Per-seq glue position = _seq_lens[sid]. Read in seq_ids order.
+        # ``seq_ids_list`` reuses the CPU list already stashed by the
+        # SPECULATE handler (in pending_swap for the swap path, or on
+        # self._last_spec_seq_ids_cpu for the cold-start path) to avoid
+        # a redundant .tolist() sync at the start of every cache_build.
+        cached_cpu: list[int] | None = None
         if pending is not None:
             seq_ids_full = pending["seq_ids"]                   # [B]
+            cached_cpu = pending.get("seq_ids_list")
         else:
             # No swap pending (cold start / all-miss round): the SPECULATE
             # handler stashed _last_spec_seq_ids at the same time as the
@@ -167,10 +173,15 @@ class DraftServerCacheBuildMixin:
             seq_ids_full = self._last_spec_seq_ids
             if seq_ids_full is None:
                 return
+            if self._last_spec_seq_ids_cpu is not None:
+                cached_cpu = self._last_spec_seq_ids_cpu
         if seq_ids_full.shape[0] != B:
             return
 
-        seq_ids_list = seq_ids_full.tolist()
+        if cached_cpu is not None and len(cached_cpu) == B:
+            seq_ids_list = cached_cpu
+        else:
+            seq_ids_list = seq_ids_full.tolist()
         glue_positions_cpu = [
             int(runner._seq_lens.get(int(sid), 0)) for sid in seq_ids_list
         ]
@@ -721,7 +732,21 @@ class DraftServerCacheBuildMixin:
             return
 
         max_fan_out = max(fan_out_list) if fan_out_list else 0
-        seq_ids_list = seq_ids.tolist()
+        # Reuse the CPU list stashed by the SPECULATE handler if it
+        # matches ``seq_ids`` (this cache_build was scheduled from the
+        # same SPECULATE round that produced ``_last_spec_seq_ids``,
+        # which is the common case on the solo path). The alternative
+        # was ``seq_ids.tolist()`` here, which drained the
+        # SPECULATE-handler GPU queue for ~1.8 ms per iter.
+        cached_cpu = self._last_spec_seq_ids_cpu
+        if (
+            cached_cpu is not None
+            and self._last_spec_seq_ids is seq_ids
+            and len(cached_cpu) == B
+        ):
+            seq_ids_list = cached_cpu
+        else:
+            seq_ids_list = seq_ids.tolist()
 
         self._build_standalone_cache(
             B, K, fan_out_list, max_fan_out, N,
@@ -824,11 +849,16 @@ class DraftServerCacheBuildMixin:
         seq_ids: torch.Tensor,
         entry_batch_ids: torch.Tensor,
         k_positions: torch.Tensor,
+        seq_ids_list: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Reserve dedicated blocks for N branches and copy parent KV in.
 
         Returns (branch_block_tables, prefix_lens) on success, or None
         if the block pool is exhausted.
+
+        ``seq_ids_list``: optional pre-materialized CPU list of the
+        seq_ids tensor to avoid a redundant ``.tolist()`` sync when the
+        caller already has it (the solo cache_build path does).
         """
         bs = runner.block_size
         M = runner.max_num_blocks
@@ -846,8 +876,12 @@ class DraftServerCacheBuildMixin:
 
         B = seq_ids.shape[0]
         # Materialize seq_ids once instead of per-element .item() calls
-        # (each would be a CPU↔GPU sync).
-        seq_ids_list = seq_ids.tolist()
+        # (each would be a CPU↔GPU sync). If the caller passes the
+        # already-materialized list, reuse it — the solo cache_build
+        # path threads through the CPU list stashed by the SPECULATE
+        # handler.
+        if seq_ids_list is None:
+            seq_ids_list = seq_ids.tolist()
         base_lens_t = torch.tensor(
             [
                 self._round_base_lens.get(sid, 0)
@@ -994,6 +1028,7 @@ class DraftServerCacheBuildMixin:
             seq_ids=seq_ids,
             entry_batch_ids=entry_batch_ids,
             k_positions=k_positions,
+            seq_ids_list=seq_ids_list,
         )
         if alloc is None:
             # Block pool exhausted; skip cache build and restore seq lens.

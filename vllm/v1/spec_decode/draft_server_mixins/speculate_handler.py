@@ -313,8 +313,15 @@ class DraftServerSpeculateMixin:
             seq_ids, k_accepted, bonus_tokens, temperatures = (
                 self._recv_speculation_tensors(verify_server_id, outcome)
             )
-        self._last_spec_seq_ids = seq_ids
+        # Materialize the CPU list first so ``_last_spec_seq_ids`` and
+        # ``_last_spec_seq_ids_cpu`` always stay in lock-step (paired
+        # assignments after the sync). Downstream cache_build consumers
+        # reuse the CPU list to avoid a repeat GPU→host sync at
+        # ``_build_next_cache`` — that sync drained the SPECULATE
+        # handler's GPU queue for ~1.8 ms per affected iter at 3V c=8.
         seq_ids_list = seq_ids.tolist()
+        self._last_spec_seq_ids = seq_ids
+        self._last_spec_seq_ids_cpu = seq_ids_list
 
         # ---- Step 2: Reconcile runner state with this round's base ----
         runner = self.draft_model_runner
@@ -521,6 +528,9 @@ class DraftServerSpeculateMixin:
         seq_ids_list = seq_ids_cat.tolist()
 
         self._last_spec_seq_ids = seq_ids_cat
+        # Mirror the single-VS path: stash the CPU list for downstream
+        # cache_build consumers that would otherwise re-tolist().
+        self._last_spec_seq_ids_cpu = seq_ids_list
         self.metrics.draft_batch_size.set(B_total)
         _spec_start = time.monotonic()
 

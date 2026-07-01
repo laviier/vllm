@@ -243,6 +243,10 @@ class DraftServer(
         # Last speculation seq_ids — stored by _handle_speculation_inner,
         # consumed by _handle_speculation for post-response cache building.
         self._last_spec_seq_ids: torch.Tensor | None = None
+        # CPU-side mirror of _last_spec_seq_ids, materialized once in
+        # the SPECULATE handler so downstream cache_build consumers can
+        # reuse it instead of paying another GPU→host sync.
+        self._last_spec_seq_ids_cpu: list[int] | None = None
 
         # In-flight background cache build. Awaited before the next
         # SPECULATE begins work on the runner (runner state and the
