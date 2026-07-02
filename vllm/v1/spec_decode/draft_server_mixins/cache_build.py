@@ -503,16 +503,6 @@ class DraftServerCacheBuildMixin:
                 vs_of_seq[b] for b in range(B_total)
                 for _ in range(entries_per_seq)
             ]
-            # Hoisted: build the GPU tensor now so its CPU→GPU
-            # copy queues alongside the upcoming block alloc /
-            # KV-copy / parallel_fanout work instead of after them.
-            # Originally created at line ~601 right before the
-            # populate loop, where the trace showed it stalling
-            # 17 ms on cudaStreamSynchronize waiting for
-            # parallel_fanout's tail kernels to drain.
-            entry_owner_t = torch.tensor(
-                entry_owner, dtype=torch.int64, device=self.device,
-            )
 
             # ONE merged block allocation. Block reservation is
             # per-VS, so split allocated blocks by entry_owner.
@@ -648,24 +638,29 @@ class DraftServerCacheBuildMixin:
                     bonus_candidates=bonus_candidates,
                 )
 
-            # Split populate per VS by entry_owner. ``entry_owner_t``
-            # was hoisted above to overlap its CPU→GPU copy with
-            # earlier GPU work.
+            # Split populate per VS via CPU-computed slice ranges.
+            # ``slice_metas`` are laid out contiguously per VS (see
+            # speculate_handler), so each VS owns a fixed slice of the
+            # merged tensors [start:end). No boolean indexing (which
+            # would force a shape sync per gather) and no mask.any()
+            # gate (which was ~5 ms/call × 3 slices ≈ 20 ms of GPU
+            # idle per iter at 3V c=8 pre-fix). All slice bounds are
+            # host-side ints known before any GPU work fires.
             seq_ids_per_branch = seq_ids_cat[entry_batch_ids]
-            for vs_idx, sm in enumerate(slice_metas):
-                mask = entry_owner_t == vs_idx
-                if not mask.any():
-                    continue
+            start = 0
+            for sm in slice_metas:
+                end = start + sm["B"] * entries_per_seq
                 self.cache.populate(
-                    seq_ids=seq_ids_per_branch[mask],
-                    k_positions=k_positions[mask],
-                    bonus_tokens=bonus_candidates[mask],
-                    draft_tokens=all_tokens[mask],
-                    draft_logits=all_logits[mask],
-                    branch_block_tables=branch_block_tables[mask],
-                    prefix_lens=prefix_lens[mask],
+                    seq_ids=seq_ids_per_branch[start:end],
+                    k_positions=k_positions[start:end],
+                    bonus_tokens=bonus_candidates[start:end],
+                    draft_tokens=all_tokens[start:end],
+                    draft_logits=all_logits[start:end],
+                    branch_block_tables=branch_block_tables[start:end],
+                    prefix_lens=prefix_lens[start:end],
                     vs_id=sm["vs_id"],
                 )
+                start = end
 
     # ------------------------------------------------------------------
     # Response helpers
