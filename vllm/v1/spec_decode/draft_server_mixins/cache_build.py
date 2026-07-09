@@ -205,7 +205,15 @@ class DraftServerCacheBuildMixin:
             cache_hits = pending["cache_hits"]
             hit_prefix_lens = pending["hit_prefix_lens"]            # [H]
             hit_mask = cache_hits.bool()
-            H = int(cache_hits.sum().item())
+            # H comes from hit_prefix_lens.shape[0] — that shape was
+            # resolved upstream when ``hit_prefix_lens`` was produced
+            # (via ``hit_mask.nonzero()`` in ``get_hit_block_tables``),
+            # so the size is already CPU-known and this read is free.
+            # The prior ``cache_hits.sum().item()`` fired a cudaStreamSync
+            # that landed during cache_build kernel tail — cost ~3 ms
+            # per iter at Qwen 3V+1D (small-drafter regime where the
+            # sync consistently caught kernels still queued).
+            H = hit_prefix_lens.shape[0]
         else:
             hit_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
             hit_prefix_lens = None
