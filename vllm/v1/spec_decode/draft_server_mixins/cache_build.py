@@ -281,7 +281,14 @@ class DraftServerCacheBuildMixin:
         ], dim=0)
         block_tables = runner._block_table_gpu[per_token_seq_ids]
 
-        max_context_hint = int(positions.max().item()) + 1
+        # Upper bound for max_seq_len_hint (used for CUDA-graph slot
+        # selection). Avoids a ``positions.max().item()`` sync (~3 ms
+        # behind cache_build's own kernels). glue_positions_cpu is
+        # already on CPU (line ~205); cleanup adds at most K-1 to
+        # per-seq positions, so ``max(glue) + K`` is a safe over-bound.
+        max_context_hint = (
+            max(glue_positions_cpu) + K if glue_positions_cpu else 1
+        )
 
         with torch.profiler.record_function(
             f"fused_cleanup_glue_H{H}_M{nB}"
@@ -472,8 +479,14 @@ class DraftServerCacheBuildMixin:
                 draft_logits_for_select = (
                     draft_logits_for_select.clone()
                 )
-                draft_logits_for_select[merged_miss_mask, 0] = (
-                    glue_logits[merged_miss_mask]
+                # torch.where instead of boolean-mask indexing (see
+                # single-path comment for reasoning).
+                V = draft_logits_for_select.shape[2]
+                mask_v = merged_miss_mask.view(-1, 1).expand(-1, V)
+                draft_logits_for_select[:, 0] = torch.where(
+                    mask_v,
+                    glue_logits,
+                    draft_logits_for_select[:, 0],
                 )
 
             # ONE merged bonus selection.
@@ -864,14 +877,15 @@ class DraftServerCacheBuildMixin:
         # handler.
         if seq_ids_list is None:
             seq_ids_list = seq_ids.tolist()
-        base_lens_t = torch.tensor(
-            [
-                self._round_base_lens.get(sid, 0)
-                for sid in seq_ids_list
-            ],
-            dtype=torch.int64,
-            device=self.device,
-        )
+        # Pinned H2D avoids serializing with cache_build's own kernels
+        # on the default stream (a pageable ``torch.tensor(list, ...)``
+        # H2D was ~2.5 ms per call because the CUDA driver has to stage
+        # pageable memory through a bounce buffer).
+        base_lens_view = self._cb_base_lens_pin[:B]
+        for i, sid in enumerate(seq_ids_list):
+            base_lens_view[i] = self._round_base_lens.get(sid, 0)
+        base_lens_t = self._cb_base_lens_gpu[:B]
+        base_lens_t.copy_(base_lens_view, non_blocking=True)
         prefix_lens = base_lens_t[entry_batch_ids] + 1 + k_positions
 
         seq_ids_for_branches = seq_ids[entry_batch_ids].to(torch.int64)
@@ -880,9 +894,16 @@ class DraftServerCacheBuildMixin:
         ].contiguous()
 
         first_write_blk = prefix_lens // bs
-        ded_tensor = torch.tensor(
-            dedicated_blocks, dtype=torch.int64, device=self.device
-        ).view(N, blocks_per_branch)
+        # Same pinned+non_blocking pattern for dedicated_blocks.
+        ded_pin_view = self._cb_ded_blocks_pin[:total_needed]
+        # Fastest bulk fill: torch.as_tensor materializes from list w/o
+        # extra copies. total_needed ≤ MAX_BRANCHES by contract above.
+        ded_pin_view.copy_(
+            torch.as_tensor(dedicated_blocks, dtype=torch.int64),
+        )
+        ded_gpu = self._cb_ded_blocks_gpu[:total_needed]
+        ded_gpu.copy_(ded_pin_view, non_blocking=True)
+        ded_tensor = ded_gpu.view(N, blocks_per_branch)
 
         j_range = torch.arange(
             blocks_per_branch, device=self.device, dtype=torch.int64
@@ -902,20 +923,39 @@ class DraftServerCacheBuildMixin:
             n_idx, src_indices_i64,
         ].to(torch.int64)
 
+        # NOTE: this write MUST use boolean-mask indexing (or an
+        # equivalently correct pattern). An earlier attempt used
+        # ``scatter_`` with clamped indices, but that produced duplicate
+        # writes at column M-1 when multiple invalid positions clamped
+        # there — race between "restore old value" writes and the
+        # legitimate write from column M-1's ``valid=True`` position.
+        # This regressed cache-hit correctness and dropped AL by ~0.1.
+        # Boolean-mask indexing does sync via ``aten::nonzero``, but
+        # this whole method runs inside cache_build (background), not
+        # the SPECULATE hot path, so the sync is tolerable here.
         branch_block_tables[
             n_idx[valid], tbl_indices[valid].to(torch.int64)
         ] = ded_tensor[valid].to(torch.int32)
 
         dst_block_ids = ded_tensor
         copy_mask = valid & (src_block_ids != dst_block_ids)
-        # Run unconditionally — see note on the merged-path variant.
         if runner.kv_caches is not None:
-            src_flat = src_block_ids[copy_mask]
-            dst_flat = dst_block_ids[copy_mask]
+            # Sync-avoiding KV copy: redirect non-copy positions to a
+            # self-copy (write ``layer_kv[dst] = layer_kv[dst]``) so the
+            # fancy-index write is shape-invariant. Adds a few redundant
+            # self-copies per iter but avoids the boolean-mask
+            # ``aten::nonzero`` sync (~1-2 ms per call). Safe because
+            # ``ded_tensor`` contains UNIQUE block IDs (fresh allocation
+            # from ``runner._alloc_n_blocks(total_needed)``), so no
+            # aliasing between real copies and self-copies.
+            src_flat_all = src_block_ids.reshape(-1).to(torch.int64)
+            dst_flat_all = dst_block_ids.reshape(-1).to(torch.int64)
+            copy_flat = copy_mask.reshape(-1)
+            safe_src = torch.where(copy_flat, src_flat_all, dst_flat_all)
             for layer_kv in runner.kv_caches:
                 # Layout (num_blocks, 2, block_size, num_kv_heads, head_dim);
                 # block dim is 0.
-                layer_kv[dst_flat] = layer_kv[src_flat]
+                layer_kv[dst_flat_all] = layer_kv[safe_src]
 
         return branch_block_tables, prefix_lens
 
@@ -980,12 +1020,18 @@ class DraftServerCacheBuildMixin:
         # k=0 branch's bonus candidates align with what the verifier
         # will sample next round. Higher-k entries are unreachable
         # (verifier accepted 0 of zeros) so we leave them as zeros.
-        # Run unconditionally — the masked assignment is a no-op when
-        # miss_mask is all-False, and the prior gating .any().item()
-        # was a CPU↔GPU sync per round.
+        #
+        # Use ``torch.where`` instead of boolean-mask indexing. The
+        # prior ``draft_logits[miss_mask, 0] = glue_logits[miss_mask]``
+        # forced a ``aten::nonzero`` + ``cudaStreamSynchronize`` (~3 ms)
+        # on every cache_build round.
         if miss_mask is not None:
             draft_logits = draft_logits.clone()
-            draft_logits[miss_mask, 0] = glue_logits[miss_mask]
+            V = draft_logits.shape[2]
+            mask_v = miss_mask.view(-1, 1).expand(-1, V)
+            draft_logits[:, 0] = torch.where(
+                mask_v, glue_logits, draft_logits[:, 0],
+            )
 
         entry_batch_ids, k_positions, bonus_candidates, _branches = (
             self._select_bonus_candidates(
@@ -1016,6 +1062,17 @@ class DraftServerCacheBuildMixin:
             return
         branch_block_tables, prefix_lens = alloc
 
+        # Upper bound for max_prefix_len_hint used inside the fanout
+        # methods (avoids a prefix_lens.max().item() sync). prefix_lens
+        # = base_lens[entry_batch_ids] + 1 + k_positions, where
+        # k_positions.max() <= K-1 (see _select_bonus_candidates), so
+        # ``max(base_lens_cpu) + K`` is a safe upper bound.
+        max_base_len = max(
+            (self._round_base_lens.get(sid, 0) for sid in seq_ids_list),
+            default=0,
+        )
+        max_prefix_len_hint = max_base_len + K
+
         if self._use_parallel_fanout:
             # Mask KVs at depths 1..K-1 are dirty in the dedicated blocks
             # we write here; they get cleaned next round in
@@ -1030,6 +1087,7 @@ class DraftServerCacheBuildMixin:
                 prefix_lens=prefix_lens,
                 branch_block_tables=branch_block_tables,
                 bonus_candidates=bonus_candidates,
+                max_prefix_len_hint=max_prefix_len_hint,
             )
         else:
             all_tokens, all_logits = self._run_tree_decode(
@@ -1041,6 +1099,7 @@ class DraftServerCacheBuildMixin:
                 prefix_lens=prefix_lens,
                 branch_block_tables=branch_block_tables,
                 bonus_candidates=bonus_candidates,
+                max_prefix_len_hint=max_prefix_len_hint,
             )
 
         self.cache.populate(

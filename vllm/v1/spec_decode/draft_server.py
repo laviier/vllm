@@ -31,7 +31,10 @@ from vllm.v1.spec_decode.draft_connector import (
 from vllm.v1.spec_decode.draft_data_models import (
     DraftCommand,
     FreeSeqRequest,
+    IpcHandshake,
+    IpcHandshakeAck,
     PrefillRequest,
+    SpeculationResponse,
     VerificationOutcome,
     decode,
     decode_command,
@@ -132,6 +135,97 @@ class DraftServerMetrics:
                 "2-VS merge increments by 2)."
             ),
         )
+
+
+class _DraftServerIpcPeer:
+    """Per-VS state for the CUDA-IPC SPECULATE transport.
+
+    Attached to a verify server via IPC_HANDSHAKE. Holds the IPC-opened
+    GPU ring buffer (owned by the verifier) and per-slot last-seen
+    sequence numbers so we don't service the same request twice.
+
+    Doorbells are GPU tensors inside ``gpu_bufs`` (``dbell_req_gpu`` /
+    ``dbell_resp_gpu``), read/written via ``.item()`` and ``.fill_()``
+    on the verifier's GPU. shm_path is retained for backward compat
+    (unused when GPU-doorbells are present).
+    """
+
+    def __init__(
+        self,
+        verify_server_id: str,
+        shm_path: str,
+        max_batch: int,
+        K: int,
+        n_slots: int,
+        gpu_bufs: dict[str, torch.Tensor],
+    ) -> None:
+        self.verify_server_id = verify_server_id
+        self.shm_path = shm_path
+        self.max_batch = max_batch
+        self.K = K
+        self.n_slots = n_slots
+        self.gpu_bufs = gpu_bufs
+        # `resp_draft_tokens.device` is the verifier's GPU (tensors were
+        # allocated on that GPU by the verifier and IPC-opened here).
+        self.target_device: torch.device = gpu_bufs[
+            "resp_draft_tokens"
+        ].device
+        self.last_seen = [0] * n_slots
+        # GPU doorbells (IPC-shared via cudaIpc).
+        self._dbell_req = gpu_bufs["dbell_req_gpu"]
+        self._dbell_resp = gpu_bufs["dbell_resp_gpu"]
+        # CPU-side pinned staging for one-shot D2H of all doorbell
+        # values. Cheap to reuse; a single D2H picks up all slots at
+        # once so the per-tick poll cost is one memcpy, not n_slots.
+        self._dbell_req_cpu = torch.zeros(
+            n_slots, dtype=torch.int32, pin_memory=True,
+        )
+        # Pinned staging for seq_ids D2H (side-stream) and remapped-ids
+        # H2D (side-stream). Both must be pinned so the non-blocking
+        # copies don't serialize with the default stream (cache_build
+        # kernels). Sized to max_batch — the actual per-round B <= this.
+        self._seq_ids_cpu = torch.zeros(
+            max_batch, dtype=torch.int64, pin_memory=True,
+        )
+        self._remap_ids_cpu = torch.zeros(
+            max_batch, dtype=torch.int64, pin_memory=True,
+        )
+        # Same pattern for k_accepted D2H — used to build the CPU list
+        # that ``_sync_runner_seq_lens_and_blocks`` needs. Skipping
+        # this side-stream fetch causes the inner handler's
+        # ``k_accepted.tolist()`` to stall ~3 ms behind cache_build.
+        self._k_accepted_cpu = torch.zeros(
+            max_batch, dtype=torch.int64, pin_memory=True,
+        )
+        # Dedicated side stream for the poll D2H and seq_ids H2D/D2H.
+        # Using the default stream serializes with cache_build kernels;
+        # a side stream lets these fire while cache_build is running.
+        with torch.cuda.device(self.target_device):
+            self._poll_stream = torch.cuda.Stream()
+
+    def poll_all_reqs(self) -> torch.Tensor:
+        """Read the full request-doorbell vector in one D2H on a side
+        stream. Returns a CPU int32 tensor of length ``n_slots``.
+
+        This D2H does NOT wait for prior default-stream work (e.g.
+        an in-flight cache_build). The read reflects whatever value
+        the doorbell tensor holds at the time the copy is scheduled;
+        because doorbell writes on the verifier are ordered-after
+        their payload copies on the verifier's default stream, a
+        published new value implies the payload is fully written.
+        """
+        with torch.cuda.stream(self._poll_stream):
+            self._dbell_req_cpu.copy_(self._dbell_req, non_blocking=True)
+        self._poll_stream.synchronize()
+        return self._dbell_req_cpu
+
+    def set_resp(self, slot: int, value: int) -> None:
+        """Kernel-queued write of the response doorbell. Ordering vs.
+        prior response-tensor copies is preserved by the default stream."""
+        self._dbell_resp[slot].fill_(value)
+
+    def close(self) -> None:
+        pass
 
 
 class DraftServer(
@@ -301,6 +395,38 @@ class DraftServer(
             tuple[str, bytes, DraftCommand, list[bytes]]
         ] = []
 
+        # ----- Per-VS CUDA-IPC state (Path C SPECULATE transport) -----
+        # If a verify server sent an IPC_HANDSHAKE, we hold its shared
+        # ring buffer + doorbells here. Otherwise it stays on ZMQ and
+        # this dict is empty. Poll path in serve() scans this dict each
+        # tick alongside the ZMQ poll.
+        # Keyed by verify_server_id.
+        self._ipc_peers: dict[str, "_DraftServerIpcPeer"] = {}
+        # Round-robin cursor for ``_poll_ipc_speculates`` to prevent
+        # a fast peer from starving a slower peer under multi-VS load.
+        self._ipc_poll_cursor: int = 0
+
+        # Pre-allocated pinned CPU staging for cache_build's per-round
+        # H2Ds. ``torch.tensor(python_list, device=cuda)`` in
+        # _allocate_branch_blocks_and_copy_kv was ~2.5 ms per call
+        # because pageable H2D serializes with cache_build's own
+        # default-stream kernels. Pinned copies do not.
+        # Sizes:
+        #  base_lens_pin: [max_batch_size] — one entry per seq_id.
+        #  ded_blocks_pin: [MAX_BRANCHES] — one entry per branch block.
+        self._cb_base_lens_pin = torch.zeros(
+            max_batch_size, dtype=torch.int64, pin_memory=True,
+        )
+        self._cb_base_lens_gpu = torch.zeros(
+            max_batch_size, dtype=torch.int64, device=self.device,
+        )
+        self._cb_ded_blocks_pin = torch.zeros(
+            self.MAX_BRANCHES, dtype=torch.int64, pin_memory=True,
+        )
+        self._cb_ded_blocks_gpu = torch.zeros(
+            self.MAX_BRANCHES, dtype=torch.int64, device=self.device,
+        )
+
         # ----- Cross-VS SPECULATE merging (Option A) -----
         # The serve loop opportunistically peeks for additional pending
         # SPECULATEs from other VSes after receiving the first, and runs
@@ -446,6 +572,122 @@ class DraftServer(
         poller.register(self._socket, zmq.POLLIN)
 
         while self._running:
+            # Fast path: check IPC doorbells first — service any pending
+            # SPECULATEs before falling through to ZMQ. Only costs a few
+            # int32 loads per registered peer when idle.
+            if self._ipc_peers:
+                pending = self._poll_ipc_speculates()
+                if pending is not None:
+                    vs_id, slot, batch_size, seq16 = pending
+                    # BEFORE servicing the IPC SPECULATE, drain any
+                    # pending ZMQ messages FROM THE SAME VS so they
+                    # execute in the order the verifier sent them
+                    # (verifier sends FREE_SEQ + PREFILL over ZMQ,
+                    # then SPECULATE over IPC — IPC arrives instantly
+                    # while ZMQ has wire latency, so without this
+                    # drain the SPECULATE can leapfrog its own
+                    # FREE_SEQ / PREFILL, corrupting the cache).
+                    #
+                    # Peer-VS messages (esp. EXIT → reset_vs) are
+                    # deferred to the ZMQ poll path below. Interleaving
+                    # a peer's cache mutation between our IPC SPECULATE
+                    # and the same VS's next round has caused device-
+                    # side OOB assertions in ``get_hit_block_tables``
+                    # after peer VS finishes benchmarks.
+                    deferred_peers: list[
+                        tuple[bytes, bytes, list[bytes]]
+                    ] = []
+                    while True:
+                        try:
+                            zmq_frames = await self._socket.recv_multipart(
+                                flags=zmq.NOBLOCK,
+                            )
+                        except zmq.Again:
+                            break
+                        except Exception:
+                            if not self._running:
+                                break
+                            logger.exception(
+                                "DraftServer ZMQ drain error"
+                            )
+                            break
+                        if len(zmq_frames) < 2:
+                            continue
+                        identity = zmq_frames[0]
+                        metadata_frame = zmq_frames[1]
+                        tensor_frames = list(zmq_frames[2:])
+                        vs_id_zmq = identity.decode(
+                            "utf-8", errors="replace",
+                        )
+                        if vs_id_zmq != vs_id:
+                            # Peer-VS message — defer to the ZMQ poll
+                            # below by re-queuing it into the deferred
+                            # buffer.
+                            deferred_peers.append(
+                                (identity, metadata_frame, tensor_frames)
+                            )
+                            continue
+                        try:
+                            command = decode_command(metadata_frame)
+                        except Exception:
+                            logger.exception(
+                                "DraftServer failed to decode command from %s",
+                                vs_id_zmq,
+                            )
+                            continue
+                        self._current_tensor_frames = tensor_frames
+                        self._current_tensor_idx = 0
+                        await self._dispatch(vs_id_zmq, identity, command)
+                    # Dispatch peer-VS messages IMMEDIATELY here (before
+                    # this IPC SPECULATE) rather than deferring them.
+                    # Deferring to ``_deferred_messages`` starves peer
+                    # VSes under sustained IPC load: the serve loop
+                    # ``continue``s after every IPC handle and never
+                    # drains the deferred queue while any IPC peer has
+                    # pending work. A peer VS whose PREFILL was
+                    # deferred sits idle for hundreds of ms.
+                    #
+                    # Peer-VS PREFILL/FREE_SEQ/EXIT are safe to run
+                    # here — they don't share request state with this
+                    # VS. The earlier concern (peer EXIT →
+                    # ``reset_vs`` mid-SPECULATE) is now avoided by
+                    # running them BEFORE this SPECULATE's
+                    # ``cache.lookup``, so the cache state is
+                    # consistent by the time our handler reads it.
+                    for identity, metadata_frame, tensor_frames in deferred_peers:
+                        vs_id_zmq = identity.decode(
+                            "utf-8", errors="replace",
+                        )
+                        try:
+                            command = decode_command(metadata_frame)
+                        except Exception:
+                            logger.exception(
+                                "DraftServer failed to decode peer command from %s",
+                                vs_id_zmq,
+                            )
+                            continue
+                        self._current_tensor_frames = tensor_frames
+                        self._current_tensor_idx = 0
+                        await self._dispatch(vs_id_zmq, identity, command)
+                    # Also drain any older deferred messages that were
+                    # skipped by prior IPC-fast-path continues.
+                    while self._deferred_messages:
+                        msg = self._deferred_messages.pop(0)
+                        vs_id_msg, identity_msg, command_msg, frames_msg = msg
+                        self._current_tensor_frames = frames_msg
+                        self._current_tensor_idx = 0
+                        await self._dispatch(
+                            vs_id_msg, identity_msg, command_msg,
+                        )
+                    # Await any in-flight cache build (SPECULATE is
+                    # single-threaded with cache_build).
+                    await self._await_inflight_cache_build()
+                    await self._handle_ipc_speculation(
+                        vs_id, slot, batch_size, seq16,
+                    )
+                    self._check_evictions()
+                    continue
+
             # Drain any messages that the merge peek deferred to keep
             # per-VS FIFO ordering. These take priority over fresh ZMQ
             # recv so a deferred FREE_SEQ never overtakes the SPECULATE
@@ -453,7 +695,10 @@ class DraftServer(
             if self._deferred_messages:
                 msg = self._deferred_messages.pop(0)
             else:
-                poll_timeout_ms = 1000
+                # Use a short poll timeout when IPC peers are active so
+                # we return to poll doorbells quickly; longer timeout
+                # when only ZMQ is in play (idle-friendly).
+                poll_timeout_ms = 1 if self._ipc_peers else 1000
                 try:
                     events = dict(await poller.poll(timeout=poll_timeout_ms))
                 except Exception:
@@ -733,6 +978,11 @@ class DraftServer(
         elif cmd == "HEALTHCHECK":
             await self._handle_healthcheck(verify_server_id, identity)
 
+        elif cmd == "IPC_HANDSHAKE":
+            await self._handle_ipc_handshake(
+                verify_server_id, identity, command,
+            )
+
         else:
             logger.warning(
                 "DraftServer received unknown command '%s' from %s",
@@ -1007,6 +1257,277 @@ class DraftServer(
                 verify_server_id,
             )
 
+    async def _handle_ipc_handshake(
+        self,
+        verify_server_id: str,
+        identity: bytes,
+        command: DraftCommand,
+    ) -> None:
+        """Handle IPC_HANDSHAKE: open the verifier-shared GPU ring buffer
+        + doorbells and register the peer.
+
+        Once registered, subsequent SPECULATEs from this VS travel via the
+        IPC ring (polled in ``serve``); the base-class ZMQ path is used
+        only for PREFILL/FREE_SEQ/HEALTHCHECK/EXIT and for SPECULATE
+        fallback if the peer registration or handshake fails.
+
+        Replies with a raw msgpack-encoded ``IpcHandshakeAck`` (NOT wrapped
+        in ``DraftCommand``) — the connector's handshake code decodes it
+        directly.
+        """
+        import pickle
+
+        try:
+            handshake = decode(command.payload, IpcHandshake)
+            gpu_handles = pickle.loads(handshake.gpu_handles_pickle)
+            gpu_bufs: dict[str, torch.Tensor] = {}
+            for name, (rebuild, args) in gpu_handles.items():
+                gpu_bufs[name] = rebuild(*args)
+
+            peer = _DraftServerIpcPeer(
+                verify_server_id=verify_server_id,
+                shm_path=handshake.shm_path,
+                max_batch=handshake.max_batch,
+                K=handshake.K,
+                n_slots=handshake.n_slots,
+                gpu_bufs=gpu_bufs,
+            )
+            # If a previous IPC session existed for this VS (e.g. after a
+            # reconnect), close the stale peer first.
+            existing = self._ipc_peers.pop(verify_server_id, None)
+            if existing is not None:
+                existing.close()
+            self._ipc_peers[verify_server_id] = peer
+            logger.info(
+                "DraftServer registered IPC peer %s: max_batch=%d K=%d "
+                "n_slots=%d target_device=%s",
+                verify_server_id, handshake.max_batch, handshake.K,
+                handshake.n_slots, peer.target_device,
+            )
+            ack = IpcHandshakeAck(ok=True)
+        except Exception as e:
+            logger.exception(
+                "DraftServer IPC_HANDSHAKE failed for %s", verify_server_id,
+            )
+            ack = IpcHandshakeAck(ok=False, error=repr(e))
+
+        try:
+            await self._socket.send_multipart([identity, encode(ack)])
+        except Exception:
+            logger.exception(
+                "DraftServer failed to send IPC_HANDSHAKE ack to %s",
+                verify_server_id,
+            )
+
+    # ------------------------------------------------------------------
+    # IPC SPECULATE poll path (single-VS only for now — multi-VS merge
+    # deferred to a follow-up).
+    # ------------------------------------------------------------------
+
+    def _poll_ipc_speculates(
+        self,
+    ) -> tuple[str, int, int, int] | None:
+        """Scan all IPC peers for a pending SPECULATE. Returns
+        ``(verify_server_id, slot, batch_size, seq16)`` for the first
+        pending request found, or ``None`` if none is ready.
+
+        Called from ``serve()`` each tick. Each peer does one D2H of
+        the whole doorbell vector, then compares against ``last_seen``
+        entirely on CPU.
+
+        Poll order rotates across peers so no VS gets starved: dict
+        iteration is insertion-ordered, and always picking the first
+        pending under sustained multi-VS load would starve the 3rd+ VS
+        (observed as 600-1200 ms SPECULATE latency).
+        """
+        vs_ids = list(self._ipc_peers.keys())
+        if not vs_ids:
+            return None
+        n = len(vs_ids)
+        # ``_ipc_poll_cursor`` advances each time we successfully
+        # service a peer, so the NEXT tick starts at the peer AFTER
+        # the one we just served — classic round-robin.
+        start = self._ipc_poll_cursor % n
+        for i in range(n):
+            vs_id = vs_ids[(start + i) % n]
+            peer = self._ipc_peers[vs_id]
+            dbell_cpu = peer.poll_all_reqs()
+            values = dbell_cpu.tolist()
+            for slot in range(peer.n_slots):
+                encoded = values[slot]
+                if encoded == peer.last_seen[slot] or encoded == 0:
+                    continue
+                if encoded < 0:
+                    logger.info(
+                        "IPC peer %s signalled shutdown on slot %d",
+                        vs_id, slot,
+                    )
+                    peer.last_seen[slot] = encoded
+                    continue
+                peer.last_seen[slot] = encoded
+                batch_size = (encoded >> 16) & 0xFFFF
+                seq16 = encoded & 0xFFFF
+                self._ipc_poll_cursor = (start + i + 1) % n
+                return (vs_id, slot, batch_size, seq16)
+        return None
+
+    async def _handle_ipc_speculation(
+        self,
+        verify_server_id: str,
+        slot: int,
+        batch_size: int,
+        seq16: int,
+    ) -> None:
+        """Service a SPECULATE that arrived via the IPC ring.
+
+        Loads tensors out of the peer's shared ring, dispatches to the
+        existing ``_handle_speculation_inner`` (same code path as ZMQ,
+        via the ``preloaded_tensors`` shortcut), copies the response
+        tensors into the ring, and bumps the response doorbell.
+        Cache_build is scheduled the same way as the ZMQ path.
+        """
+        peer = self._ipc_peers.get(verify_server_id)
+        if peer is None:
+            return
+
+        # Track VS activity so the eviction timer doesn't fire.
+        self._verify_server_last_seen[verify_server_id] = time.monotonic()
+
+        buf = peer.gpu_bufs
+        B = batch_size
+        try:
+            # Fast-path seq_ids remap using the side stream in both
+            # directions:
+            #  1. D2H: read raw ring seq_ids into pinned CPU buffer
+            #     (side stream — doesn't wait for cache_build kernels
+            #     on the default stream).
+            #  2. CPU remap: ext_id → internal_id via mapping dict.
+            #  3. H2D: pinned CPU → GPU staging → slice (side stream —
+            #     same non-blocking benefit).
+            # Do both D2Hs (seq_ids, k_accepted) on the side stream at
+            # once so we only synchronize once. Both feed the inner
+            # handler as preloaded CPU lists to skip its own
+            # ``.tolist()`` calls.
+            seq_ids_ring = buf["req_seq_ids"][slot, :B]
+            k_accepted_ring = buf["req_k_accepted"][slot, :B]
+            seq_ids_cpu = peer._seq_ids_cpu[:B]
+            k_accepted_cpu = peer._k_accepted_cpu[:B]
+            with torch.cuda.stream(peer._poll_stream):
+                seq_ids_cpu.copy_(seq_ids_ring, non_blocking=True)
+                k_accepted_cpu.copy_(k_accepted_ring, non_blocking=True)
+            peer._poll_stream.synchronize()
+            # Remap on CPU. Keep the Python lists around too so the
+            # inner handler can skip its own ``.tolist()`` calls.
+            ext_list = seq_ids_cpu.tolist()
+            k_accepted_list = k_accepted_cpu.tolist()
+            internal_ids: list[int] = []
+            remap_view = peer._remap_ids_cpu[:B]
+            for i, ext in enumerate(ext_list):
+                mapped = self._map_seq_id(verify_server_id, int(ext))
+                internal_ids.append(mapped)
+                remap_view[i] = mapped
+            # H2D on the side stream — pinned source, non_blocking OK.
+            seq_ids = torch.empty(
+                B, dtype=torch.int64, device=self.device,
+            )
+            with torch.cuda.stream(peer._poll_stream):
+                seq_ids.copy_(remap_view, non_blocking=True)
+            peer._poll_stream.synchronize()
+
+            k_accepted = buf["req_k_accepted"][slot, :B].to(
+                device=self.device, non_blocking=True, copy=True,
+            )
+            bonus_tokens = buf["req_bonus_tokens"][slot, :B].to(
+                device=self.device, non_blocking=True, copy=True,
+            )
+            temperatures = buf["req_temperatures"][slot, :B].to(
+                device=self.device, non_blocking=True, copy=True,
+            )
+
+            # Synthesize a VerificationOutcome for the inner handler.
+            # The refs are unused when preloaded_tensors is provided.
+            outcome = VerificationOutcome(
+                verify_server_id=verify_server_id,
+                batch_size=B,
+                seq_ids_ref=self._make_tensor_ref(seq_ids),
+                k_accepted_ref=self._make_tensor_ref(k_accepted),
+                bonus_tokens_ref=self._make_tensor_ref(bonus_tokens),
+                temperatures_ref=self._make_tensor_ref(temperatures),
+                needs_logits=False,
+            )
+
+            # Reuse the ZMQ inner handler wholesale — same cache lookup,
+            # miss-fill, pending_swap plumbing, _last_* stashing, etc.
+            # Passing ``preloaded_seq_ids_list`` lets the inner handler
+            # skip its own ``seq_ids.tolist()`` sync, which otherwise
+            # stalls ~3 ms on the default stream behind cache_build.
+            result = await self._handle_speculation_inner(
+                verify_server_id,
+                identity=b"",  # unused on IPC path
+                outcome=outcome,
+                preloaded_tensors=(
+                    seq_ids, k_accepted, bonus_tokens, temperatures,
+                ),
+                preloaded_seq_ids_list=internal_ids,
+                preloaded_k_accepted_list=k_accepted_list,
+            )
+            if result is None:
+                # Inner returned early. Send zeros so the verifier
+                # doesn't hang.
+                buf["resp_cache_hits"][slot, :B].zero_()
+                buf["resp_draft_tokens"][slot, :B].zero_()
+                peer.set_resp(slot, seq16)
+                return
+
+            cache_hits, draft_tokens, _draft_logits, _needs_logits = result
+
+            # ---- Write response back into the ring ----
+            # cache_hits/draft_tokens live on the DRAFTER GPU; resp_*
+            # live on the VERIFIER GPU via IPC. Cross-device copy_() is
+            # queued on the source (drafter) default stream.
+            #
+            # The doorbell write (set_resp -> fill_) is queued on the
+            # SAME drafter default stream AFTER the copies, so on the
+            # verifier side the doorbell can only become visible once
+            # the ring writes have committed. No CPU sync needed.
+            buf["resp_cache_hits"][slot, :B].copy_(
+                cache_hits.to(torch.int64), non_blocking=True,
+            )
+            buf["resp_draft_tokens"][slot, :B].copy_(
+                draft_tokens, non_blocking=True,
+            )
+            peer.set_resp(slot, seq16)
+
+            # Schedule cache_build for the next round (same as ZMQ).
+            runner = self.draft_model_runner
+            if runner is not None and self._last_spec_seq_ids is not None:
+                try:
+                    self._inflight_cache_build = asyncio.create_task(
+                        self._run_cache_build(
+                            B, self._last_spec_seq_ids, verify_server_id,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "cache_build scheduling failed on IPC path",
+                    )
+
+            self.metrics.draft_speculate_total.inc()
+
+        except Exception:
+            logger.exception(
+                "DraftServer IPC speculation failed for %s slot %d",
+                verify_server_id, slot,
+            )
+            try:
+                buf["resp_cache_hits"][slot, :B].zero_()
+                buf["resp_draft_tokens"][slot, :B].zero_()
+                peer.set_resp(slot, seq16)
+            except Exception:
+                logger.exception(
+                    "DraftServer IPC fallback response failed",
+                )
+
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
@@ -1025,6 +1546,9 @@ class DraftServer(
             except Exception:
                 pass
             self._ctx = None
+        for peer in self._ipc_peers.values():
+            peer.close()
+        self._ipc_peers.clear()
         self._request_state.clear()
         self._verify_servers.clear()
         self._verify_server_last_seen.clear()

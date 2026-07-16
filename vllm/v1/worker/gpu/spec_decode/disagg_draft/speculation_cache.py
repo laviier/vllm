@@ -138,6 +138,23 @@ class SpeculationCache:
         self._total_lookups = 0
         self._total_hits = 0
 
+        # Pinned CPU staging + GPU staging for ``get_hit_block_tables``.
+        # Used to avoid ``owners.tolist() + hit_indices.tolist()`` host
+        # syncs, which stall behind cache_build kernels on the default
+        # stream when the SPECULATE handler is called concurrently.
+        self._vs_start_cpu_pin = torch.zeros(
+            max_verify_servers, dtype=torch.int64, pin_memory=True,
+        )
+        self._vs_offset_cpu_pin = torch.zeros(
+            max_verify_servers, dtype=torch.int64, pin_memory=True,
+        )
+        self._vs_start_gpu = torch.zeros(
+            max_verify_servers, dtype=torch.int64, device=device,
+        )
+        self._vs_offset_gpu = torch.zeros(
+            max_verify_servers, dtype=torch.int64, device=device,
+        )
+
     @property
     def hit_rate(self) -> float:
         """Running cache hit rate."""
@@ -471,50 +488,65 @@ class SpeculationCache:
         match = eq.all(dim=2)  # [B, N]
         cache_hits = match.any(dim=1)  # [B]
 
-        self._total_hits += int(cache_hits.sum().item())
+        # NOTE: skip cache_hits.sum().item() here — it forces a CPU sync
+        # on the default stream, which in the IPC-early-dispatch path
+        # stalls this handler behind cache_build kernels from the prior
+        # round. Metrics are accumulated on the caller side via
+        # ``_accumulate_hit_metrics``, which lazily .item()-s a GPU-side
+        # running sum every N rounds instead.
 
-        # Extract matched entries
-        draft_tokens_out = torch.zeros(
-            B, self.K, dtype=torch.int64, device=self.device
+        # Extract matched entries WITHOUT boolean-mask indexing.
+        # Boolean-mask indexing (``x[bool_mask]``) is a synchronizing op
+        # in PyTorch: the output shape depends on how many True elements
+        # the mask has, so an ``_local_scalar_dense`` fires under the
+        # hood. On the IPC-early-dispatch path that sync stalls ~3 ms
+        # behind the prior round's cache_build kernels.
+        #
+        # Use ``torch.where`` + full-index gathers instead:
+        #   - ``match_idx`` is safe to use even on miss rows because
+        #     ``argmax`` returns 0 (or any valid index) on all-False
+        #     rows; we ignore those values via the mask in ``where``.
+        #   - Gather every row from ``self.tokens[match_idx]`` (shape
+        #     [B, K]) unconditionally, then blend with zeros using
+        #     ``where(cache_hits, gathered, zeros)``.
+        match_idx = match.float().argmax(dim=1)  # [B]
+        self._last_match_idx = match_idx
+        hit_mask = cache_hits
+        hit_mask_kt = hit_mask.unsqueeze(-1).expand(-1, self.K)  # [B, K]
+
+        gathered_tokens = self.tokens[match_idx]  # [B, K]
+        draft_tokens_out = torch.where(
+            hit_mask_kt,
+            gathered_tokens,
+            torch.zeros_like(gathered_tokens),
         )
-        draft_logits_out = None
-        hidden_states_out = None
-        # match_idx for block table swapping (stored even if no logits)
-        self._last_match_idx = None
 
-        if cache_hits.any():
-            match_idx = match.float().argmax(dim=1)  # [B]
-            hit_mask = cache_hits
-            self._last_match_idx = match_idx
+        draft_logits_out: torch.Tensor | None = None
+        if self._logits is not None and self._logits_allocated >= N:
+            hit_mask_ktv = hit_mask.view(B, 1, 1).expand(
+                -1, self.K, self.vocab_size,
+            )
+            gathered_logits = self._logits[match_idx]  # [B, K, V]
+            draft_logits_out = torch.where(
+                hit_mask_ktv,
+                gathered_logits,
+                torch.zeros_like(gathered_logits),
+            )
 
-            draft_tokens_out[hit_mask] = self.tokens[match_idx[hit_mask]]
-
-            if self._logits is not None and self._logits_allocated >= N:
-                draft_logits_out = torch.zeros(
-                    B,
-                    self.K,
-                    self.vocab_size,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                draft_logits_out[hit_mask] = self._logits[match_idx[hit_mask]]
-
-            # Return cached hidden states for EAGLE/EAGLE3/MTP methods
-            if self._hidden_states is not None:
-                hidden_states_out = torch.zeros(
-                    B,
-                    self.hidden_size,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                hidden_states_out[hit_mask] = (
-                    self._hidden_states[match_idx[hit_mask]]
-                )
+        hidden_states_out: torch.Tensor | None = None
+        if self._hidden_states is not None:
+            hit_mask_h = hit_mask.unsqueeze(-1).expand(-1, self.hidden_size)
+            gathered_hidden = self._hidden_states[match_idx]  # [B, H]
+            hidden_states_out = torch.where(
+                hit_mask_h,
+                gathered_hidden,
+                torch.zeros_like(gathered_hidden),
+            )
 
         return draft_tokens_out, draft_logits_out, cache_hits, hidden_states_out
 
     def get_hit_block_tables(
-        self, hit_mask: torch.Tensor
+        self, hit_mask: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Get branch block tables and prefix_lens for cache hits.
 
@@ -522,6 +554,13 @@ class SpeculationCache:
         ``self._owners``. All active VSes share one ``DraftModelRunner``
         so block-table column count M is identical across VSes;
         concat-and-index works safely.
+
+        Must be called SYNCHRONOUSLY within the same round as the
+        ``lookup()`` that produced ``hit_mask``. Deferring it — e.g.
+        stashing hit_mask + match_idx and reading later — is unsafe:
+        a peer VS's ``reset_vs`` / ``drop_entries_by_seq_ids`` between
+        the lookup and this call can compact the cache and silently
+        invalidate ``self._last_match_idx``.
 
         Args:
             hit_mask: [B] — boolean mask from lookup().
@@ -568,19 +607,38 @@ class SpeculationCache:
         flat_tables = torch.cat(table_list, dim=0)
         flat_prefix = torch.cat(prefix_list, dim=0)
 
-        # For each hit: local_offset = global_idx - vs_offsets[owner_vs],
-        #               flat_idx = vs_start[owner_vs] + local_offset.
-        # Compute on CPU (num_hits is small, typically <= B_active).
-        owners_cpu = owners.tolist()
-        hit_idx_cpu = hit_indices.tolist()
-        flat_idx_list = []
-        for owner_small, global_idx in zip(owners_cpu, hit_idx_cpu):
-            vs_id = self._small_id_to_vs[owner_small]
-            local_offset = global_idx - self._vs_offsets[vs_id]
-            flat_idx_list.append(vs_start[vs_id] + local_offset)
-        flat_idx = torch.tensor(
-            flat_idx_list, dtype=torch.int64, device=hit_indices.device,
-        )
+        # Vectorized on GPU. Reuse pre-allocated pinned+GPU staging so
+        # the per-small_id lookup tensors can be updated cheaply each
+        # call. Previous ``owners.tolist() + hit_indices.tolist()``
+        # host syncs stalled ~3-5 ms behind cache_build kernels on the
+        # IPC-early-dispatch path.
+        n_small = len(self._small_id_to_vs)
+        start_pin = self._vs_start_cpu_pin[:n_small]
+        offset_pin = self._vs_offset_cpu_pin[:n_small]
+        start_gpu = self._vs_start_gpu[:n_small]
+        offset_gpu = self._vs_offset_gpu[:n_small]
+
+        # Fill CPU-side pinned buffers with current per-small_id starts
+        # / offsets. Cheap: n_small ≤ max_verify_servers (a few).
+        start_pin.zero_()
+        offset_pin.zero_()
+        for small in range(n_small):
+            vs_id = self._small_id_to_vs[small]
+            if vs_id in vs_start:
+                start_pin[small] = vs_start[vs_id]
+            if vs_id in self._vs_offsets:
+                offset_pin[small] = self._vs_offsets[vs_id]
+        # Pinned → GPU with non_blocking; doesn't serialize with the
+        # default stream because the source is pinned.
+        start_gpu.copy_(start_pin, non_blocking=True)
+        offset_gpu.copy_(offset_pin, non_blocking=True)
+
+        # owners is [num_hits] of small_ids (int32). Gather per-hit
+        # starts / offsets, then compute flat indices in one op.
+        owners_i64 = owners.to(torch.int64)
+        per_hit_start = start_gpu[owners_i64]              # [num_hits]
+        per_hit_offset = offset_gpu[owners_i64]            # [num_hits]
+        flat_idx = per_hit_start + (hit_indices - per_hit_offset)
 
         return flat_tables[flat_idx], flat_prefix[flat_idx]
 

@@ -4707,6 +4707,21 @@ class GPUModelRunner(
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        # Path C: fire disagg SPECULATE BEFORE bookkeeping so the
+        # drafter's compute overlaps with the target-forward-tail wait.
+        # ``_disagg_propose_drafts_early`` uses GPU-native num_sampled /
+        # last_sampled derived from sampler_output.sampled_token_ids —
+        # the same tensor bookkeeping consumes — so we don't have to
+        # wait for valid_sampled_token_ids to exist. If the speculator
+        # isn't ready or the connector fell back to ZMQ,
+        # ``_early`` returns None and ``_await`` runs the original
+        # blocking propose after bookkeeping.
+        disagg_early_ctx = None
+        if spec_config is not None and spec_config.use_disagg():
+            disagg_early_ctx = self._disagg_propose_drafts_early(
+                sampler_output,
+            )
+
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4744,11 +4759,13 @@ class GPUModelRunner(
                 )
                 self.drafter.dummy_run(num_tokens=1)
 
-        # Disaggregated speculative decoding: draft tokens come from a
-        # remote draft server via ZMQ. Fetched after bookkeeping so
-        # valid_sampled_token_ids is finalised.
         if spec_config is not None and spec_config.use_disagg():
-            self._disagg_propose_drafts(valid_sampled_token_ids)
+            # Await the SPECULATE reply (kernel-queued from _early) OR
+            # run the original blocking propose if _early declined
+            # (returns None).
+            self._disagg_propose_drafts_await(
+                disagg_early_ctx, valid_sampled_token_ids,
+            )
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -4878,6 +4895,172 @@ class GPUModelRunner(
             self.input_batch.num_tokens_no_spec[i] = pos + 1
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
+    # ------------------------------------------------------------------
+    # Path C: split-dispatch pair. ``_disagg_propose_drafts_early`` fires
+    # SPECULATE from GPU-derived num_sampled/last_sampled BEFORE
+    # bookkeeping so the drafter's compute overlaps with the target
+    # forward tail. ``_disagg_propose_drafts_await`` waits for the reply
+    # AFTER bookkeeping and stitches into ``self._draft_token_ids``.
+    #
+    # If the speculator isn't ready (proxy not initialized, non-rank-0
+    # TP, drafter fallen back to ZMQ), ``_early`` returns None and
+    # ``_await`` degrades to the original blocking ``_disagg_propose_drafts``
+    # (which uses the CPU list-of-lists ``valid_sampled_token_ids``).
+    # ------------------------------------------------------------------
+
+    def _disagg_propose_drafts_early(
+        self, sampler_output: SamplerOutput,
+    ) -> Any:
+        """Fire SPECULATE using GPU-native num_sampled/last_sampled
+        derived from ``sampler_output.sampled_token_ids`` — the same
+        source that ``_bookkeeping_sync`` will later use to build
+        ``valid_sampled_token_ids``. Returns a context for _await, or
+        None on error / non-rank-0 / no active speculator."""
+        num_reqs = self.input_batch.num_reqs
+
+        # Lazy speculator init — identical to _disagg_propose_drafts()
+        if not hasattr(self, "_disagg_speculator"):
+            from vllm.distributed.parallel_state import get_tp_group
+            from vllm.v1.worker.gpu.spec_decode import init_speculator
+            tp_rank = get_tp_group().rank_in_group
+            self._disagg_tp_rank = tp_rank
+            self._disagg_speculator = None
+            if tp_rank == 0:
+                self._disagg_speculator = init_speculator(
+                    self.vllm_config, self.device,
+                )
+
+        speculator = self._disagg_speculator
+        if speculator is None or not speculator.is_connected:
+            return None
+
+        # Only the split fast-path exists on the disagg speculator proxy;
+        # other speculator types don't provide propose_dispatch.
+        if not hasattr(speculator, "propose_dispatch"):
+            return None
+
+        # Cache prompt tokens for any new requests (same as the sync
+        # path). Cheap CPU-only bookkeeping.
+        for rid in self.input_batch.req_ids:
+            if rid in speculator._disagg_prefilled_reqs:
+                continue
+            if rid in speculator._pending_prompt_tokens:
+                continue
+            req = self.requests.get(rid)
+            if req is None:
+                continue
+            n_prompt = req.num_prompt_tokens
+            req_idx = self.input_batch.req_id_to_index[rid]
+            prompt_ids = self.input_batch.token_ids_cpu[
+                req_idx, :n_prompt,
+            ].tolist()
+            speculator.cache_new_request_tokens(rid, prompt_ids)
+
+        # Build GPU-native num_sampled / last_sampled from the sampler
+        # output tensor. sampled_token_ids is [num_reqs, max_gen_len]
+        # int32 with PLACEHOLDER_TOKEN_ID (-1) marking rejected slots.
+        # Valid tokens are also OOB-filtered (< vocab_size) to match
+        # RejectionSampler.parse_output's valid_mask.
+        #
+        # Discarded rows (prompt still processing) must be treated as
+        # having num_sampled=0 to match the old code path, which sets
+        # valid_sampled_token_ids[i] = [] for those rows.
+        sti = sampler_output.sampled_token_ids
+        vocab_size = self.input_batch.vocab_size
+        valid_mask = (sti >= 0) & (sti < vocab_size)
+        num_sampled_t = valid_mask.sum(dim=1).to(torch.int64)
+
+        # Zero out num_sampled for discarded rows. discard_request_mask
+        # is a small numpy bool array kept in sync with GPU; H2D of a
+        # tiny slice is cheap. Skip if no discarded rows this iter (the
+        # common case).
+        discard_np = self.discard_request_mask.np[:num_reqs]
+        if discard_np.any():
+            discard_gpu = torch.from_numpy(discard_np.copy()).to(
+                self.device, dtype=torch.bool, non_blocking=True,
+            )
+            num_sampled_t = torch.where(
+                discard_gpu,
+                torch.zeros_like(num_sampled_t),
+                num_sampled_t,
+            )
+
+        # Replace PLACEHOLDER_TOKEN_ID (-1) entries with 0 to match the
+        # old bookkeeping path, which pads valid_sampled_token_ids[i]
+        # with zeros. The speculator picks last_sampled[i, num_sampled-1]
+        # as the bonus token; for rows where num_sampled=0 we'd otherwise
+        # pick sti[i, 0] which may hold -1 for discarded/all-rejected
+        # rows, poisoning the drafter's cache with an invalid seed
+        # token (observed at c=8: AL 2.43 → 2.30).
+        last_sampled_t = torch.where(
+            sti >= 0, sti, torch.zeros_like(sti),
+        )
+
+        # Temperature is 1.0 for all — matches the current fast-path
+        # behavior (see the original _disagg_propose_drafts).
+        _temperature = torch.ones(num_reqs, device=self.device)
+
+        try:
+            ctx = speculator.propose_dispatch(
+                input_batch=self.input_batch,
+                num_sampled=num_sampled_t,
+                last_sampled=last_sampled_t,
+                temperature=_temperature,
+            )
+        except Exception:
+            logger.exception("disagg propose_dispatch failed")
+            return None
+
+        if ctx is None:
+            return None
+        return {"speculator": speculator, "ctx": ctx, "num_reqs": num_reqs}
+
+    def _disagg_propose_drafts_await(
+        self,
+        early_ctx: Any,
+        valid_sampled_token_ids,
+    ) -> None:
+        """Wait for the SPECULATE reply (fast path) and stitch into
+        ``self._draft_token_ids``. On fast-path fallback, invokes the
+        original synchronous ``_disagg_propose_drafts`` so behavior
+        is identical to pre-Path-C."""
+        num_reqs = self.input_batch.num_reqs
+        if early_ctx is None:
+            # Slow path — run the original synchronous propose.
+            return self._disagg_propose_drafts(valid_sampled_token_ids)
+
+        speculator = early_ctx["speculator"]
+        ctx = early_ctx["ctx"]
+
+        try:
+            draft_tensor = speculator.propose_await(ctx, num_reqs)
+            self._draft_token_ids = draft_tensor.tolist()
+        except Exception:
+            logger.exception(
+                "disagg propose_await failed; falling back to zero drafts",
+            )
+            self._draft_token_ids = [
+                [0] * self.num_spec_tokens for _ in range(num_reqs)
+            ]
+
+        # TP broadcast (same as sync path)
+        if self.parallel_config.tensor_parallel_size > 1:
+            with record_function_or_nullcontext("disagg_dpd: tp_broadcast"):
+                from vllm.distributed.parallel_state import get_tp_group
+                tp_group = get_tp_group()
+                draft_buf = torch.tensor(
+                    self._draft_token_ids,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(
+                    draft_buf, src=tp_group.first_rank,
+                    group=tp_group.device_group,
+                )
+                self._draft_token_ids = draft_buf.tolist()
+
+        self._draft_token_req_ids = self.input_batch.req_ids.copy()
+
     def _disagg_propose_drafts(
         self,
         valid_sampled_token_ids,
@@ -4927,30 +5110,49 @@ class GPUModelRunner(
             # returned by _bookkeeping_sync. valid_sampled_token_ids[i] is
             # [accepted_0, ..., bonus_token] so len-1 is k_accepted and
             # the last element is the bonus token.
-            max_sampled = (
-                max(len(ids) for ids in valid_sampled_token_ids)
-                if valid_sampled_token_ids else 1
-            )
-            padded = [
-                ids + [0] * (max_sampled - len(ids))
-                for ids in valid_sampled_token_ids
-            ]
-            num_sampled_t = torch.tensor(
-                [len(ids) for ids in valid_sampled_token_ids],
-                dtype=torch.int64, device=self.device,
-            )
-            last_sampled_t = torch.tensor(
-                padded, dtype=torch.int64, device=self.device,
-            ).unsqueeze(-1)
+            with record_function_or_nullcontext(
+                "disagg_dpd: build_num_sampled_padded"
+            ):
+                max_sampled = (
+                    max(len(ids) for ids in valid_sampled_token_ids)
+                    if valid_sampled_token_ids else 1
+                )
+                padded = [
+                    ids + [0] * (max_sampled - len(ids))
+                    for ids in valid_sampled_token_ids
+                ]
+            with record_function_or_nullcontext(
+                "disagg_dpd: h2d_num_sampled_t"
+            ):
+                num_sampled_t = torch.tensor(
+                    [len(ids) for ids in valid_sampled_token_ids],
+                    dtype=torch.int64, device=self.device,
+                )
+            with record_function_or_nullcontext(
+                "disagg_dpd: h2d_last_sampled_t"
+            ):
+                last_sampled_t = torch.tensor(
+                    padded, dtype=torch.int64, device=self.device,
+                ).unsqueeze(-1)
+            with record_function_or_nullcontext(
+                "disagg_dpd: h2d_temperature"
+            ):
+                _temperature = torch.ones(num_reqs, device=self.device)
 
             try:
-                draft_tensor = speculator.propose(
-                    input_batch=self.input_batch,
-                    num_sampled=num_sampled_t,
-                    last_sampled=last_sampled_t,
-                    temperature=torch.ones(num_reqs, device=self.device),
-                )
-                self._draft_token_ids = draft_tensor.tolist()
+                with record_function_or_nullcontext(
+                    "disagg_dpd: speculator.propose"
+                ):
+                    draft_tensor = speculator.propose(
+                        input_batch=self.input_batch,
+                        num_sampled=num_sampled_t,
+                        last_sampled=last_sampled_t,
+                        temperature=_temperature,
+                    )
+                with record_function_or_nullcontext(
+                    "disagg_dpd: draft_tensor.tolist"
+                ):
+                    self._draft_token_ids = draft_tensor.tolist()
             except Exception as e:
                 logger.warning(
                     "Disagg propose failed: %s. Returning zero drafts.", e,
@@ -4969,18 +5171,19 @@ class GPUModelRunner(
         # target forward pass writes these into input_ids, and TP
         # all-reduce requires identical inputs on every rank.
         if self.parallel_config.tensor_parallel_size > 1:
-            from vllm.distributed.parallel_state import get_tp_group
-            tp_group = get_tp_group()
-            draft_buf = torch.tensor(
-                self._draft_token_ids,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            torch.distributed.broadcast(
-                draft_buf, src=tp_group.first_rank,
-                group=tp_group.device_group,
-            )
-            self._draft_token_ids = draft_buf.tolist()
+            with record_function_or_nullcontext("disagg_dpd: tp_broadcast"):
+                from vllm.distributed.parallel_state import get_tp_group
+                tp_group = get_tp_group()
+                draft_buf = torch.tensor(
+                    self._draft_token_ids,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(
+                    draft_buf, src=tp_group.first_rank,
+                    group=tp_group.device_group,
+                )
+                self._draft_token_ids = draft_buf.tolist()
 
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 

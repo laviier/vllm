@@ -23,6 +23,7 @@ so the model runner can call it uniformly. Under the hood it:
 from __future__ import annotations
 
 import asyncio
+import time as _time
 from collections import defaultdict
 from typing import Any
 
@@ -118,6 +119,33 @@ class DisaggSpeculatorProxy:
             dtype=torch.int64,
             device=device,
         )
+
+        # Path C: pinned CPU staging buffers so the per-round H2Ds in
+        # ``_do_propose_dispatch`` don't have to serialize with the
+        # target-forward-tail sampler kernel on the default stream.
+        # Pageable H2D via ``torch.tensor(list, device=cuda)`` forces
+        # such serialization (measured 10 ms wait); pinned + non-blocking
+        # ``copy_`` does not.
+        self._active_idx_pinned_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, pin_memory=True,
+        )
+        self._seq_ids_pinned_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, pin_memory=True,
+        )
+        self._active_idx_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=device,
+        )
+        self._seq_ids_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=device,
+        )
+        # Per-server local-indices staging (used in dispatch to pick out
+        # a per-server slice of the batch). Same pinned pattern.
+        self._srv_idx_pinned_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, pin_memory=True,
+        )
+        self._srv_idx_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=device,
+        )
         self.draft_logits: torch.Tensor | None = None
         if self.speculative_config.rejection_sample_method == "probabilistic":
             self.draft_logits = torch.zeros(
@@ -180,11 +208,28 @@ class DisaggSpeculatorProxy:
     # ------------------------------------------------------------------
 
     def set_router(self, router: "DraftRouter") -> None:
+        from vllm.v1.spec_decode.draft_connector import CudaIpcDraftConnector
         from vllm.v1.spec_decode.draft_router import DraftRouter
 
         assert isinstance(router, DraftRouter)
         self.router = router
         self._nm_event_loop = asyncio.new_event_loop()
+
+        # Perform any deferred IPC handshakes on our newly-created loop
+        # so subsequent SPECULATEs can use the fast IPC path. Failure
+        # for a given connector logs and leaves it on the ZMQ fallback.
+        for i, connector in enumerate(router.connectors):
+            if isinstance(connector, CudaIpcDraftConnector):
+                try:
+                    self._nm_event_loop.run_until_complete(
+                        connector.async_establish_ipc()
+                    )
+                except Exception:
+                    logger.exception(
+                        "IPC handshake failed for connector %d; "
+                        "SPECULATE will use ZMQ fallback", i,
+                    )
+
         logger.info(
             "DisaggSpeculatorProxy: DraftRouter connected with %d server(s).",
             len(router.connectors),
@@ -243,6 +288,81 @@ class DisaggSpeculatorProxy:
     # ------------------------------------------------------------------
     # Propose (V1 runner signature — called from gpu_model_runner.py)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Split dispatch API (Path C)
+    #
+    # ``propose_dispatch`` runs steps 1-4 of ``_do_propose`` up through
+    # firing SPECULATE. ``propose_await`` waits for the SPECULATE reply
+    # and stitches draft tokens into ``self.draft_tokens``. Split so
+    # the model runner can overlap the drafter's compute with
+    # ``_bookkeeping_sync``'s target-forward-tail wait.
+    #
+    # The one-shot ``propose`` below still works — it just calls the
+    # dispatch + await pair back-to-back. Call sites that don't yet
+    # know about the split behave identically to before.
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def propose_dispatch(
+        self,
+        input_batch,
+        num_sampled: torch.Tensor,
+        last_sampled: torch.Tensor,
+        temperature: torch.Tensor,
+        **kwargs: Any,
+    ) -> Any:
+        """Fire SPECULATE early (kernel-queued + one CPU doorbell write).
+
+        Returns an opaque context to pass to ``propose_await``. If the
+        speculator isn't ready (non-rank-0 TP, no router, warmup, etc.)
+        returns None — the caller must handle this by returning zeros.
+        """
+        num_reqs = input_batch.num_reqs
+        if self._tp_rank != 0 or self.router is None:
+            return None
+        self._propose_count += 1
+        if (self.router.num_available_servers < len(self.router.connectors)
+                and self._propose_count
+                    % self._reconnect_check_interval == 0):
+            self._attempt_reconnect_unavailable_servers()
+        if self.router.num_available_servers == 0:
+            return None
+        if any(rid.startswith("_warmup_") or rid.startswith("_dummy_")
+               for rid in input_batch.req_ids):
+            return None
+
+        try:
+            return self._do_propose_dispatch(
+                input_batch, num_sampled, last_sampled, temperature,
+            )
+        except Exception:
+            logger.exception("propose_dispatch failed; awaiting will zero.")
+            return None
+
+    @torch.inference_mode()
+    def propose_await(
+        self,
+        ctx: Any,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """Wait for the SPECULATE reply, stitch tokens into
+        ``self.draft_tokens``, return the ``[num_reqs, K]`` slice.
+
+        If ``ctx`` is None (dispatch skipped or failed), returns zeros.
+        """
+        K = self.num_speculative_steps
+        if ctx is None:
+            return torch.zeros(
+                num_reqs, K, dtype=torch.int64, device=self.device,
+            )
+        try:
+            return self._do_propose_await(ctx, num_reqs)
+        except Exception:
+            logger.exception("propose_await failed; returning zeros.")
+            return torch.zeros(
+                num_reqs, K, dtype=torch.int64, device=self.device,
+            )
 
     @torch.inference_mode()
     def propose(
@@ -308,6 +428,7 @@ class DisaggSpeculatorProxy:
         last_sampled: torch.Tensor,
         temperature: torch.Tensor,
     ) -> torch.Tensor:
+        from torch.profiler import record_function
         num_reqs = input_batch.num_reqs
         K = self.num_speculative_steps
         req_ids = input_batch.req_ids
@@ -320,78 +441,84 @@ class DisaggSpeculatorProxy:
             )
 
         # Step 1: Send FREE_SEQ for requests that have just finished.
-        self._free_stale_requests(req_ids)
+        with record_function("propose_step1_free_stale"):
+            self._free_stale_requests(req_ids)
 
         # Step 2: Send PREFILL for new requests that just finished
         # their prompt processing.
-        new_req_ids = [
-            rid for i, rid in enumerate(req_ids)
-            if rid not in self._disagg_prefilled_reqs
-            and int(num_sampled[i].item()) > 0
-        ]
+        with record_function("propose_step2_check_prefill_needed"):
+            new_req_ids = [
+                rid for i, rid in enumerate(req_ids)
+                if rid not in self._disagg_prefilled_reqs
+                and int(num_sampled[i].item()) > 0
+            ]
         if new_req_ids:
-            self._prefill_new_requests(new_req_ids)
+            with record_function("propose_step2b_prefill_new"):
+                self._prefill_new_requests(new_req_ids)
 
         # Step 3: Build the verification outcome tensors over the subset
         # of requests that are prefilled and ready for decode.
-        active_req_indices = [
-            i for i, rid in enumerate(req_ids)
-            if rid in self._disagg_req_to_seq_id
-        ]
-        if not active_req_indices:
-            return torch.zeros(
-                num_reqs, K, dtype=torch.int64, device=self.device,
+        with record_function("propose_step3_build_outcome_tensors"):
+            active_req_indices = [
+                i for i, rid in enumerate(req_ids)
+                if rid in self._disagg_req_to_seq_id
+            ]
+            if not active_req_indices:
+                return torch.zeros(
+                    num_reqs, K, dtype=torch.int64, device=self.device,
+                )
+
+            active_req_ids = [req_ids[i] for i in active_req_indices]
+            active_idx = torch.tensor(
+                active_req_indices, dtype=torch.int64, device=self.device,
             )
+            seq_ids = torch.tensor(
+                [self._disagg_req_to_seq_id[rid] for rid in active_req_ids],
+                dtype=torch.int64, device=self.device,
+            )
+            k_accepted = (
+                num_sampled[active_idx] - 1
+            ).clamp(min=0).to(torch.int64)
 
-        active_req_ids = [req_ids[i] for i in active_req_indices]
-        active_idx = torch.tensor(
-            active_req_indices, dtype=torch.int64, device=self.device,
-        )
-        seq_ids = torch.tensor(
-            [self._disagg_req_to_seq_id[rid] for rid in active_req_ids],
-            dtype=torch.int64, device=self.device,
-        )
-        k_accepted = (
-            num_sampled[active_idx] - 1
-        ).clamp(min=0).to(torch.int64)
+            # last_sampled is [num_reqs, max_sampled, 1] or [num_reqs, 1];
+            # the bonus token is the last valid sample per request.
+            _ls = last_sampled[idx_mapping[active_idx]]
+            _ns = num_sampled[active_idx]
+            if _ls.dim() == 3:
+                last_idx = (_ns - 1).clamp(min=0).long()
+                bonus_tokens = _ls[
+                    torch.arange(_ls.shape[0], device=_ls.device),
+                    last_idx, 0,
+                ].to(torch.int64)
+            elif _ls.dim() == 2:
+                last_idx = (_ns - 1).clamp(min=0).long()
+                bonus_tokens = _ls[
+                    torch.arange(_ls.shape[0], device=_ls.device),
+                    last_idx,
+                ].to(torch.int64)
+            else:
+                bonus_tokens = _ls.squeeze(-1).to(torch.int64)
 
-        # last_sampled is [num_reqs, max_sampled, 1] or [num_reqs, 1];
-        # the bonus token is the last valid sample per request.
-        _ls = last_sampled[idx_mapping[active_idx]]
-        _ns = num_sampled[active_idx]
-        if _ls.dim() == 3:
-            last_idx = (_ns - 1).clamp(min=0).long()
-            bonus_tokens = _ls[
-                torch.arange(_ls.shape[0], device=_ls.device),
-                last_idx, 0,
-            ].to(torch.int64)
-        elif _ls.dim() == 2:
-            last_idx = (_ns - 1).clamp(min=0).long()
-            bonus_tokens = _ls[
-                torch.arange(_ls.shape[0], device=_ls.device),
-                last_idx,
-            ].to(torch.int64)
-        else:
-            bonus_tokens = _ls.squeeze(-1).to(torch.int64)
-
-        temps = temperature[idx_mapping[active_idx]].to(torch.float32)
+            temps = temperature[idx_mapping[active_idx]].to(torch.float32)
 
         # Step 4: Dispatch SPECULATE requests to the draft servers.
         import time as _time
         t0 = _time.perf_counter()
         B_active = len(active_req_indices)
-        draft_toks, draft_logits = self._dispatch_speculation(
-            active_req_ids=active_req_ids,
-            seq_ids=seq_ids,
-            k_accepted=k_accepted,
-            bonus_tokens=bonus_tokens,
-            temperatures=temps,
-            B_active=B_active,
-        )
+        with record_function("propose_step4_dispatch_speculation"):
+            draft_toks, draft_logits = self._dispatch_speculation(
+                active_req_ids=active_req_ids,
+                seq_ids=seq_ids,
+                k_accepted=k_accepted,
+                bonus_tokens=bonus_tokens,
+                temperatures=temps,
+                B_active=B_active,
+            )
         dt_ms = (_time.perf_counter() - t0) * 1000.0
 
-        tokens_requested = B_active * K
-        tokens_accepted = int(k_accepted.sum().item())
+        with record_function("propose_step5_metrics_sync"):
+            tokens_requested = B_active * K
+            tokens_accepted = int(k_accepted.sum().item())
         self._metrics.record_speculation(
             tokens_requested=tokens_requested,
             tokens_accepted=tokens_accepted,
@@ -508,6 +635,292 @@ class DisaggSpeculatorProxy:
 
         self._disagg_prefilled_reqs.update(new_req_ids)
 
+    def _do_propose_dispatch(
+        self,
+        input_batch,
+        num_sampled: torch.Tensor,
+        last_sampled: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> dict | None:
+        """Run steps 1-3 of _do_propose and fire SPECULATE early.
+
+        Returns a context dict for propose_await, or None if there's no
+        active work to do (empty batch after prefill filtering).
+        """
+        from torch.profiler import record_function
+        from vllm.v1.spec_decode.draft_connector import PendingSpeculation
+
+        num_reqs = input_batch.num_reqs
+        K = self.num_speculative_steps
+        req_ids = input_batch.req_ids
+        idx_mapping = getattr(input_batch, 'idx_mapping', None)
+        if idx_mapping is not None:
+            idx_mapping = idx_mapping[:num_reqs]
+        else:
+            idx_mapping = torch.arange(
+                num_reqs, dtype=torch.int64, device=self.device,
+            )
+
+        with record_function("propose_step1_free_stale"):
+            self._free_stale_requests(req_ids)
+
+        with record_function("propose_step2_check_prefill_needed"):
+            new_req_ids = [
+                rid for i, rid in enumerate(req_ids)
+                if rid not in self._disagg_prefilled_reqs
+                and int(num_sampled[i].item()) > 0
+            ]
+        if new_req_ids:
+            with record_function("propose_step2b_prefill_new"):
+                self._prefill_new_requests(new_req_ids)
+
+        with record_function("propose_step3_build_outcome_tensors"):
+            with record_function("propose_step3a_active_req_indices"):
+                active_req_indices = [
+                    i for i, rid in enumerate(req_ids)
+                    if rid in self._disagg_req_to_seq_id
+                ]
+                if not active_req_indices:
+                    return None
+                active_req_ids = [req_ids[i] for i in active_req_indices]
+
+            with record_function("propose_step3b_h2d_active_idx"):
+                # Fill pinned CPU staging, then async H2D. Non-blocking
+                # copies from pinned memory don't serialize with the
+                # default stream, so this call returns almost immediately
+                # while the target sampler kernel is still running.
+                n_active = len(active_req_indices)
+                # copy_ from Python list into pinned buffer is a plain
+                # memcpy (no CUDA involved).
+                self._active_idx_pinned_cpu[:n_active] = torch.as_tensor(
+                    active_req_indices, dtype=torch.int64,
+                )
+                self._seq_ids_pinned_cpu[:n_active] = torch.as_tensor(
+                    [
+                        self._disagg_req_to_seq_id[rid]
+                        for rid in active_req_ids
+                    ],
+                    dtype=torch.int64,
+                )
+                active_idx = self._active_idx_gpu[:n_active]
+                seq_ids = self._seq_ids_gpu[:n_active]
+                active_idx.copy_(
+                    self._active_idx_pinned_cpu[:n_active],
+                    non_blocking=True,
+                )
+                seq_ids.copy_(
+                    self._seq_ids_pinned_cpu[:n_active],
+                    non_blocking=True,
+                )
+
+            with record_function("propose_step3c_k_accepted"):
+                k_accepted = (
+                    num_sampled[active_idx] - 1
+                ).clamp(min=0).to(torch.int64)
+
+            with record_function("propose_step3d_bonus_tokens"):
+                _ls = last_sampled[idx_mapping[active_idx]]
+                _ns = num_sampled[active_idx]
+                if _ls.dim() == 3:
+                    last_idx = (_ns - 1).clamp(min=0).long()
+                    bonus_tokens = _ls[
+                        torch.arange(_ls.shape[0], device=_ls.device),
+                        last_idx, 0,
+                    ].to(torch.int64)
+                elif _ls.dim() == 2:
+                    last_idx = (_ns - 1).clamp(min=0).long()
+                    bonus_tokens = _ls[
+                        torch.arange(_ls.shape[0], device=_ls.device),
+                        last_idx,
+                    ].to(torch.int64)
+                else:
+                    bonus_tokens = _ls.squeeze(-1).to(torch.int64)
+
+            with record_function("propose_step3e_temps"):
+                temps = temperature[idx_mapping[active_idx]].to(torch.float32)
+
+        # Fire SPECULATE. Fast path: if every connector supports
+        # dispatch_speculation returning a real PendingSpeculation (i.e.
+        # CudaIpcDraftConnector with IPC ready), do the split. Otherwise
+        # we fall back to the base ZMQ path via send_and_recv (in the
+        # await step).
+        B_active = len(active_req_indices)
+        assert self.router is not None
+        needs_logits = self.draft_logits is not None
+
+        with record_function("propose_step4_dispatch_early"):
+            server_groups: dict[int, list[int]] = defaultdict(list)
+            for j, rid in enumerate(active_req_ids):
+                if rid in self.router.assignment:
+                    srv_idx = self.router.assignment[rid]
+                else:
+                    self.router.assign(rid)
+                    srv_idx = self.router.assignment[rid]
+                server_groups[srv_idx].append(j)
+
+            srv_order: list[int] = []
+            srv_local_indices: list[list[int]] = []
+            handles: list[PendingSpeculation] = []
+            single_server_fast_path = (
+                len(server_groups) == 1
+                and next(iter(server_groups.values())) ==
+                    list(range(B_active))
+            )
+            for srv_idx, local_indices in server_groups.items():
+                connector = self.router.connectors[srv_idx]
+                n = len(local_indices)
+                srv_order.append(srv_idx)
+                srv_local_indices.append(local_indices)
+
+                if single_server_fast_path:
+                    # All requests routed to the same server AND in
+                    # order — no need to build a GPU index tensor;
+                    # just pass the whole batch slice directly. Avoids
+                    # a pageable H2D that would serialize with the
+                    # sampler kernel on the default stream.
+                    handles.append(
+                        connector.dispatch_speculation(
+                            batch_size=n,
+                            seq_ids=seq_ids[:n],
+                            k_accepted=k_accepted[:n],
+                            bonus_tokens=bonus_tokens[:n],
+                            temperatures=temps[:n],
+                            needs_logits=needs_logits,
+                        )
+                    )
+                else:
+                    # Multi-server: build per-server index tensor via
+                    # pinned staging (same trick as step3b).
+                    self._srv_idx_pinned_cpu[:n] = torch.as_tensor(
+                        local_indices, dtype=torch.int64,
+                    )
+                    idx_t = self._srv_idx_gpu[:n]
+                    idx_t.copy_(
+                        self._srv_idx_pinned_cpu[:n], non_blocking=True,
+                    )
+                    handles.append(
+                        connector.dispatch_speculation(
+                            batch_size=n,
+                            seq_ids=seq_ids[idx_t],
+                            k_accepted=k_accepted[idx_t],
+                            bonus_tokens=bonus_tokens[idx_t],
+                            temperatures=temps[idx_t],
+                            needs_logits=needs_logits,
+                        )
+                    )
+
+        return {
+            "active_req_indices": active_req_indices,
+            "srv_order": srv_order,
+            "srv_local_indices": srv_local_indices,
+            "handles": handles,
+            "B_active": B_active,
+            "k_accepted": k_accepted,
+            "dispatch_t0": _time.perf_counter(),
+        }
+
+    def _do_propose_await(self, ctx: dict, num_reqs: int) -> torch.Tensor:
+        """Wait for dispatched SPECULATEs, stitch back into
+        ``self.draft_tokens``."""
+        from torch.profiler import record_function
+
+        K = self.num_speculative_steps
+        active_req_indices = ctx["active_req_indices"]
+        srv_order = ctx["srv_order"]
+        srv_local_indices = ctx["srv_local_indices"]
+        handles = ctx["handles"]
+        B_active = ctx["B_active"]
+        k_accepted = ctx["k_accepted"]
+        dispatch_t0 = ctx["dispatch_t0"]
+
+        assert self.router is not None
+
+        draft_toks_out = torch.zeros(
+            B_active, K, dtype=torch.int64, device=self.device,
+        )
+        draft_logits_out: torch.Tensor | None = None
+
+        async def _gather_awaits():
+            coros = [
+                self.router.connectors[srv_idx].await_speculation(h)
+                for srv_idx, h in zip(srv_order, handles)
+            ]
+            return await asyncio.gather(*coros, return_exceptions=True)
+
+        with record_function("propose_await_gather"):
+            results = self._run_async(_gather_awaits())
+
+        for srv_idx, local_indices, result in zip(
+            srv_order, srv_local_indices, results,
+        ):
+            if isinstance(result, ConnectionError):
+                logger.warning(
+                    "Draft server %d failed (%s); marking unavailable.",
+                    srv_idx, result,
+                )
+                self.router.handle_server_failure(srv_idx)
+                continue
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Draft server %d error: %s; affected requests "
+                    "get zero drafts.", srv_idx, result,
+                )
+                continue
+
+            _, srv_draft_toks, srv_draft_logits = result
+            for local_j, global_j in enumerate(local_indices):
+                if local_j < srv_draft_toks.shape[0]:
+                    draft_toks_out[global_j] = srv_draft_toks[local_j]
+            if srv_draft_logits is not None:
+                if draft_logits_out is None:
+                    draft_logits_out = torch.zeros(
+                        B_active, K, self.vocab_size,
+                        dtype=self.dtype, device=self.device,
+                    )
+                for local_j, global_j in enumerate(local_indices):
+                    if local_j < srv_draft_logits.shape[0]:
+                        K_actual = min(
+                            srv_draft_logits.shape[1],
+                            draft_logits_out.shape[1],
+                        )
+                        draft_logits_out[global_j, :K_actual] = (
+                            srv_draft_logits[local_j, :K_actual]
+                        )
+
+        dt_ms = (_time.perf_counter() - dispatch_t0) * 1000.0
+        tokens_requested = B_active * K
+        tokens_accepted = int(k_accepted.sum().item())
+        self._metrics.record_speculation(
+            tokens_requested=tokens_requested,
+            tokens_accepted=tokens_accepted,
+            latency_s=dt_ms / 1000.0,
+        )
+        if dt_ms > self._latency_warn_ms:
+            logger.warning(
+                "Disagg SPECULATE latency %.2fms exceeds threshold "
+                "%.2fms (B_active=%d, K=%d)",
+                dt_ms, self._latency_warn_ms, B_active, K,
+            )
+
+        # Stitch into self.draft_tokens
+        self.draft_tokens[:num_reqs].zero_()
+        if self.draft_logits is not None and draft_logits_out is not None:
+            K_actual = min(
+                draft_logits_out.shape[1], self.draft_logits.shape[1],
+            )
+            self.draft_logits[:num_reqs].zero_()
+            for j, orig_i in enumerate(active_req_indices):
+                self.draft_logits[orig_i, :K_actual] = (
+                    draft_logits_out[j, :K_actual]
+                )
+
+        target_vocab = self.vllm_config.model_config.get_vocab_size()
+        draft_toks_out = draft_toks_out.clamp(min=0, max=target_vocab - 1)
+        for j, orig_i in enumerate(active_req_indices):
+            self.draft_tokens[orig_i] = draft_toks_out[j]
+
+        return self.draft_tokens[:num_reqs]
+
     def _dispatch_speculation(
         self,
         active_req_ids: list[str],
@@ -519,45 +932,47 @@ class DisaggSpeculatorProxy:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Group requests by draft server, send per-server SPECULATEs
         concurrently, stitch results back to active-batch order."""
+        from torch.profiler import record_function
         assert self.router is not None
         K = self.num_speculative_steps
 
-        server_groups: dict[int, list[int]] = defaultdict(list)
-        for j, rid in enumerate(active_req_ids):
-            if rid in self.router.assignment:
-                srv_idx = self.router.assignment[rid]
-            else:
-                self.router.assign(rid)
-                srv_idx = self.router.assignment[rid]
-            server_groups[srv_idx].append(j)
+        with record_function("disp_group_by_server"):
+            server_groups: dict[int, list[int]] = defaultdict(list)
+            for j, rid in enumerate(active_req_ids):
+                if rid in self.router.assignment:
+                    srv_idx = self.router.assignment[rid]
+                else:
+                    self.router.assign(rid)
+                    srv_idx = self.router.assignment[rid]
+                server_groups[srv_idx].append(j)
 
-        draft_toks_out = torch.zeros(
-            B_active, K, dtype=torch.int64, device=self.device,
-        )
-        draft_logits_out: torch.Tensor | None = None
-        needs_logits = self.draft_logits is not None
-
-        srv_order: list[int] = []
-        srv_local_indices: list[list[int]] = []
-        coros: list[Any] = []
-        for srv_idx, local_indices in server_groups.items():
-            connector = self.router.connectors[srv_idx]
-            n = len(local_indices)
-            idx_t = torch.tensor(
-                local_indices, dtype=torch.int64, device=self.device,
+            draft_toks_out = torch.zeros(
+                B_active, K, dtype=torch.int64, device=self.device,
             )
-            srv_order.append(srv_idx)
-            srv_local_indices.append(local_indices)
-            coros.append(
-                connector.send_and_recv_speculation(
-                    batch_size=n,
-                    seq_ids=seq_ids[idx_t],
-                    k_accepted=k_accepted[idx_t],
-                    bonus_tokens=bonus_tokens[idx_t],
-                    temperatures=temperatures[idx_t],
-                    needs_logits=needs_logits,
+            draft_logits_out: torch.Tensor | None = None
+            needs_logits = self.draft_logits is not None
+
+            srv_order: list[int] = []
+            srv_local_indices: list[list[int]] = []
+            coros: list[Any] = []
+            for srv_idx, local_indices in server_groups.items():
+                connector = self.router.connectors[srv_idx]
+                n = len(local_indices)
+                idx_t = torch.tensor(
+                    local_indices, dtype=torch.int64, device=self.device,
                 )
-            )
+                srv_order.append(srv_idx)
+                srv_local_indices.append(local_indices)
+                coros.append(
+                    connector.send_and_recv_speculation(
+                        batch_size=n,
+                        seq_ids=seq_ids[idx_t],
+                        k_accepted=k_accepted[idx_t],
+                        bonus_tokens=bonus_tokens[idx_t],
+                        temperatures=temperatures[idx_t],
+                        needs_logits=needs_logits,
+                    )
+                )
 
         if not coros:
             return draft_toks_out, draft_logits_out
@@ -565,7 +980,8 @@ class DisaggSpeculatorProxy:
         async def _gather():
             return await asyncio.gather(*coros, return_exceptions=True)
 
-        results = self._run_async(_gather())
+        with record_function("disp_run_async_gather"):
+            results = self._run_async(_gather())
         for srv_idx, local_indices, result in zip(
             srv_order, srv_local_indices, results
         ):

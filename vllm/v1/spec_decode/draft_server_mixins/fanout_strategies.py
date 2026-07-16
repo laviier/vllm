@@ -33,6 +33,7 @@ class DraftServerFanoutMixin:
         prefix_lens: torch.Tensor,
         branch_block_tables: torch.Tensor,
         bonus_candidates: torch.Tensor,
+        max_prefix_len_hint: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run K tree-decode steps and return (tokens, logits) per branch."""
         seq_ids_expanded = seq_ids[entry_batch_ids]
@@ -43,7 +44,10 @@ class DraftServerFanoutMixin:
             N, K, self.vocab_size, dtype=self.dtype, device=self.device
         )
         current_ids = bonus_candidates.clone()
-        max_context_hint = int(prefix_lens.max().item()) + K + 1
+        if max_prefix_len_hint is not None:
+            max_context_hint = max_prefix_len_hint + K + 1
+        else:
+            max_context_hint = int(prefix_lens.max().item()) + K + 1
 
         for depth in range(K):
             tree_positions = prefix_lens + depth
@@ -73,6 +77,7 @@ class DraftServerFanoutMixin:
         prefix_lens: torch.Tensor,
         branch_block_tables: torch.Tensor,
         bonus_candidates: torch.Tensor,
+        max_prefix_len_hint: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Single-pass parallel fanout for MTP-style draft models.
 
@@ -156,7 +161,13 @@ class DraftServerFanoutMixin:
         )
 
         # --- Run single forward pass ---
-        max_context_hint = int(prefix_lens.max().item()) + K + 1
+        # Use caller-provided upper bound if available (avoids a
+        # prefix_lens.max().item() sync — ~1.7 ms). Falls back to the
+        # syncing path when no hint is threaded through.
+        if max_prefix_len_hint is not None:
+            max_context_hint = max_prefix_len_hint + K + 1
+        else:
+            max_context_hint = int(prefix_lens.max().item()) + K + 1
         logits_flat = runner.tree_decode_step(
             input_ids=input_ids,
             positions=positions,

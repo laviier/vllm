@@ -192,17 +192,39 @@ class DraftServerSpeculateMixin:
 
         Returns (hit_tables, hit_prefix_lens) so the caller can stash
         them for the deferred swap; the synchronous SPECULATE path no
-        longer touches runner block tables / seq_lens. None if the cache
-        has no hit entries to copy from.
+        longer touches runner block tables / seq_lens. None if the
+        cache has no hit entries to copy from.
+
+        NOTE: an earlier ``deferred-materialization`` variant tried to
+        return ``(None, None)`` sentinels so cache_build could call
+        ``get_hit_block_tables`` later in its prologue. That kept the
+        SPECULATE hot path sync-free but was unsafe under multi-VS:
+        by the time cache_build ran, a peer VS's ``reset_vs`` /
+        ``drop_entries_by_seq_ids`` could have compacted the cache
+        keys, silently invalidating the stashed match_idx →
+        device-side OOB assertion in ``match_idx[hit_mask]``.
+        Materializing synchronously here (matching the original ZMQ
+        path) makes hit_tables/hit_prefix_lens self-contained tensor
+        outputs that survive any subsequent cache mutation.
         """
         hit_tables, hit_prefix_lens = self.cache.get_hit_block_tables(
-            cache_hits
+            cache_hits,
         )
         if hit_tables is None or hit_prefix_lens is None:
             return None
-        hit_mask = cache_hits.bool()
-        draft_tokens[hit_mask] = cached_tokens[hit_mask]
-        draft_logits[hit_mask] = cached_logits[hit_mask]
+        # torch.where blend of cached tokens/logits into draft buffers,
+        # avoiding boolean-mask indexing (which forces a CPU sync via
+        # _local_scalar_dense on the mask size).
+        K = cached_tokens.shape[1]
+        V = cached_logits.shape[2]
+        hit_mask_kt = cache_hits.unsqueeze(-1).expand(-1, K)
+        hit_mask_ktv = cache_hits.view(-1, 1, 1).expand(-1, K, V)
+        draft_tokens.copy_(
+            torch.where(hit_mask_kt, cached_tokens, draft_tokens),
+        )
+        draft_logits.copy_(
+            torch.where(hit_mask_ktv, cached_logits, draft_logits),
+        )
         return hit_tables, hit_prefix_lens
 
     def _apply_pending_swap(
@@ -218,6 +240,12 @@ class DraftServerSpeculateMixin:
         """Mutate runner state for a previously-recorded set of cache
         hits. Called at the start of cache_build to hide swap latency
         behind the verifier's target forward.
+
+        ``hit_tables`` / ``hit_prefix_lens`` are always real tensors by
+        the time we're called — the IPC hot path stashes None
+        sentinels, but ``_run_cache_build`` materializes them via
+        ``get_hit_block_tables`` before invoking us (see cache_build.py
+        prologue).
         """
         hit_mask = cache_hits.bool()
         hit_seq_ids = seq_ids[hit_mask]
@@ -295,31 +323,65 @@ class DraftServerSpeculateMixin:
         becomes a no-op) — the caller doesn't need to gate this on a
         host-side ``B_miss`` count.
         """
-        draft_tokens[miss_mask, 0] = bonus_tokens[miss_mask]
+        # Use torch.where instead of ``x[bool_mask, 0] = y[bool_mask]``.
+        # Boolean-mask indexing forces a CPU sync (output size depends
+        # on mask), which stalls behind cache_build kernels on the
+        # IPC-early-dispatch path.
+        col0 = draft_tokens[:, 0]  # [B] view
+        draft_tokens[:, 0] = torch.where(miss_mask, bonus_tokens, col0)
 
     async def _handle_speculation_inner(
         self,
         verify_server_id: str,
         identity: bytes,
         outcome: VerificationOutcome,
+        preloaded_tensors: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                  torch.Tensor | None]
+            | None
+        ) = None,
+        preloaded_seq_ids_list: list[int] | None = None,
+        preloaded_k_accepted_list: list[int] | None = None,
     ) -> None:
-        """Core speculation logic, separated for error handling."""
+        """Core speculation logic, separated for error handling.
+
+        ``preloaded_tensors`` is an optional
+        ``(seq_ids, k_accepted, bonus_tokens, temperatures)`` tuple.
+        When provided (e.g. from the CUDA-IPC transport path) we skip
+        the ZMQ frame read; seq_ids must already be remapped into the
+        draft server's internal namespace.
+
+        ``preloaded_seq_ids_list`` / ``preloaded_k_accepted_list`` —
+        CPU list mirrors of ``seq_ids`` / ``k_accepted``. When provided,
+        we skip the corresponding ``.tolist()`` sync (each blocks ~3 ms
+        waiting for prior default-stream cache_build kernels). The IPC
+        path materializes these via side-stream D2Hs that overlap with
+        cache_build.
+        """
         B = outcome.batch_size
         _spec_start = time.monotonic()
         self.metrics.draft_batch_size.set(B)
 
         # ---- Step 1: Receive tensor payloads ----
         with torch.profiler.record_function("recv_spec_tensors"):
-            seq_ids, k_accepted, bonus_tokens, temperatures = (
-                self._recv_speculation_tensors(verify_server_id, outcome)
-            )
+            if preloaded_tensors is not None:
+                seq_ids, k_accepted, bonus_tokens, temperatures = (
+                    preloaded_tensors
+                )
+            else:
+                seq_ids, k_accepted, bonus_tokens, temperatures = (
+                    self._recv_speculation_tensors(verify_server_id, outcome)
+                )
         # Materialize the CPU list first so ``_last_spec_seq_ids`` and
         # ``_last_spec_seq_ids_cpu`` always stay in lock-step (paired
         # assignments after the sync). Downstream cache_build consumers
         # reuse the CPU list to avoid a repeat GPU→host sync at
         # ``_build_next_cache`` — that sync drained the SPECULATE
         # handler's GPU queue for ~1.8 ms per affected iter at 3V c=8.
-        seq_ids_list = seq_ids.tolist()
+        if preloaded_seq_ids_list is not None:
+            seq_ids_list = preloaded_seq_ids_list
+        else:
+            seq_ids_list = seq_ids.tolist()
         self._last_spec_seq_ids = seq_ids
         self._last_spec_seq_ids_cpu = seq_ids_list
 
@@ -327,8 +389,12 @@ class DraftServerSpeculateMixin:
         runner = self.draft_model_runner
         if runner is not None:
             with torch.profiler.record_function("sync_seq_lens"):
+                if preloaded_k_accepted_list is not None:
+                    k_accepted_list = preloaded_k_accepted_list
+                else:
+                    k_accepted_list = k_accepted.tolist()
                 self._sync_runner_seq_lens_and_blocks(
-                    runner, seq_ids_list, k_accepted.tolist(),
+                    runner, seq_ids_list, k_accepted_list,
                 )
 
         # ---- Step 3: Cache lookup ----

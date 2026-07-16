@@ -66,10 +66,38 @@ class FreeSeqRequest(msgspec.Struct):
     seq_ids_ref: TensorRef  # [N] int64
 
 
+class IpcHandshake(msgspec.Struct):
+    """Verify_Server → Draft_Server: attach a CUDA-IPC SPECULATE ring
+    buffer alongside the existing ZMQ channel.
+
+    Sent once per connection at startup. Draft server opens the GPU
+    handles + doorbell shm and services SPECULATEs via the ring;
+    PREFILL/FREE_SEQ still travel via ZMQ.
+    """
+
+    verify_server_id: str
+    shm_path: str
+    max_batch: int
+    K: int
+    n_slots: int
+    # Pickle of {tensor_name: (rebuild_fn, args)} — torch.mp.reductions
+    # output. Kept as opaque bytes so msgspec doesn't need to know the
+    # torch reduction schema.
+    gpu_handles_pickle: bytes
+
+
+class IpcHandshakeAck(msgspec.Struct):
+    """Draft_Server → Verify_Server: acknowledgement of IPC_HANDSHAKE."""
+
+    ok: bool
+    error: str = ""
+
+
 class DraftCommand(msgspec.Struct):
     """Envelope for all draft service messages over ZMQ."""
 
-    command: str  # "SPECULATE", "PREFILL", "FREE_SEQ", "EXIT", "HEALTHCHECK"
+    command: str  # "SPECULATE", "PREFILL", "FREE_SEQ", "EXIT",
+                  # "HEALTHCHECK", "IPC_HANDSHAKE"
     payload: bytes  # msgspec-encoded inner message
 
 
@@ -83,6 +111,8 @@ _decoders: dict[type, msgspec.msgpack.Decoder] = {
     SpeculationResponse: msgspec.msgpack.Decoder(SpeculationResponse),
     PrefillRequest: msgspec.msgpack.Decoder(PrefillRequest),
     FreeSeqRequest: msgspec.msgpack.Decoder(FreeSeqRequest),
+    IpcHandshake: msgspec.msgpack.Decoder(IpcHandshake),
+    IpcHandshakeAck: msgspec.msgpack.Decoder(IpcHandshakeAck),
     DraftCommand: msgspec.msgpack.Decoder(DraftCommand),
 }
 
@@ -92,6 +122,8 @@ DraftMessage = Union[
     SpeculationResponse,
     PrefillRequest,
     FreeSeqRequest,
+    IpcHandshake,
+    IpcHandshakeAck,
     DraftCommand,
 ]
 
@@ -113,6 +145,8 @@ def encode_command(
         SpeculationResponse,
         PrefillRequest,
         FreeSeqRequest,
+        IpcHandshake,
+        IpcHandshakeAck,
         None,
     ] = None,
 ) -> bytes:
