@@ -662,6 +662,17 @@ class DraftServer(
                     # Await any in-flight cache build (SPECULATE is
                     # single-threaded with cache_build).
                     await self._await_inflight_cache_build()
+                    # Late-arrival re-poll: the ``_await_inflight_...``
+                    # above can take 10-20 ms under heavy load. During
+                    # that wait, additional peers' doorbells can fire.
+                    # Re-poll so those get folded into this merged
+                    # round instead of triggering a separate solo
+                    # round on the next serve iteration (which would
+                    # cost another ~13 ms of drafter time).
+                    if len(pending_ipc) < len(self._ipc_peers):
+                        late = self._poll_ipc_all_pending()
+                        if late:
+                            pending_ipc.extend(late)
                     # After the ZMQ drain, a VS may have EXITed and
                     # had its cache/state torn down via ``reset_vs``.
                     # Its IPC peer is still registered (EXIT only wipes
