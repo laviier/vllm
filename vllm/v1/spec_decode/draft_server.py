@@ -576,27 +576,46 @@ class DraftServer(
             # SPECULATEs before falling through to ZMQ. Only costs a few
             # int32 loads per registered peer when idle.
             if self._ipc_peers:
-                pending = self._poll_ipc_speculates()
-                if pending is not None:
-                    vs_id, slot, batch_size, seq16 = pending
-                    # BEFORE servicing the IPC SPECULATE, drain any
-                    # pending ZMQ messages FROM THE SAME VS so they
-                    # execute in the order the verifier sent them
-                    # (verifier sends FREE_SEQ + PREFILL over ZMQ,
-                    # then SPECULATE over IPC — IPC arrives instantly
-                    # while ZMQ has wire latency, so without this
-                    # drain the SPECULATE can leapfrog its own
-                    # FREE_SEQ / PREFILL, corrupting the cache).
+                pending_ipc = self._poll_ipc_all_pending()
+                # Optional accumulation window: if only a subset of
+                # peers are ready, briefly yield and re-poll so late-
+                # arriving doorbells can join this merged round.
+                # Default is 0 (no wait): every micro-second of wait
+                # adds to the ITL of the peer that already arrived,
+                # and empirically that regresses more than the extra
+                # merge coverage helps at 2V/3V c=8. Set
+                # ``VLLM_DISAGG_IPC_ACCUM_US=N`` (e.g. 150) to enable
+                # a wait when higher merge coverage would be worth
+                # more than sub-N-µs response latency for a peer that
+                # arrived first.
+                if pending_ipc and len(pending_ipc) < len(self._ipc_peers):
+                    accum_us = int(
+                        os.environ.get("VLLM_DISAGG_IPC_ACCUM_US", "0")
+                    )
+                    if accum_us > 0:
+                        await asyncio.sleep(accum_us / 1_000_000.0)
+                        # Re-poll to pick up any straggler doorbells that
+                        # fired during the sleep. Existing entries in
+                        # ``pending_ipc`` were marked ``last_seen``, so
+                        # this call returns ONLY NEW pending items.
+                        extras = self._poll_ipc_all_pending()
+                        if extras:
+                            pending_ipc.extend(extras)
+                if pending_ipc:
+                    # Drain ALL pending ZMQ commands before running the
+                    # SPECULATE(s). PREFILL/FREE_SEQ from any VS must
+                    # apply before we look up in the cache, since the
+                    # verifier sends them over ZMQ *before* the matching
+                    # SPECULATE over IPC. IPC arrives instantly while
+                    # ZMQ has wire latency, so without this drain the
+                    # SPECULATE can leapfrog its own PREFILL/FREE_SEQ
+                    # and corrupt cache state under sustained load.
                     #
-                    # Peer-VS messages (esp. EXIT → reset_vs) are
-                    # deferred to the ZMQ poll path below. Interleaving
-                    # a peer's cache mutation between our IPC SPECULATE
-                    # and the same VS's next round has caused device-
-                    # side OOB assertions in ``get_hit_block_tables``
-                    # after peer VS finishes benchmarks.
-                    deferred_peers: list[
-                        tuple[bytes, bytes, list[bytes]]
-                    ] = []
+                    # Dispatching peer-VS commands here (rather than
+                    # deferring to ``_deferred_messages``) prevents
+                    # starvation under multi-VS IPC load — the serve
+                    # loop otherwise ``continue``s past the deferred-
+                    # queue drain on every hot tick.
                     while True:
                         try:
                             zmq_frames = await self._socket.recv_multipart(
@@ -619,14 +638,6 @@ class DraftServer(
                         vs_id_zmq = identity.decode(
                             "utf-8", errors="replace",
                         )
-                        if vs_id_zmq != vs_id:
-                            # Peer-VS message — defer to the ZMQ poll
-                            # below by re-queuing it into the deferred
-                            # buffer.
-                            deferred_peers.append(
-                                (identity, metadata_frame, tensor_frames)
-                            )
-                            continue
                         try:
                             command = decode_command(metadata_frame)
                         except Exception:
@@ -638,39 +649,8 @@ class DraftServer(
                         self._current_tensor_frames = tensor_frames
                         self._current_tensor_idx = 0
                         await self._dispatch(vs_id_zmq, identity, command)
-                    # Dispatch peer-VS messages IMMEDIATELY here (before
-                    # this IPC SPECULATE) rather than deferring them.
-                    # Deferring to ``_deferred_messages`` starves peer
-                    # VSes under sustained IPC load: the serve loop
-                    # ``continue``s after every IPC handle and never
-                    # drains the deferred queue while any IPC peer has
-                    # pending work. A peer VS whose PREFILL was
-                    # deferred sits idle for hundreds of ms.
-                    #
-                    # Peer-VS PREFILL/FREE_SEQ/EXIT are safe to run
-                    # here — they don't share request state with this
-                    # VS. The earlier concern (peer EXIT →
-                    # ``reset_vs`` mid-SPECULATE) is now avoided by
-                    # running them BEFORE this SPECULATE's
-                    # ``cache.lookup``, so the cache state is
-                    # consistent by the time our handler reads it.
-                    for identity, metadata_frame, tensor_frames in deferred_peers:
-                        vs_id_zmq = identity.decode(
-                            "utf-8", errors="replace",
-                        )
-                        try:
-                            command = decode_command(metadata_frame)
-                        except Exception:
-                            logger.exception(
-                                "DraftServer failed to decode peer command from %s",
-                                vs_id_zmq,
-                            )
-                            continue
-                        self._current_tensor_frames = tensor_frames
-                        self._current_tensor_idx = 0
-                        await self._dispatch(vs_id_zmq, identity, command)
-                    # Also drain any older deferred messages that were
-                    # skipped by prior IPC-fast-path continues.
+                    # Drain any older deferred messages skipped by prior
+                    # IPC-fast-path ``continue``s (legacy safety net).
                     while self._deferred_messages:
                         msg = self._deferred_messages.pop(0)
                         vs_id_msg, identity_msg, command_msg, frames_msg = msg
@@ -682,9 +662,33 @@ class DraftServer(
                     # Await any in-flight cache build (SPECULATE is
                     # single-threaded with cache_build).
                     await self._await_inflight_cache_build()
-                    await self._handle_ipc_speculation(
-                        vs_id, slot, batch_size, seq16,
-                    )
+                    # After the ZMQ drain, a VS may have EXITed and
+                    # had its cache/state torn down via ``reset_vs``.
+                    # Its IPC peer is still registered (EXIT only wipes
+                    # cache/dedicated blocks, not the IPC ring), and
+                    # its stashed doorbell tick would try to lookup
+                    # against entries that no longer exist. Skip such
+                    # VSes here so we don't scramble the merged
+                    # cache.lookup.
+                    live_ipc = [
+                        item for item in pending_ipc
+                        if item[0] in self._verify_servers
+                    ]
+                    if not live_ipc:
+                        self._check_evictions()
+                        continue
+                    # Multi-VS: merge into ONE drafter forward when we
+                    # have multiple pending IPC SPECULATEs. Fall back to
+                    # single-VS for len==1.
+                    if len(live_ipc) == 1:
+                        vs_id, slot, batch_size, seq16 = live_ipc[0]
+                        await self._handle_ipc_speculation(
+                            vs_id, slot, batch_size, seq16,
+                        )
+                    else:
+                        await self._handle_ipc_speculation_merged(
+                            live_ipc,
+                        )
                     self._check_evictions()
                     continue
 
@@ -1320,9 +1324,52 @@ class DraftServer(
             )
 
     # ------------------------------------------------------------------
-    # IPC SPECULATE poll path (single-VS only for now — multi-VS merge
-    # deferred to a follow-up).
+    # IPC SPECULATE poll path
     # ------------------------------------------------------------------
+
+    def _poll_ipc_all_pending(
+        self,
+    ) -> list[tuple[str, int, int, int]]:
+        """Return one pending SPECULATE (if any) per peer, in
+        round-robin order. Enables cross-VS merged dispatch.
+
+        Rotates the start of the sweep via ``_ipc_poll_cursor`` so no
+        peer gets starved when its immediate neighbour is always hot.
+        """
+        vs_ids = list(self._ipc_peers.keys())
+        if not vs_ids:
+            return []
+        n = len(vs_ids)
+        start = self._ipc_poll_cursor % n
+        pending: list[tuple[str, int, int, int]] = []
+        for i in range(n):
+            vs_id = vs_ids[(start + i) % n]
+            peer = self._ipc_peers[vs_id]
+            dbell_cpu = peer.poll_all_reqs()
+            values = dbell_cpu.tolist()
+            # Only pick ONE pending slot per peer per call — matching
+            # the verifier's dispatch/await protocol, only one
+            # SPECULATE is inflight per VS at any time.
+            for slot in range(peer.n_slots):
+                encoded = values[slot]
+                if encoded == peer.last_seen[slot] or encoded == 0:
+                    continue
+                if encoded < 0:
+                    logger.info(
+                        "IPC peer %s signalled shutdown on slot %d",
+                        vs_id, slot,
+                    )
+                    peer.last_seen[slot] = encoded
+                    continue
+                peer.last_seen[slot] = encoded
+                batch_size = (encoded >> 16) & 0xFFFF
+                seq16 = encoded & 0xFFFF
+                pending.append((vs_id, slot, batch_size, seq16))
+                break
+        # Advance cursor by 1 so the next round starts on a fresh
+        # peer even if only some peers had pending work.
+        self._ipc_poll_cursor = (start + 1) % n
+        return pending
 
     def _poll_ipc_speculates(
         self,
@@ -1426,13 +1473,19 @@ class DraftServer(
                 mapped = self._map_seq_id(verify_server_id, int(ext))
                 internal_ids.append(mapped)
                 remap_view[i] = mapped
-            # H2D on the side stream — pinned source, non_blocking OK.
+            # Allocate + write on the DEFAULT stream so the caching
+            # allocator tags the tensor's owning stream to match its
+            # downstream consumers (cache.lookup runs on the default
+            # stream). A previous version wrote this on
+            # ``peer._poll_stream`` while allocating on the default
+            # stream; that stream/allocator mismatch surfaced under
+            # multi-VS merged load as a spurious device-side assert
+            # (masked when CUDA_LAUNCH_BLOCKING=1). Pinned source keeps
+            # the copy non-blocking on the default stream.
             seq_ids = torch.empty(
                 B, dtype=torch.int64, device=self.device,
             )
-            with torch.cuda.stream(peer._poll_stream):
-                seq_ids.copy_(remap_view, non_blocking=True)
-            peer._poll_stream.synchronize()
+            seq_ids.copy_(remap_view, non_blocking=True)
 
             k_accepted = buf["req_k_accepted"][slot, :B].to(
                 device=self.device, non_blocking=True, copy=True,
@@ -1458,9 +1511,14 @@ class DraftServer(
 
             # Reuse the ZMQ inner handler wholesale — same cache lookup,
             # miss-fill, pending_swap plumbing, _last_* stashing, etc.
-            # Passing ``preloaded_seq_ids_list`` lets the inner handler
-            # skip its own ``seq_ids.tolist()`` sync, which otherwise
-            # stalls ~3 ms on the default stream behind cache_build.
+            # ``ipc_send_ctx`` makes the inner handler write the IPC
+            # response tensors AND fire the doorbell as soon as it has
+            # cache_hits + draft_tokens (i.e. right after cache.lookup),
+            # so the verifier unblocks ~10 ms sooner than under the old
+            # "compute everything, then send" flow. The remaining
+            # per-round staging (draft_logits blend, pending_swap
+            # setup, _last_* clones) happens after the send and
+            # overlaps with the verifier's target forward.
             result = await self._handle_speculation_inner(
                 verify_server_id,
                 identity=b"",  # unused on IPC path
@@ -1470,47 +1528,24 @@ class DraftServer(
                 ),
                 preloaded_seq_ids_list=internal_ids,
                 preloaded_k_accepted_list=k_accepted_list,
+                ipc_send_ctx=(peer, slot, seq16),
             )
-            if result is None:
-                # Inner returned early. Send zeros so the verifier
-                # doesn't hang.
-                buf["resp_cache_hits"][slot, :B].zero_()
-                buf["resp_draft_tokens"][slot, :B].zero_()
+            if result is not None:
+                # Defensive fallback: inner-handler-sends path returns
+                # None on IPC. Reaching here means the caller's
+                # ipc_send_ctx wasn't honored (should not happen).
+                cache_hits, draft_tokens, _dl, _nl = result
+                buf["resp_cache_hits"][slot, :B].copy_(
+                    cache_hits.to(torch.int64), non_blocking=True,
+                )
+                buf["resp_draft_tokens"][slot, :B].copy_(
+                    draft_tokens, non_blocking=True,
+                )
                 peer.set_resp(slot, seq16)
-                return
 
-            cache_hits, draft_tokens, _draft_logits, _needs_logits = result
-
-            # ---- Write response back into the ring ----
-            # cache_hits/draft_tokens live on the DRAFTER GPU; resp_*
-            # live on the VERIFIER GPU via IPC. Cross-device copy_() is
-            # queued on the source (drafter) default stream.
-            #
-            # The doorbell write (set_resp -> fill_) is queued on the
-            # SAME drafter default stream AFTER the copies, so on the
-            # verifier side the doorbell can only become visible once
-            # the ring writes have committed. No CPU sync needed.
-            buf["resp_cache_hits"][slot, :B].copy_(
-                cache_hits.to(torch.int64), non_blocking=True,
-            )
-            buf["resp_draft_tokens"][slot, :B].copy_(
-                draft_tokens, non_blocking=True,
-            )
-            peer.set_resp(slot, seq16)
-
-            # Schedule cache_build for the next round (same as ZMQ).
-            runner = self.draft_model_runner
-            if runner is not None and self._last_spec_seq_ids is not None:
-                try:
-                    self._inflight_cache_build = asyncio.create_task(
-                        self._run_cache_build(
-                            B, self._last_spec_seq_ids, verify_server_id,
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "cache_build scheduling failed on IPC path",
-                    )
+            # Cache_build is scheduled inside the inner
+            # (``_phase_b_and_cache_build_solo``) so the serve loop
+            # returns to polling doorbells right after Phase A.
 
             self.metrics.draft_speculate_total.inc()
 
@@ -1527,6 +1562,149 @@ class DraftServer(
                 logger.exception(
                     "DraftServer IPC fallback response failed",
                 )
+
+    async def _handle_ipc_speculation_merged(
+        self,
+        pending: list[tuple[str, int, int, int]],
+    ) -> None:
+        """Cross-VS merged variant of ``_handle_ipc_speculation``.
+
+        Loads tensors from EACH peer's ring on their shared side stream,
+        remaps per-VS seq_ids to internal ids, and dispatches to
+        ``_handle_speculation_merged_inner`` with the preloaded per-VS
+        payload. The inner concatenates along the batch dim and runs a
+        single merged cache_lookup + response fill, then writes
+        responses back into EACH peer's ring via the IPC branch of the
+        inner handler's send loop.
+        """
+        if not pending:
+            return
+        # Track VS activity so eviction timers don't fire.
+        now = time.monotonic()
+        for vs_id, _, _, _ in pending:
+            self._verify_server_last_seen[vs_id] = now
+
+        # ---- Phase A: pipelined D2H across all peers, ONE host sync ----
+        # Fire the seq_ids/k_accepted D2H on each peer's poll stream in
+        # a single loop so all D2Hs run concurrently, then synchronize
+        # each stream once. Previously each peer had its own
+        # ``synchronize()`` inside the read loop, so N peers cost N
+        # host barriers — visible under 2-VS/3-VS merge.
+        prefetch: list[tuple[str, int, int, int, Any]] = []
+        for vs_id, slot, B, seq16 in pending:
+            peer = self._ipc_peers.get(vs_id)
+            if peer is None:
+                continue
+            buf = peer.gpu_bufs
+            seq_ids_ring = buf["req_seq_ids"][slot, :B]
+            k_accepted_ring = buf["req_k_accepted"][slot, :B]
+            seq_ids_cpu = peer._seq_ids_cpu[:B]
+            k_accepted_cpu = peer._k_accepted_cpu[:B]
+            with torch.cuda.stream(peer._poll_stream):
+                seq_ids_cpu.copy_(seq_ids_ring, non_blocking=True)
+                k_accepted_cpu.copy_(k_accepted_ring, non_blocking=True)
+            prefetch.append((vs_id, slot, B, seq16, peer))
+        # Single-pass sync — poll streams have already been kicked off
+        # in parallel above.
+        for _vs_id, _slot, _B, _seq16, peer in prefetch:
+            peer._poll_stream.synchronize()
+
+        per_vs: list[dict[str, Any]] = []
+        try:
+            for vs_id, slot, B, seq16, peer in prefetch:
+                buf = peer.gpu_bufs
+                seq_ids_cpu = peer._seq_ids_cpu[:B]
+                k_accepted_cpu = peer._k_accepted_cpu[:B]
+                ext_list = seq_ids_cpu.tolist()
+                k_accepted_list = k_accepted_cpu.tolist()
+                internal_ids: list[int] = []
+                remap_view = peer._remap_ids_cpu[:B]
+                for i, ext in enumerate(ext_list):
+                    mapped = self._map_seq_id(vs_id, int(ext))
+                    internal_ids.append(mapped)
+                    remap_view[i] = mapped
+                # All GPU tensors below are allocated AND written on the
+                # drafter's default stream so the caching allocator tags
+                # them correctly for downstream default-stream consumers
+                # (torch.cat + cache.lookup). A previous version wrote
+                # them on ``peer._poll_stream`` and hit a stream/allocator
+                # race that surfaced as a spurious device-side assert
+                # under sustained multi-VS load (masked when
+                # CUDA_LAUNCH_BLOCKING=1).
+                seq_ids = torch.empty(
+                    B, dtype=torch.int64, device=self.device,
+                )
+                seq_ids.copy_(remap_view, non_blocking=True)
+                k_accepted = buf["req_k_accepted"][slot, :B].to(
+                    device=self.device, non_blocking=True, copy=True,
+                )
+                bonus_tokens = buf["req_bonus_tokens"][slot, :B].to(
+                    device=self.device, non_blocking=True, copy=True,
+                )
+                temperatures = buf["req_temperatures"][slot, :B].to(
+                    device=self.device, non_blocking=True, copy=True,
+                )
+                outcome = VerificationOutcome(
+                    verify_server_id=vs_id,
+                    batch_size=B,
+                    seq_ids_ref=self._make_tensor_ref(seq_ids),
+                    k_accepted_ref=self._make_tensor_ref(k_accepted),
+                    bonus_tokens_ref=self._make_tensor_ref(bonus_tokens),
+                    temperatures_ref=self._make_tensor_ref(temperatures),
+                    needs_logits=False,
+                )
+                per_vs.append({
+                    "vs_id": vs_id,
+                    "identity": b"",  # unused on IPC path
+                    "outcome": outcome,
+                    "B": B,
+                    "seq_ids": seq_ids,
+                    "k_accepted": k_accepted,
+                    "bonus_tokens": bonus_tokens,
+                    "temperatures": temperatures,
+                    "seq_ids_list": internal_ids,
+                    "k_accepted_list": k_accepted_list,
+                    # IPC response-fill hook consumed by
+                    # ``_handle_speculation_merged_inner``.
+                    "ipc_peer": peer,
+                    "ipc_slot": slot,
+                    "ipc_seq16": seq16,
+                })
+
+            if not per_vs:
+                return
+
+            # ``items`` is only used by the ZMQ recv path when
+            # ``preloaded_per_vs`` is None. Pass a shape-only stub.
+            items_stub = [
+                (p["vs_id"], b"", None, [])  # type: ignore[list-item]
+                for p in per_vs
+            ]
+            await self._handle_speculation_merged_inner(
+                items_stub, preloaded_per_vs=per_vs,
+            )
+
+        except Exception:
+            logger.exception(
+                "DraftServer IPC merged speculation failed for %s",
+                [p[0] for p in pending],
+            )
+            # Fallback: write zeros to each peer's ring so verifiers
+            # don't time out.
+            for vs_id, slot, B, seq16 in pending:
+                peer = self._ipc_peers.get(vs_id)
+                if peer is None:
+                    continue
+                try:
+                    buf = peer.gpu_bufs
+                    buf["resp_cache_hits"][slot, :B].zero_()
+                    buf["resp_draft_tokens"][slot, :B].zero_()
+                    peer.set_resp(slot, seq16)
+                except Exception:
+                    logger.exception(
+                        "DraftServer IPC merged fallback failed for %s",
+                        vs_id,
+                    )
 
     # ------------------------------------------------------------------
     # Cleanup

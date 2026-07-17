@@ -157,6 +157,141 @@ class DraftModelRunner(
         self._decode_graph_pool = None
         self._decode_graphs_captured = False
 
+        # ---- KV-copy graph state (branch-block KV copy in cache_build) ---
+        # Fancy-index copy across all attention layers costs ~4 ms/round
+        # under 3V+1D c=8 K=4 because each layer fires its own kernel
+        # (28 layers × ~150 μs launch overhead). Batching into one CUDA
+        # graph replay cuts that to ~100 μs. Buffers are sized to the
+        # worst-case ``MAX_BRANCHES × max_blocks_per_branch``; each new
+        # ``n_copies`` value captures its own graph on first use.
+        self._kv_copy_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._kv_copy_src_buf: torch.Tensor | None = None
+        self._kv_copy_dst_buf: torch.Tensor | None = None
+        self._kv_copy_graph_pool = None
+
+    # Upper bound on n for KV copy: max branches × max blocks/branch.
+    # MAX_BRANCHES = 504 (DraftServer.MAX_BRANCHES). blocks_per_branch
+    # = (K + block_size) // block_size + 1 — 3 covers K up to ~2×bs.
+    _KV_COPY_BUF_MAX = 504 * 4
+
+    def _ensure_kv_copy_buffers(self, max_n: int) -> None:
+        """One-shot allocation of persistent src/dst index buffers.
+
+        Buffers are sized to the worst case so we never reallocate;
+        that keeps every captured graph valid across all ``n`` values
+        (each graph indexes into a stable underlying tensor via a
+        ``[:n]`` view).
+        """
+        if self._kv_copy_src_buf is not None:
+            return
+        cap = max(max_n, self._KV_COPY_BUF_MAX)
+        self._kv_copy_src_buf = torch.zeros(
+            cap, dtype=torch.int64, device=self.device,
+        )
+        self._kv_copy_dst_buf = torch.zeros(
+            cap, dtype=torch.int64, device=self.device,
+        )
+
+    def _capture_kv_copy_graph(self, n: int) -> torch.cuda.CUDAGraph:
+        """Capture a CUDA graph that copies KV blocks for all layers
+        using persistent ``self._kv_copy_src_buf[:n]`` /
+        ``self._kv_copy_dst_buf[:n]`` as the fancy-index sources. The
+        graph is safe to replay after overwriting those buffers with
+        fresh indices via ``copy_``.
+        """
+        assert self._kv_copy_src_buf is not None
+        assert self._kv_copy_dst_buf is not None
+        assert self.kv_caches is not None
+        src = self._kv_copy_src_buf[:n]
+        dst = self._kv_copy_dst_buf[:n]
+        # Warm-up outside capture to compile any needed autograd artifacts
+        # and register the fancy-index kernels in the current stream.
+        for layer_kv in self.kv_caches:
+            layer_kv[dst] = layer_kv[src]
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._kv_copy_graph_pool):
+            for layer_kv in self.kv_caches:
+                layer_kv[dst] = layer_kv[src]
+        if self._kv_copy_graph_pool is None:
+            self._kv_copy_graph_pool = graph.pool()
+        return graph
+
+    def _capture_kv_copy_graphs(self) -> None:
+        """Capture KV-copy graphs at expected ``n`` values.
+
+        Under 3V+1D c=8 K=4 fan_out=3 the runtime ``n`` values are
+        ``B_total × entries_per_seq × blocks_per_branch`` — a small
+        set determined by config. We over-capture to cover the
+        realistic B_total range (1..24) at typical
+        ``blocks_per_branch`` values so cache_build always hits a
+        pre-captured graph and never has to pay first-call capture
+        cost on the hot path.
+        """
+        if self.kv_caches is None:
+            return
+        # Pre-allocate the biggest buffer we'll ever need.
+        self._ensure_kv_copy_buffers(self._KV_COPY_BUF_MAX)
+        # Enumerate plausible ``n`` = B × entries_per_seq × blocks/branch.
+        # entries_per_seq = disagg_fan_out × (K+1) = sum_fan_out;
+        # blocks_per_branch = (K + bs) // bs + 1 (typically 2 for K≤bs,
+        # 3 for bs < K ≤ 2*bs). Capture both to be safe.
+        K = self._num_spec_tokens
+        bs = self.block_size
+        sum_fan = self._sum_fan_out
+        candidates: set[int] = set()
+        for bpb in (2, 3):
+            for b_total in (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32):
+                n = b_total * sum_fan * bpb
+                if 0 < n <= self._KV_COPY_BUF_MAX:
+                    candidates.add(n)
+        for n in sorted(candidates):
+            try:
+                self._kv_copy_graphs[n] = self._capture_kv_copy_graph(n)
+            except Exception as e:
+                logger.warning(
+                    "KV copy graph capture for n=%d failed: %s", n, e,
+                )
+        logger.info(
+            "KV copy graphs captured: %d sizes.",
+            len(self._kv_copy_graphs),
+        )
+
+    def run_kv_copy(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor,
+    ) -> None:
+        """Batched fancy-index KV copy across all attention layers.
+
+        Replays a captured CUDA graph so all ``num_layers`` copies fire
+        as a single dispatch instead of ``num_layers`` separate kernel
+        launches. Falls back to a per-layer eager loop if the graph
+        for this size wasn't captured (e.g. capture failed at init).
+
+        ``src_indices`` and ``dst_indices`` must be int64 tensors of
+        the same length on the runner's device. Callers can (and
+        should) include self-copies (``src == dst``) so shape stays
+        fixed — that lets a single captured graph handle any
+        hit-count pattern.
+        """
+        n = src_indices.numel()
+        assert n == dst_indices.numel()
+        if n == 0:
+            return
+        graph = self._kv_copy_graphs.get(n)
+        if graph is None or self._kv_copy_src_buf is None:
+            # Eager fallback: no captured graph for this size.
+            assert self.kv_caches is not None
+            for layer_kv in self.kv_caches:
+                layer_kv[dst_indices] = layer_kv[src_indices]
+            return
+        # Copy indices into the graph-captured buffers, then replay.
+        # ``non_blocking=True`` is safe because both src_indices and
+        # the persistent buffer live on the same device.
+        self._kv_copy_src_buf[:n].copy_(src_indices, non_blocking=True)
+        assert self._kv_copy_dst_buf is not None
+        self._kv_copy_dst_buf[:n].copy_(dst_indices, non_blocking=True)
+        graph.replay()
+
     def glue_decode(
         self,
         tokens: torch.Tensor,
@@ -361,6 +496,16 @@ class DraftModelRunner(
                 "Tree decode CUDA graph capture failed: %s. Using eager.", e
             )
             self._tree_decode_captured = False
+
+        try:
+            self._capture_kv_copy_graphs()
+        except Exception as e:
+            logger.warning(
+                "KV copy CUDA graph capture failed: %s. Using eager.", e
+            )
+            # Callers fall through to the per-layer eager loop when the
+            # graph dict is empty (see ``run_kv_copy``).
+            self._kv_copy_graphs = {}
 
     @torch.inference_mode()
     def prefill(

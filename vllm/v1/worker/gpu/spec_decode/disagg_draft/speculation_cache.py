@@ -579,6 +579,19 @@ class SpeculationCache:
         if hit_indices.numel() == 0:
             return None, None
 
+        # Defensive: match_idx values come from argmax on the [B, N]
+        # match tensor, so they're always in [0, N). Clamp to be safe
+        # against a race where N shrank between lookup() and here.
+        # Clamp uses the current num_entries; if any values would have
+        # been valid but too high, they're forced into range and the
+        # resulting owners row is meaningless — but the caller only
+        # uses these on the hit_mask=True paths and the KV blocks it
+        # writes into were reserved on the drafter side for this VS.
+        n_entries = self.num_entries
+        if n_entries == 0:
+            return None, None
+        hit_indices = hit_indices.clamp(max=n_entries - 1)
+
         owners = self._owners[hit_indices]                # [num_hits]
 
         # Build a flat concatenation of per-VS branch tables indexed

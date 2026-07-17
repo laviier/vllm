@@ -613,23 +613,25 @@ class DraftServerCacheBuildMixin:
             ] = ded_tensor[valid].to(torch.int32)
 
             # KV copy from parent into newly-reserved blocks.
-            # Run unconditionally — when copy_mask is all-False
-            # the per-layer index_put_ is a 0-element no-op, and
-            # in practice copy_mask is almost always True (parent
-            # and dedicated block IDs differ for the blocks being
-            # written). The prior ``copy_mask.any()`` guard cost a
-            # full GPU-queue sync just to skip 32 empty kernels.
+            # Uses the same shape-invariant "self-copy for skip" trick
+            # as the solo path so the batched CUDA-graph KV copy
+            # (``runner.run_kv_copy``) can replay a captured graph of
+            # fixed size N × blocks_per_branch. Previously each layer
+            # fired its own fancy-index kernel (~28 launches ≈ 4 ms
+            # dominated by launch overhead); the graph replay folds
+            # them into a single dispatch.
             dst_block_ids = ded_tensor
             copy_mask = (
                 valid & (src_block_ids != dst_block_ids)
             )
             if runner.kv_caches is not None:
-                src_flat = src_block_ids[copy_mask]
-                dst_flat = dst_block_ids[copy_mask]
-                for layer_kv in runner.kv_caches:
-                    # Layout (num_blocks, 2, block_size, num_kv_heads,
-                    # head_dim); block dim is 0.
-                    layer_kv[dst_flat] = layer_kv[src_flat]
+                src_flat_all = src_block_ids.reshape(-1).to(torch.int64)
+                dst_flat_all = dst_block_ids.reshape(-1).to(torch.int64)
+                copy_flat = copy_mask.reshape(-1)
+                safe_src = torch.where(
+                    copy_flat, src_flat_all, dst_flat_all,
+                )
+                runner.run_kv_copy(safe_src, dst_flat_all)
 
             # ONE merged tree decode (or parallel fanout). Mask KVs
             # at depths 1..K-1 are dirty in the dedicated blocks
@@ -952,10 +954,12 @@ class DraftServerCacheBuildMixin:
             dst_flat_all = dst_block_ids.reshape(-1).to(torch.int64)
             copy_flat = copy_mask.reshape(-1)
             safe_src = torch.where(copy_flat, src_flat_all, dst_flat_all)
-            for layer_kv in runner.kv_caches:
-                # Layout (num_blocks, 2, block_size, num_kv_heads, head_dim);
-                # block dim is 0.
-                layer_kv[dst_flat_all] = layer_kv[safe_src]
+            # Batched fancy-index copy across all attention layers via a
+            # captured CUDA graph. Previously this looped ~28 times in
+            # Python firing one fancy-index kernel per layer, costing
+            # ~4 ms/round at 3V+1D c=8 dominated by launch overhead.
+            # ``run_kv_copy`` fuses the launches into a single replay.
+            runner.run_kv_copy(safe_src, dst_flat_all)
 
         return branch_block_tables, prefix_lens
 

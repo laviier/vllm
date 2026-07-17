@@ -813,6 +813,17 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         # Poll GPU-side response doorbell via .item() — issues a D2H
         # each call (~10 µs). Cheaper than a full stream sync. Async
         # yields let other coroutines run between polls.
+        #
+        # Default is spin-poll (yield with no sleep): fastest response
+        # detection. A 100 µs poll granularity cut the D2H count 36×
+        # under 3V c=8 but consistently regressed ITL because the
+        # drafter often responds within a poll tick, so waiting adds
+        # response latency. Env var kept for A/B: set
+        # ``VLLM_DISAGG_IPC_POLL_US=N`` on the verifier to sleep N µs
+        # between polls (e.g. useful when CPU budget matters more than
+        # sub-100 µs response latency).
+        poll_us = int(os.environ.get("VLLM_DISAGG_IPC_POLL_US", "0"))
+        poll_delay = poll_us / 1_000_000.0 if poll_us > 0 else 0
         deadline = asyncio.get_event_loop().time() + self._timeout_ms / 1000.0
         dbell_slice = buf.dbell_resp_gpu[slot:slot + 1]
         while int(dbell_slice.item()) != seq16:
@@ -821,7 +832,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
                 raise ConnectionError(
                     f"IPC recv timeout on slot {slot} seq {seq16}",
                 )
-            await asyncio.sleep(0)
+            await asyncio.sleep(poll_delay)
 
         cache_hits = (
             buf.resp_cache_hits[slot, :batch_size].clone().to(torch.bool)
