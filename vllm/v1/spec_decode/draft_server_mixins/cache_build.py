@@ -19,6 +19,8 @@ Expects the consumer to expose: ``draft_model_runner``, ``cache``,
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 from typing import Any
 
 import torch
@@ -26,6 +28,21 @@ import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Diagnostic: annotate sub-regions inside ``_run_cache_build_merged``
+# so the profiler can attribute the ~20 ms unaccounted wall time at
+# 3V+1D between the top-level record_function (cache_build_merged_n3)
+# and the already-annotated inner spans (_fused_cleanup_and_glue,
+# _run_parallel_fanout, tree_decode_step). Costs one extra push per
+# stage when set; a no-op nullcontext when unset.
+_CB_TRACE = os.environ.get("VLLM_DISAGG_CB_TRACE", "0") == "1"
+
+
+def _cb_span(name: str) -> Any:
+    """record_function when _CB_TRACE, no-op nullcontext otherwise."""
+    if _CB_TRACE:
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
 
 
 class DraftServerCacheBuildMixin:
@@ -375,22 +392,25 @@ class DraftServerCacheBuildMixin:
             # SPECULATE handler (deferring it regressed multi-VS TPOT
             # by 1-3 %). The fused cleanup+glue forward then refreshes
             # mask KVs and produces glue logits in one varlen forward.
-            pending_merged = self._pending_swap_merged
-            self._pending_swap_merged = None
-            self._fused_cleanup_and_glue(runner, pending_merged)
+            with _cb_span("cb3_fused_prologue"):
+                pending_merged = self._pending_swap_merged
+                self._pending_swap_merged = None
+                self._fused_cleanup_and_glue(runner, pending_merged)
 
             # Reset and recycle per-VS upfront.
-            for sm in slice_metas:
-                self.cache.reset_vs(sm["vs_id"])
-                runner.recycle_dedicated_blocks(sm["vs_id"])
+            with _cb_span("cb3_reset_and_recycle"):
+                for sm in slice_metas:
+                    self.cache.reset_vs(sm["vs_id"])
+                    runner.recycle_dedicated_blocks(sm["vs_id"])
 
             # Concatenate.
-            seq_ids_cat = torch.cat(
-                [sm["seq_ids"] for sm in slice_metas], dim=0,
-            )
-            draft_tokens_cat = torch.cat(
-                [sm["draft_tokens"] for sm in slice_metas], dim=0,
-            )
+            with _cb_span("cb3_concat_inputs"):
+                seq_ids_cat = torch.cat(
+                    [sm["seq_ids"] for sm in slice_metas], dim=0,
+                )
+                draft_tokens_cat = torch.cat(
+                    [sm["draft_tokens"] for sm in slice_metas], dim=0,
+                )
             # Note: sm["draft_logits"] is intentionally NOT
             # concatenated here. ``_select_bonus_candidates`` below
             # reads ``self._last_draft_logits`` instead, which
@@ -401,289 +421,313 @@ class DraftServerCacheBuildMixin:
             # bonus candidates at HIT rows because mask-context
             # logits at positions 1..K-1 are near-flat for the
             # parallel-MTP drafter.
-            bonus_cat = torch.cat(
-                [sm["bonus_tokens"] for sm in slice_metas], dim=0,
-            )
-            B_total = seq_ids_cat.shape[0]
-            # The CPU-side seq_ids list was already materialized
-            # in the SPECULATE handler (where the sync overlapped
-            # with verifier-side work); re-using its per-VS slices
-            # here avoids a fresh ``seq_ids_cat.tolist()`` host
-            # sync that would drain the cleanup_glue GPU queue.
-            # That sync was ~2.2 ms / cycle in the inter-phase
-            # Python band at 3V c=8.
-            if all("seq_ids_cpu" in sm for sm in slice_metas):
-                seq_ids_list = [
-                    sid for sm in slice_metas for sid in sm["seq_ids_cpu"]
-                ]
-            else:
-                seq_ids_list = seq_ids_cat.tolist()
-
-            # Geometric fan-out (shared across VSes).
-            fan_out_list = self._shrink_fan_out_to_budget(
-                list(self.outcome_predictor.fan_out_list),
-                B_total, self.MAX_BRANCHES,
-            )
-            entries_per_seq = sum(fan_out_list)
-            N = B_total * entries_per_seq
-            if N > self.MAX_BRANCHES or N == 0:
-                return
-            max_fan_out = (
-                max(fan_out_list) if fan_out_list else 0
-            )
-
-            # Per-row glue input: bonus token for miss rows
-            # (which received zero drafts), last drafted token
-            # for hit rows (whose drafts came from the cache).
-            merged_miss_mask = None
-            if all("miss_mask" in sm for sm in slice_metas):
-                merged_miss_mask = torch.cat(
-                    [sm["miss_mask"] for sm in slice_metas], dim=0,
+            with _cb_span("cb3_bonus_and_seqids"):
+                bonus_cat = torch.cat(
+                    [sm["bonus_tokens"] for sm in slice_metas], dim=0,
                 )
-            if self._pending_glue_logits is not None:
-                glue_logits = self._pending_glue_logits
-                self._pending_glue_logits = None
-            else:
-                # Unconditional ``torch.where`` avoids the
-                # ``mask.any().item()`` host sync; result is just
-                # the last-col tokens when the mask is all-False.
-                # When all 3V cb_merged_n3 rounds drained on this
-                # sync, it cost ~0.5-1 ms each.
-                if merged_miss_mask is not None:
-                    glue_input = torch.where(
-                        merged_miss_mask,
-                        bonus_cat,
-                        draft_tokens_cat[:, -1],
-                    )
+                B_total = seq_ids_cat.shape[0]
+                # The CPU-side seq_ids list was already materialized
+                # in the SPECULATE handler (where the sync overlapped
+                # with verifier-side work); re-using its per-VS slices
+                # here avoids a fresh ``seq_ids_cat.tolist()`` host
+                # sync that would drain the cleanup_glue GPU queue.
+                # That sync was ~2.2 ms / cycle in the inter-phase
+                # Python band at 3V c=8.
+                if all("seq_ids_cpu" in sm for sm in slice_metas):
+                    seq_ids_list = [
+                        sid for sm in slice_metas
+                        for sid in sm["seq_ids_cpu"]
+                    ]
                 else:
-                    glue_input = draft_tokens_cat[:, -1]
-                # Advances _seq_lens by 1 per seq (mirrored by the
-                # fused-prologue path).
-                glue_logits = runner.glue_decode(
-                    tokens=glue_input, seq_ids=seq_ids_cat,
+                    seq_ids_list = seq_ids_cat.tolist()
+
+            with _cb_span("cb3_fanout_shrink"):
+                # Geometric fan-out (shared across VSes).
+                fan_out_list = self._shrink_fan_out_to_budget(
+                    list(self.outcome_predictor.fan_out_list),
+                    B_total, self.MAX_BRANCHES,
                 )
+                entries_per_seq = sum(fan_out_list)
+                N = B_total * entries_per_seq
+                if N > self.MAX_BRANCHES or N == 0:
+                    return
+                max_fan_out = (
+                    max(fan_out_list) if fan_out_list else 0
+                )
+
+            with _cb_span("cb3_glue_input"):
+                # Per-row glue input: bonus token for miss rows
+                # (which received zero drafts), last drafted token
+                # for hit rows (whose drafts came from the cache).
+                merged_miss_mask = None
+                if all("miss_mask" in sm for sm in slice_metas):
+                    merged_miss_mask = torch.cat(
+                        [sm["miss_mask"] for sm in slice_metas], dim=0,
+                    )
+                if self._pending_glue_logits is not None:
+                    glue_logits = self._pending_glue_logits
+                    self._pending_glue_logits = None
+                else:
+                    # Unconditional ``torch.where`` avoids the
+                    # ``mask.any().item()`` host sync; result is just
+                    # the last-col tokens when the mask is all-False.
+                    # When all 3V cb_merged_n3 rounds drained on this
+                    # sync, it cost ~0.5-1 ms each.
+                    if merged_miss_mask is not None:
+                        glue_input = torch.where(
+                            merged_miss_mask,
+                            bonus_cat,
+                            draft_tokens_cat[:, -1],
+                        )
+                    else:
+                        glue_input = draft_tokens_cat[:, -1]
+                    # Advances _seq_lens by 1 per seq (mirrored by
+                    # the fused-prologue path).
+                    with _cb_span("cb3_glue_decode"):
+                        glue_logits = runner.glue_decode(
+                            tokens=glue_input, seq_ids=seq_ids_cat,
+                        )
 
             # Use ``self._last_draft_logits`` (cleanup-spliced) as
             # the source for ``_select_bonus_candidates``; the per-
             # VS slice in slice_metas is the un-spliced version
             # from the speculate handler (see note where it would
             # have been concatenated above).
-            draft_logits_for_select = self._last_draft_logits
-            # Zero-fallback miss rows: replace k=0 logits with
-            # glue_logits so bonus candidates are real (see
-            # _build_standalone_cache for full reasoning). Run
-            # unconditionally — masked assignment is a no-op when
-            # the mask is all-False; gating with .any().item() was
-            # a CPU↔GPU sync per round.
-            if merged_miss_mask is not None:
-                draft_logits_for_select = (
-                    draft_logits_for_select.clone()
-                )
-                # torch.where instead of boolean-mask indexing (see
-                # single-path comment for reasoning).
-                V = draft_logits_for_select.shape[2]
-                mask_v = merged_miss_mask.view(-1, 1).expand(-1, V)
-                draft_logits_for_select[:, 0] = torch.where(
-                    mask_v,
-                    glue_logits,
-                    draft_logits_for_select[:, 0],
-                )
-
-            # ONE merged bonus selection.
-            (
-                entry_batch_ids,
-                k_positions,
-                bonus_candidates,
-                _branches,
-            ) = self._select_bonus_candidates(
-                B=B_total,
-                fan_out_list=fan_out_list,
-                max_fan_out=max_fan_out,
-                draft_logits=draft_logits_for_select,
-                draft_tokens=draft_tokens_cat,
-                rec_tokens=bonus_cat,
-                glue_logits=glue_logits,
-            )
-
-            # Map each entry back to the originating VS via
-            # entry_batch_ids[i] (which indexes the merged batch).
-            # Build slice_owner[i] = vs_idx for each of the N
-            # entries.
-            vs_of_seq: list[int] = []
-            for vs_idx, sm in enumerate(slice_metas):
-                vs_of_seq.extend([vs_idx] * sm["B"])
-            # entry_batch_ids is a deterministic
-            # ``arange(B_total).repeat_interleave(entries_per_seq)``
-            # pattern produced by ``_select_bonus_candidates``; we
-            # reconstruct the host-side equivalent without a GPU→CPU
-            # sync. The prior ``entry_batch_ids.tolist()`` showed
-            # up as ~1.17 ms in the inter-phase band of every
-            # merged cb cycle because it forced the
-            # ``_select_bonus_candidates`` GPU queue to drain.
-            entry_owner = [
-                vs_of_seq[b] for b in range(B_total)
-                for _ in range(entries_per_seq)
-            ]
-
-            # ONE merged block allocation. Block reservation is
-            # per-VS, so split allocated blocks by entry_owner.
-            bs = runner.block_size
-            blocks_per_branch = (K + bs) // bs + 1
-            total_needed = N * blocks_per_branch
-            available = (
-                (runner.num_kv_blocks - runner._next_free_block)
-                + len(runner._free_list)
-            )
-            if available < total_needed:
-                # Pool exhausted; abort. No need to restore _seq_lens —
-                # next SPECULATE's sync overwrites it from
-                # _round_base_lens + k_accepted regardless.
-                return
-            dedicated_blocks = runner._alloc_n_blocks(total_needed)
-            # Reserve dedicated blocks per VS (chunk
-            # dedicated_blocks by entry owner).
-            blocks_by_vs: dict[int, list[int]] = {
-                i: [] for i in range(len(slice_metas))
-            }
-            for n in range(N):
-                base = n * blocks_per_branch
-                blocks_by_vs[entry_owner[n]].extend(
-                    dedicated_blocks[base:base + blocks_per_branch]
-                )
-            for vs_idx, blks in blocks_by_vs.items():
-                if blks:
-                    runner.reserve_dedicated_blocks(
-                        blks, slice_metas[vs_idx]["vs_id"],
+            with _cb_span("cb3_miss_glue_splice"):
+                draft_logits_for_select = self._last_draft_logits
+                # Zero-fallback miss rows: replace k=0 logits with
+                # glue_logits so bonus candidates are real (see
+                # _build_standalone_cache for full reasoning). Run
+                # unconditionally — masked assignment is a no-op when
+                # the mask is all-False; gating with .any().item() was
+                # a CPU↔GPU sync per round.
+                if merged_miss_mask is not None:
+                    draft_logits_for_select = (
+                        draft_logits_for_select.clone()
+                    )
+                    # torch.where instead of boolean-mask indexing (see
+                    # single-path comment for reasoning).
+                    V = draft_logits_for_select.shape[2]
+                    mask_v = merged_miss_mask.view(-1, 1).expand(-1, V)
+                    draft_logits_for_select[:, 0] = torch.where(
+                        mask_v,
+                        glue_logits,
+                        draft_logits_for_select[:, 0],
                     )
 
-            # Build branch_block_tables and prefix_lens (same math
-            # as _allocate_branch_blocks_and_copy_kv but using
-            # already-allocated dedicated_blocks).
-            M = runner.max_num_blocks
-            # seq_ids_list was already materialized above (line ~376).
-            # Use it directly instead of per-element seq_ids_cat[b].item(),
-            # which adds B_total CPU↔GPU syncs.
-            base_lens_t = torch.tensor(
-                [
-                    self._round_base_lens.get(sid, 0)
-                    for sid in seq_ids_list
-                ],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            prefix_lens = (
-                base_lens_t[entry_batch_ids] + 1 + k_positions
-            )
-            seq_ids_for_branches = (
-                seq_ids_cat[entry_batch_ids].to(torch.int64)
-            )
-            branch_block_tables = runner._block_table_gpu[
-                seq_ids_for_branches
-            ].contiguous()
-            first_write_blk = prefix_lens // bs
-            ded_tensor = torch.tensor(
-                dedicated_blocks,
-                dtype=torch.int64,
-                device=self.device,
-            ).view(N, blocks_per_branch)
-            j_range = torch.arange(
-                blocks_per_branch,
-                device=self.device,
-                dtype=torch.int64,
-            )
-            tbl_indices = (
-                first_write_blk.unsqueeze(1) + j_range.unsqueeze(0)
-            )
-            valid = tbl_indices < M
-            n_idx = (
-                torch.arange(N, device=self.device)
-                .unsqueeze(1)
-                .expand_as(tbl_indices)
-            )
-            # Read parent block IDs BEFORE mutating branch_block_tables:
-            # at this point it's still a clean copy of the parent table,
-            # so we can skip a second _block_table_gpu gather.
-            src_indices_i64 = tbl_indices.clamp(max=M - 1).to(torch.int64)
-            src_block_ids = branch_block_tables[
-                n_idx, src_indices_i64,
-            ].to(torch.int64)
-
-            branch_block_tables[
-                n_idx[valid], tbl_indices[valid].to(torch.int64),
-            ] = ded_tensor[valid].to(torch.int32)
-
-            # KV copy from parent into newly-reserved blocks.
-            # Uses the same shape-invariant "self-copy for skip" trick
-            # as the solo path so the batched CUDA-graph KV copy
-            # (``runner.run_kv_copy``) can replay a captured graph of
-            # fixed size N × blocks_per_branch. Previously each layer
-            # fired its own fancy-index kernel (~28 launches ≈ 4 ms
-            # dominated by launch overhead); the graph replay folds
-            # them into a single dispatch.
-            dst_block_ids = ded_tensor
-            copy_mask = (
-                valid & (src_block_ids != dst_block_ids)
-            )
-            if runner.kv_caches is not None:
-                src_flat_all = src_block_ids.reshape(-1).to(torch.int64)
-                dst_flat_all = dst_block_ids.reshape(-1).to(torch.int64)
-                copy_flat = copy_mask.reshape(-1)
-                safe_src = torch.where(
-                    copy_flat, src_flat_all, dst_flat_all,
+            # ONE merged bonus selection.
+            with _cb_span("cb3_select_bonus"):
+                (
+                    entry_batch_ids,
+                    k_positions,
+                    bonus_candidates,
+                    _branches,
+                ) = self._select_bonus_candidates(
+                    B=B_total,
+                    fan_out_list=fan_out_list,
+                    max_fan_out=max_fan_out,
+                    draft_logits=draft_logits_for_select,
+                    draft_tokens=draft_tokens_cat,
+                    rec_tokens=bonus_cat,
+                    glue_logits=glue_logits,
                 )
-                runner.run_kv_copy(safe_src, dst_flat_all)
+
+            with _cb_span("cb3_alloc_and_reserve"):
+                # Map each entry back to the originating VS via
+                # entry_batch_ids[i] (which indexes the merged batch).
+                # Build slice_owner[i] = vs_idx for each of the N
+                # entries.
+                vs_of_seq: list[int] = []
+                for vs_idx, sm in enumerate(slice_metas):
+                    vs_of_seq.extend([vs_idx] * sm["B"])
+                # entry_batch_ids is a deterministic
+                # ``arange(B_total).repeat_interleave(entries_per_seq)``
+                # pattern produced by ``_select_bonus_candidates``; we
+                # reconstruct the host-side equivalent without a
+                # GPU→CPU sync. The prior ``entry_batch_ids.tolist()``
+                # showed up as ~1.17 ms in the inter-phase band of
+                # every merged cb cycle because it forced the
+                # ``_select_bonus_candidates`` GPU queue to drain.
+                entry_owner = [
+                    vs_of_seq[b] for b in range(B_total)
+                    for _ in range(entries_per_seq)
+                ]
+
+                # ONE merged block allocation. Block reservation is
+                # per-VS, so split allocated blocks by entry_owner.
+                bs = runner.block_size
+                blocks_per_branch = (K + bs) // bs + 1
+                total_needed = N * blocks_per_branch
+                available = (
+                    (runner.num_kv_blocks - runner._next_free_block)
+                    + len(runner._free_list)
+                )
+                if available < total_needed:
+                    # Pool exhausted; abort. No need to restore
+                    # _seq_lens — next SPECULATE's sync overwrites it
+                    # from _round_base_lens + k_accepted regardless.
+                    return
+                dedicated_blocks = runner._alloc_n_blocks(total_needed)
+                # Reserve dedicated blocks per VS (chunk
+                # dedicated_blocks by entry owner).
+                blocks_by_vs: dict[int, list[int]] = {
+                    i: [] for i in range(len(slice_metas))
+                }
+                for n in range(N):
+                    base = n * blocks_per_branch
+                    blocks_by_vs[entry_owner[n]].extend(
+                        dedicated_blocks[base:base + blocks_per_branch]
+                    )
+                for vs_idx, blks in blocks_by_vs.items():
+                    if blks:
+                        runner.reserve_dedicated_blocks(
+                            blks, slice_metas[vs_idx]["vs_id"],
+                        )
+
+            with _cb_span("cb3_branch_block_tables"):
+                # Build branch_block_tables and prefix_lens (same math
+                # as _allocate_branch_blocks_and_copy_kv but using
+                # already-allocated dedicated_blocks).
+                M = runner.max_num_blocks
+                # seq_ids_list was already materialized above (line
+                # ~376). Use it directly instead of per-element
+                # seq_ids_cat[b].item(), which adds B_total CPU↔GPU
+                # syncs.
+                base_lens_t = torch.tensor(
+                    [
+                        self._round_base_lens.get(sid, 0)
+                        for sid in seq_ids_list
+                    ],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                prefix_lens = (
+                    base_lens_t[entry_batch_ids] + 1 + k_positions
+                )
+                seq_ids_for_branches = (
+                    seq_ids_cat[entry_batch_ids].to(torch.int64)
+                )
+                branch_block_tables = runner._block_table_gpu[
+                    seq_ids_for_branches
+                ].contiguous()
+                first_write_blk = prefix_lens // bs
+                ded_tensor = torch.tensor(
+                    dedicated_blocks,
+                    dtype=torch.int64,
+                    device=self.device,
+                ).view(N, blocks_per_branch)
+                j_range = torch.arange(
+                    blocks_per_branch,
+                    device=self.device,
+                    dtype=torch.int64,
+                )
+                tbl_indices = (
+                    first_write_blk.unsqueeze(1) + j_range.unsqueeze(0)
+                )
+                valid = tbl_indices < M
+                n_idx = (
+                    torch.arange(N, device=self.device)
+                    .unsqueeze(1)
+                    .expand_as(tbl_indices)
+                )
+                # Read parent block IDs BEFORE mutating
+                # branch_block_tables: at this point it's still a
+                # clean copy of the parent table, so we can skip a
+                # second _block_table_gpu gather.
+                src_indices_i64 = tbl_indices.clamp(max=M - 1).to(
+                    torch.int64
+                )
+                src_block_ids = branch_block_tables[
+                    n_idx, src_indices_i64,
+                ].to(torch.int64)
+
+                branch_block_tables[
+                    n_idx[valid], tbl_indices[valid].to(torch.int64),
+                ] = ded_tensor[valid].to(torch.int32)
+
+            with _cb_span("cb3_run_kv_copy"):
+                # KV copy from parent into newly-reserved blocks.
+                # Uses the same shape-invariant "self-copy for skip"
+                # trick as the solo path so the batched CUDA-graph KV
+                # copy (``runner.run_kv_copy``) can replay a captured
+                # graph of fixed size N × blocks_per_branch.
+                # Previously each layer fired its own fancy-index
+                # kernel (~28 launches ≈ 4 ms dominated by launch
+                # overhead); the graph replay folds them into a
+                # single dispatch.
+                dst_block_ids = ded_tensor
+                copy_mask = (
+                    valid & (src_block_ids != dst_block_ids)
+                )
+                if runner.kv_caches is not None:
+                    src_flat_all = src_block_ids.reshape(-1).to(
+                        torch.int64
+                    )
+                    dst_flat_all = dst_block_ids.reshape(-1).to(
+                        torch.int64
+                    )
+                    copy_flat = copy_mask.reshape(-1)
+                    safe_src = torch.where(
+                        copy_flat, src_flat_all, dst_flat_all,
+                    )
+                    runner.run_kv_copy(safe_src, dst_flat_all)
 
             # ONE merged tree decode (or parallel fanout). Mask KVs
             # at depths 1..K-1 are dirty in the dedicated blocks
             # we just wrote; they get cleaned next round in
             # ``_fused_cleanup_and_glue`` for whichever branch
             # wins the next-round lookup.
-            if self._use_parallel_fanout:
-                all_tokens, all_logits = self._run_parallel_fanout(
-                    runner=runner,
-                    N=N,
-                    K=K,
-                    seq_ids=seq_ids_cat,
-                    entry_batch_ids=entry_batch_ids,
-                    prefix_lens=prefix_lens,
-                    branch_block_tables=branch_block_tables,
-                    bonus_candidates=bonus_candidates,
-                )
-            else:
-                all_tokens, all_logits = self._run_tree_decode(
-                    runner=runner,
-                    N=N,
-                    K=K,
-                    seq_ids=seq_ids_cat,
-                    entry_batch_ids=entry_batch_ids,
-                    prefix_lens=prefix_lens,
-                    branch_block_tables=branch_block_tables,
-                    bonus_candidates=bonus_candidates,
-                )
+            with _cb_span("cb3_fanout_call"):
+                if self._use_parallel_fanout:
+                    all_tokens, all_logits = self._run_parallel_fanout(
+                        runner=runner,
+                        N=N,
+                        K=K,
+                        seq_ids=seq_ids_cat,
+                        entry_batch_ids=entry_batch_ids,
+                        prefix_lens=prefix_lens,
+                        branch_block_tables=branch_block_tables,
+                        bonus_candidates=bonus_candidates,
+                    )
+                else:
+                    all_tokens, all_logits = self._run_tree_decode(
+                        runner=runner,
+                        N=N,
+                        K=K,
+                        seq_ids=seq_ids_cat,
+                        entry_batch_ids=entry_batch_ids,
+                        prefix_lens=prefix_lens,
+                        branch_block_tables=branch_block_tables,
+                        bonus_candidates=bonus_candidates,
+                    )
 
-            # Split populate per VS via CPU-computed slice ranges.
-            # ``slice_metas`` are laid out contiguously per VS (see
-            # speculate_handler), so each VS owns a fixed slice of the
-            # merged tensors [start:end). No boolean indexing (which
-            # would force a shape sync per gather) and no mask.any()
-            # gate (which was ~5 ms/call × 3 slices ≈ 20 ms of GPU
-            # idle per iter at 3V c=8 pre-fix). All slice bounds are
-            # host-side ints known before any GPU work fires.
-            seq_ids_per_branch = seq_ids_cat[entry_batch_ids]
-            start = 0
-            for sm in slice_metas:
-                end = start + sm["B"] * entries_per_seq
-                self.cache.populate(
-                    seq_ids=seq_ids_per_branch[start:end],
-                    k_positions=k_positions[start:end],
-                    bonus_tokens=bonus_candidates[start:end],
-                    draft_tokens=all_tokens[start:end],
-                    draft_logits=all_logits[start:end],
-                    branch_block_tables=branch_block_tables[start:end],
-                    prefix_lens=prefix_lens[start:end],
-                    vs_id=sm["vs_id"],
-                )
-                start = end
+            with _cb_span("cb3_populate_per_vs"):
+                # Split populate per VS via CPU-computed slice ranges.
+                # ``slice_metas`` are laid out contiguously per VS
+                # (see speculate_handler), so each VS owns a fixed
+                # slice of the merged tensors [start:end). No boolean
+                # indexing (which would force a shape sync per gather)
+                # and no mask.any() gate (which was ~5 ms/call × 3
+                # slices ≈ 20 ms of GPU idle per iter at 3V c=8
+                # pre-fix). All slice bounds are host-side ints known
+                # before any GPU work fires.
+                seq_ids_per_branch = seq_ids_cat[entry_batch_ids]
+                start = 0
+                for sm in slice_metas:
+                    end = start + sm["B"] * entries_per_seq
+                    self.cache.populate(
+                        seq_ids=seq_ids_per_branch[start:end],
+                        k_positions=k_positions[start:end],
+                        bonus_tokens=bonus_candidates[start:end],
+                        draft_tokens=all_tokens[start:end],
+                        draft_logits=all_logits[start:end],
+                        branch_block_tables=branch_block_tables[
+                            start:end
+                        ],
+                        prefix_lens=prefix_lens[start:end],
+                        vs_id=sm["vs_id"],
+                    )
+                    start = end
 
     # ------------------------------------------------------------------
     # Response helpers

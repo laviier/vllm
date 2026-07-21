@@ -18,11 +18,18 @@ Reference: SSD paper §4.1 (Geometric Fan-Out Cache Construction)
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Diagnostic: when set, annotate sub-regions inside get_hit_block_tables
+# so the profiler can attribute the 5.77 ms p50 wall to specific ops.
+# Costs one extra record_function push per stage but no CPU/GPU work.
+_GHBT_TRACE = os.environ.get("VLLM_DISAGG_GHBT_TRACE", "0") == "1"
 
 
 class SpeculationCache:
@@ -575,7 +582,16 @@ class SpeculationCache:
             return None, None
 
         match_idx = self._last_match_idx                  # [B]
-        hit_indices = match_idx[hit_mask]                 # [num_hits]
+        # Boolean-mask index: forces a CUDA sync to resolve output shape.
+        # If prior-round cache_build kernels are still draining on the
+        # default stream, this is where that wait lands.
+        if _GHBT_TRACE:
+            with torch.profiler.record_function("ghbt_hit_indices"):
+                hit_indices = match_idx[hit_mask]         # [num_hits]
+        else:
+            hit_indices = match_idx[hit_mask]             # [num_hits]
+        # ``numel()`` on the result reads shape only — the sync above
+        # already resolved it, so this is a cheap host-side query.
         if hit_indices.numel() == 0:
             return None, None
 
@@ -590,13 +606,20 @@ class SpeculationCache:
         n_entries = self.num_entries
         if n_entries == 0:
             return None, None
-        hit_indices = hit_indices.clamp(max=n_entries - 1)
-
-        owners = self._owners[hit_indices]                # [num_hits]
+        if _GHBT_TRACE:
+            with torch.profiler.record_function("ghbt_clamp_owners"):
+                hit_indices = hit_indices.clamp(max=n_entries - 1)
+                owners = self._owners[hit_indices]        # [num_hits]
+        else:
+            hit_indices = hit_indices.clamp(max=n_entries - 1)
+            owners = self._owners[hit_indices]            # [num_hits]
 
         # Build a flat concatenation of per-VS branch tables indexed
         # by small_id. Per-hit lookup maps global cache index →
         # (owner_vs, local_index) → flat index in the concat.
+        if _GHBT_TRACE:
+            _ghbt_cat_ctx = torch.profiler.record_function("ghbt_py_cat")
+            _ghbt_cat_ctx.__enter__()
         table_list: list[torch.Tensor] = []
         prefix_list: list[torch.Tensor] = []
         vs_start: dict[str, int] = {}
@@ -615,16 +638,23 @@ class SpeculationCache:
             cursor += self._vs_counts.get(vs_id, 0)
 
         if not table_list:
+            if _GHBT_TRACE:
+                _ghbt_cat_ctx.__exit__(None, None, None)
             return None, None
 
         flat_tables = torch.cat(table_list, dim=0)
         flat_prefix = torch.cat(prefix_list, dim=0)
+        if _GHBT_TRACE:
+            _ghbt_cat_ctx.__exit__(None, None, None)
 
         # Vectorized on GPU. Reuse pre-allocated pinned+GPU staging so
         # the per-small_id lookup tensors can be updated cheaply each
         # call. Previous ``owners.tolist() + hit_indices.tolist()``
         # host syncs stalled ~3-5 ms behind cache_build kernels on the
         # IPC-early-dispatch path.
+        if _GHBT_TRACE:
+            _ghbt_stage_ctx = torch.profiler.record_function("ghbt_stage_pinned")
+            _ghbt_stage_ctx.__enter__()
         n_small = len(self._small_id_to_vs)
         start_pin = self._vs_start_cpu_pin[:n_small]
         offset_pin = self._vs_offset_cpu_pin[:n_small]
@@ -645,9 +675,22 @@ class SpeculationCache:
         # default stream because the source is pinned.
         start_gpu.copy_(start_pin, non_blocking=True)
         offset_gpu.copy_(offset_pin, non_blocking=True)
+        if _GHBT_TRACE:
+            _ghbt_stage_ctx.__exit__(None, None, None)
 
         # owners is [num_hits] of small_ids (int32). Gather per-hit
         # starts / offsets, then compute flat indices in one op.
+        if _GHBT_TRACE:
+            with torch.profiler.record_function("ghbt_flat_idx"):
+                owners_i64 = owners.to(torch.int64)
+                per_hit_start = start_gpu[owners_i64]       # [num_hits]
+                per_hit_offset = offset_gpu[owners_i64]     # [num_hits]
+                flat_idx = per_hit_start + (hit_indices - per_hit_offset)
+            with torch.profiler.record_function("ghbt_gather_out"):
+                out_tables = flat_tables[flat_idx]
+                out_prefix = flat_prefix[flat_idx]
+            return out_tables, out_prefix
+
         owners_i64 = owners.to(torch.int64)
         per_hit_start = start_gpu[owners_i64]              # [num_hits]
         per_hit_offset = offset_gpu[owners_i64]            # [num_hits]
