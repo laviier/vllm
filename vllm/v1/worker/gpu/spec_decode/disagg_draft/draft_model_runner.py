@@ -23,6 +23,7 @@ Reference: SSD ref impl ssd/engine/model_runner.py
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import torch
@@ -168,6 +169,22 @@ class DraftModelRunner(
         self._kv_copy_src_buf: torch.Tensor | None = None
         self._kv_copy_dst_buf: torch.Tensor | None = None
         self._kv_copy_graph_pool = None
+
+        # ir_op priority override — see load_model() for the reason.
+        # Populated (as an IrOpPriorityConfig) when the drafter model
+        # loads.
+        self._drafter_ir_priority = None
+
+    def _ir_priority_ctx(self):
+        """Context manager that installs the drafter's ir_op priority.
+
+        No-op when ``_drafter_ir_priority`` isn't set yet (e.g. during
+        early init before load_model). See ``load_model`` for why we
+        need this scoped override rather than the worker-wide default.
+        """
+        if self._drafter_ir_priority is None:
+            return contextlib.nullcontext()
+        return self._drafter_ir_priority.set_priority()
 
     # Upper bound on n for KV copy: max branches × max blocks/branch.
     # MAX_BRANCHES = 504 (DraftServer.MAX_BRANCHES). blocks_per_branch
@@ -380,7 +397,9 @@ class DraftModelRunner(
             g["graph"].replay()
             hidden_states = g["hidden"][:N]
         else:
-            # Eager fallback
+            # Eager fallback — wrap in the drafter's ir_op priority so
+            # the fused vllm_c RMSNorm kernel is picked (see load_model()
+            # for the reason).
             query_start_loc = torch.arange(
                 N + 1, dtype=torch.int32, device=self.device
             )
@@ -401,7 +420,7 @@ class DraftModelRunner(
                 num_tokens=N,
                 slot_mapping=slot_mapping_dict,
                 batch_descriptor=batch_descriptor,
-            ):
+            ), self._ir_priority_ctx():
                 hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -481,21 +500,43 @@ class DraftModelRunner(
         self._bind_kv_cache_to_attention_layers()
         self._model_loaded = True
 
-        try:
-            self._capture_decode_graphs()
-        except Exception as e:
-            logger.warning(
-                "CUDA graph capture failed: %s. Using eager decode.", e
-            )
-            self._decode_graphs_captured = False
+        # The worker-wide ir_op priority was set at worker init from the
+        # target's kernel_config. When the target uses inductor, that
+        # priority is ["native"] because inductor traces the decomposed
+        # PyTorch impl of RMSNorm and re-fuses it as part of a bigger
+        # compiled graph. The drafter runs with CompilationMode.NONE
+        # (no inductor), so leaving priority at "native" bakes ~7
+        # separate kernels per RMSNorm into every drafter forward.
+        # Override to ["vllm_c", "native"] on this drafter's forwards
+        # (and, critically, its CUDA graph captures — priority is a
+        # capture-time decision that gets frozen into the replayable
+        # graph). Every drafter forward path (graph capture, eager
+        # fallback in tree_decode_step / decode_step, prefill) wraps
+        # itself in ``self._ir_priority_ctx()`` so this override applies
+        # exactly where we need it and nowhere else.
+        from vllm.config.kernel import IrOpPriorityConfig
+        self._drafter_ir_priority = IrOpPriorityConfig.with_default(
+            ["vllm_c", "native"]
+        )
 
-        try:
-            self._capture_tree_decode_graphs()
-        except Exception as e:
-            logger.warning(
-                "Tree decode CUDA graph capture failed: %s. Using eager.", e
-            )
-            self._tree_decode_captured = False
+        with self._ir_priority_ctx():
+            try:
+                self._capture_decode_graphs()
+            except Exception as e:
+                logger.warning(
+                    "CUDA graph capture failed: %s. Using eager decode.",
+                    e,
+                )
+                self._decode_graphs_captured = False
+
+            try:
+                self._capture_tree_decode_graphs()
+            except Exception as e:
+                logger.warning(
+                    "Tree decode CUDA graph capture failed: %s. Using eager.",
+                    e,
+                )
+                self._tree_decode_captured = False
 
         try:
             self._capture_kv_copy_graphs()
@@ -582,7 +623,8 @@ class DraftModelRunner(
         # layer's KV cache gets updated via unified_kv_cache_update.
         slot_mapping_dict = self._build_slot_mapping_dict(slot_mapping)
 
-        # Run model forward with proper context
+        # Run model forward with proper context. ``_ir_priority_ctx()``
+        # picks the fused vllm_c RMSNorm impl (see load_model()).
         batch_descriptor = BatchDescriptor(num_tokens=total)
         with set_forward_context(
             attn_metadata=attn_metadata,
@@ -590,7 +632,7 @@ class DraftModelRunner(
             num_tokens=total,
             slot_mapping=slot_mapping_dict,
             batch_descriptor=batch_descriptor,
-        ):
+        ), self._ir_priority_ctx():
             # V1 models don't accept kv_caches as a forward argument;
             # KV cache is managed through the attention backend via
             # set_forward_context.
@@ -684,7 +726,7 @@ class DraftModelRunner(
                 num_tokens=B,
                 slot_mapping=slot_mapping_dict,
                 batch_descriptor=batch_descriptor,
-            ):
+            ), self._ir_priority_ctx():
                 hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
