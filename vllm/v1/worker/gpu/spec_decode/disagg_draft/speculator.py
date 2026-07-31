@@ -25,13 +25,16 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections import defaultdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import prometheus_client
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.spec_decode.draft_router import DraftRouter
 
 logger = init_logger(__name__)
 
@@ -158,6 +161,7 @@ class DisaggSpeculatorProxy:
 
         # disagg does not support multimodal inputs for drafting
         self.supports_mm_inputs = False
+        self.model = _DisaggDraftModelStub()
 
         # Injected via set_router(); see init_speculator().
         self.router: DraftRouter | None = None
@@ -168,8 +172,8 @@ class DisaggSpeculatorProxy:
         self._last_all_unavailable_warn: int = 0
         self._all_unavailable_warn_interval: int = 50
 
-        # Prompt tokens cached by cache_new_request_tokens(), drained
-        # by _prefill_new_requests(). Keyed by req_id.
+        # Prompt tokens cached for the request lifetime so failover can
+        # rebuild draft-side state on a replacement server.
         self._pending_prompt_tokens: dict[str, list[int]] = {}
 
         # Per-request state for the draft side.
@@ -207,7 +211,7 @@ class DisaggSpeculatorProxy:
     # Wiring hooks
     # ------------------------------------------------------------------
 
-    def set_router(self, router: "DraftRouter") -> None:
+    def set_router(self, router: DraftRouter) -> None:
         from vllm.v1.spec_decode.draft_connector import CudaIpcDraftConnector
         from vllm.v1.spec_decode.draft_router import DraftRouter
 
@@ -239,7 +243,11 @@ class DisaggSpeculatorProxy:
         self, req_id: str, prompt_token_ids: list[int]
     ) -> None:
         """Stash a new request's prompt tokens so ``_prefill_new_requests``
-        can ship them to a draft server without a second UVA read."""
+        can ship them to a draft server without a second UVA read.
+
+        Tokens remain cached until request completion because server
+        failover requires replaying PREFILL on the replacement drafter.
+        """
         self._pending_prompt_tokens[req_id] = list(prompt_token_ids)
 
     @property
@@ -270,6 +278,12 @@ class DisaggSpeculatorProxy:
                     "Draft server %d reconnected successfully.", srv_idx,
                 )
 
+    def _handle_server_failure(self, server_index: int) -> None:
+        """Invalidate draft-side readiness after routing failover."""
+        assert self.router is not None
+        affected_req_ids = self.router.handle_server_failure(server_index)
+        self._disagg_prefilled_reqs.difference_update(affected_req_ids)
+
     # ------------------------------------------------------------------
     # Model-runner shim (these methods make the proxy look like a local
     # speculator to the V2 model runner)
@@ -277,16 +291,21 @@ class DisaggSpeculatorProxy:
 
     def load_model(self, target_model=None) -> None:
         """No-op: the draft model lives on a separate GPU."""
-        self.model = _DisaggDraftModelStub()
 
     def set_attn(self, *args, **kwargs) -> None:
         """No-op: the draft model manages its own attention."""
+
+    def init_cudagraph_manager(self, cudagraph_mode=None) -> None:
+        """No-op: CUDA graphs for the draft live on the draft GPU."""
+
+    def capture(self, attn_states=None) -> None:
+        """No-op: CUDA graphs for the draft live on the draft GPU."""
 
     def capture_model(self) -> None:
         """No-op: CUDA graphs for the draft live on the draft GPU."""
 
     # ------------------------------------------------------------------
-    # Propose (V1 runner signature — called from gpu_model_runner.py)
+    # Propose interfaces for legacy and current GPU model runners
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -368,24 +387,57 @@ class DisaggSpeculatorProxy:
     def propose(
         self,
         input_batch,
-        num_sampled: torch.Tensor,
-        last_sampled: torch.Tensor,
-        temperature: torch.Tensor,
-        **kwargs: Any,
+        attn_metadata: dict[str, Any] | torch.Tensor | None = None,
+        slot_mappings: dict[str, torch.Tensor] | torch.Tensor | None = None,
+        last_hidden_states: torch.Tensor | None = None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
+        num_sampled: torch.Tensor | None = None,
+        num_rejected: torch.Tensor | None = None,
+        last_sampled: torch.Tensor | None = None,
+        next_prefill_tokens: torch.Tensor | None = None,
+        temperature: torch.Tensor | None = None,
+        seeds: torch.Tensor | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        is_profile: bool = False,
     ) -> torch.Tensor:
         """Request K draft tokens for every request in the batch.
+
+        Supports the canonical ``BaseSpeculator`` call used by
+        ``gpu/model_runner.py`` and the legacy positional call
+        ``propose(input_batch, num_sampled, last_sampled, temperature)``.
 
         Returns ``[num_reqs, K]`` int64 tensor. Non-rank-0 TP workers,
         dummy/warmup batches, and batches with no active requests all
         return zeros; callers rely on a TP broadcast to align all ranks.
         """
+        if (
+            num_sampled is None
+            and last_sampled is None
+            and temperature is None
+            and isinstance(attn_metadata, torch.Tensor)
+            and isinstance(slot_mappings, torch.Tensor)
+            and isinstance(last_hidden_states, torch.Tensor)
+        ):
+            num_sampled = attn_metadata
+            last_sampled = slot_mappings
+            temperature = last_hidden_states
+
+        if num_sampled is None or last_sampled is None or temperature is None:
+            raise TypeError(
+                "DisaggSpeculatorProxy.propose requires num_sampled, "
+                "last_sampled, and temperature."
+            )
+
         num_reqs = input_batch.num_reqs
         K = self.num_speculative_steps
         zeros = torch.zeros(
             num_reqs, K, dtype=torch.int64, device=self.device,
         )
 
-        if self._tp_rank != 0 or self.router is None:
+        if dummy_run or is_profile or self._tp_rank != 0 or self.router is None:
             return zeros
 
         self._propose_count += 1
@@ -461,7 +513,8 @@ class DisaggSpeculatorProxy:
         with record_function("propose_step3_build_outcome_tensors"):
             active_req_indices = [
                 i for i, rid in enumerate(req_ids)
-                if rid in self._disagg_req_to_seq_id
+                if rid in self._disagg_prefilled_reqs
+                and rid in self._disagg_req_to_seq_id
             ]
             if not active_req_indices:
                 return torch.zeros(
@@ -561,12 +614,19 @@ class DisaggSpeculatorProxy:
         """Send FREE_SEQ per draft server for requests no longer active."""
         assert self.router is not None
         active_rids = set(req_ids)
-        stale = self._disagg_prefilled_reqs - active_rids
+        tracked_rids = (
+            self._disagg_prefilled_reqs
+            | set(self._disagg_req_to_seq_id)
+            | set(self._pending_prompt_tokens)
+            | set(self.router.assignment)
+        )
+        stale = tracked_rids - active_rids
         if not stale:
             return
         self._disagg_prefilled_reqs -= stale
         stale_by_server: dict[int, list[int]] = defaultdict(list)
         for rid in stale:
+            self._pending_prompt_tokens.pop(rid, None)
             sid = self._disagg_req_to_seq_id.pop(rid, None)
             if sid is not None:
                 self._disagg_free_seq_ids.append(sid)
@@ -603,7 +663,7 @@ class DisaggSpeculatorProxy:
             self._disagg_req_to_seq_id[rid] = sid
 
         for rid in new_req_ids:
-            prompt_ids = self._pending_prompt_tokens.pop(rid, None)
+            prompt_ids = self._pending_prompt_tokens.get(rid)
             if not prompt_ids:
                 logger.warning(
                     "Disagg prefill req %s: no cached prompt tokens, "
@@ -631,9 +691,12 @@ class DisaggSpeculatorProxy:
                 )
             except Exception as e:
                 logger.error("PREFILL for req %s failed: %s", rid, e)
+                if isinstance(e, ConnectionError):
+                    server_index = self.router.assignment.get(rid)
+                    if server_index is not None:
+                        self._handle_server_failure(server_index)
                 continue
-
-        self._disagg_prefilled_reqs.update(new_req_ids)
+            self._disagg_prefilled_reqs.add(rid)
 
     def _do_propose_dispatch(
         self,
@@ -678,7 +741,8 @@ class DisaggSpeculatorProxy:
             with record_function("propose_step3a_active_req_indices"):
                 active_req_indices = [
                     i for i, rid in enumerate(req_ids)
-                    if rid in self._disagg_req_to_seq_id
+                    if rid in self._disagg_prefilled_reqs
+                    and rid in self._disagg_req_to_seq_id
                 ]
                 if not active_req_indices:
                     return None
@@ -858,7 +922,7 @@ class DisaggSpeculatorProxy:
                     "Draft server %d failed (%s); marking unavailable.",
                     srv_idx, result,
                 )
-                self.router.handle_server_failure(srv_idx)
+                self._handle_server_failure(srv_idx)
                 continue
             if isinstance(result, BaseException):
                 logger.warning(
@@ -990,7 +1054,7 @@ class DisaggSpeculatorProxy:
                     "Draft server %d failed (%s); marking unavailable.",
                     srv_idx, result,
                 )
-                self.router.handle_server_failure(srv_idx)
+                self._handle_server_failure(srv_idx)
                 continue
             if isinstance(result, BaseException):
                 logger.warning(

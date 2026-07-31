@@ -113,16 +113,22 @@ class TestHandleServerFailure:
         router = DraftRouter(connectors=conns)
         router.assign("r0")  # → server 0
         router.assign("r1")  # → server 1
-        router.handle_server_failure(0)
+        affected = router.handle_server_failure(0)
         # r0 should now be on server 1
         assert router.assignment["r0"] == 1
+        assert affected == ["r0"]
 
     def test_failure_of_all_servers_removes_assignments(self):
         router = DraftRouter(connectors=_make_connectors(1))
         router.assign("r0")
-        router.handle_server_failure(0)
+        affected = router.handle_server_failure(0)
         # No servers left — assignment removed
         assert "r0" not in router.assignment
+        assert affected == ["r0"]
+
+    def test_failure_without_assignments_returns_empty_list(self):
+        router = DraftRouter(connectors=_make_connectors(2))
+        assert router.handle_server_failure(0) == []
 
     def test_invalid_server_index_raises(self):
         router = DraftRouter(connectors=_make_connectors(2))

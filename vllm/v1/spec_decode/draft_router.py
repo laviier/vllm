@@ -148,11 +148,14 @@ class DraftRouter:
         idx = self.assignment[request_id]
         return self.connectors[idx]
 
-    def handle_server_failure(self, server_index: int) -> None:
+    def handle_server_failure(self, server_index: int) -> list[str]:
         """Mark *server_index* as unavailable and reassign its requests.
 
         All requests currently assigned to the failed server are
         reassigned to other available servers via round-robin.
+
+        Returns:
+            Request IDs whose assignment changed or was removed.
         """
         if server_index < 0 or server_index >= len(self.connectors):
             raise IndexError(
@@ -174,7 +177,7 @@ class DraftRouter:
         ]
 
         if not affected:
-            return
+            return []
 
         for rid in affected:
             try:
@@ -195,6 +198,7 @@ class DraftRouter:
                 server_index,
                 new_idx,
             )
+        return affected
 
     # ------------------------------------------------------------------
     # Helpers

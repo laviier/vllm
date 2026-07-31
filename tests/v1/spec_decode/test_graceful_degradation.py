@@ -17,8 +17,7 @@ import importlib.util
 import pathlib
 import sys
 import types
-from collections import defaultdict
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
 import torch
@@ -86,6 +85,8 @@ def _make_mock_connector(connected: bool = True):
     """Create a mock DraftConnector with a ``connected`` property."""
     conn = MagicMock(name="connector")
     type(conn).connected = PropertyMock(return_value=connected)
+    conn.send_prefill = AsyncMock()
+    conn.send_free_seq = AsyncMock()
     return conn
 
 
@@ -157,6 +158,86 @@ def _make_input_batch(req_ids: list[str], device=torch.device("cpu")):
 
 
 # ------------------------------------------------------------------
+# Tests: old and new model-runner propose interfaces
+# ------------------------------------------------------------------
+
+
+class TestProposeInterface:
+    def test_exposes_new_model_runner_lifecycle_hooks(self):
+        proxy = _make_proxy(router=_make_router(1))
+
+        assert isinstance(proxy.model, torch.nn.Module)
+        proxy.init_cudagraph_manager()
+        proxy.capture()
+
+    def test_accepts_new_model_runner_positional_signature(self):
+        proxy = _make_proxy(router=_make_router(1))
+        batch = _make_input_batch(["r0"])
+        num_sampled = torch.tensor([1])
+        last_sampled = torch.tensor([[7]])
+        temperature = torch.tensor([1.0])
+        expected = torch.tensor([[7, 8, 9]])
+        proxy._do_propose = MagicMock(return_value=expected)
+
+        result = proxy.propose(
+            batch,
+            {},
+            {},
+            torch.zeros(1, 64),
+            None,
+            num_sampled,
+            torch.tensor([0]),
+            last_sampled,
+            torch.tensor([]),
+            temperature,
+            torch.tensor([0]),
+        )
+
+        assert result is expected
+        proxy._do_propose.assert_called_once_with(
+            batch, num_sampled, last_sampled, temperature
+        )
+
+    def test_preserves_legacy_positional_signature(self):
+        proxy = _make_proxy(router=_make_router(1))
+        batch = _make_input_batch(["r0"])
+        num_sampled = torch.tensor([1])
+        last_sampled = torch.tensor([[7]])
+        temperature = torch.tensor([1.0])
+        expected = torch.tensor([[7, 8, 9]])
+        proxy._do_propose = MagicMock(return_value=expected)
+
+        result = proxy.propose(
+            batch,
+            num_sampled,
+            last_sampled,
+            temperature,
+        )
+
+        assert result is expected
+        proxy._do_propose.assert_called_once_with(
+            batch, num_sampled, last_sampled, temperature
+        )
+
+    def test_dummy_run_skips_remote_speculation(self):
+        proxy = _make_proxy(router=_make_router(1))
+        batch = _make_input_batch(["r0"])
+        proxy._do_propose = MagicMock()
+
+        result = proxy.propose(
+            input_batch=batch,
+            num_sampled=torch.tensor([1]),
+            last_sampled=torch.tensor([[7]]),
+            temperature=torch.tensor([1.0]),
+            dummy_run=True,
+        )
+
+        assert result.shape == (1, 3)
+        assert (result == 0).all()
+        proxy._do_propose.assert_not_called()
+
+
+# ------------------------------------------------------------------
 # Tests: propose() returns zero tensor when all servers unavailable
 # ------------------------------------------------------------------
 
@@ -217,53 +298,93 @@ class TestAllServersUnavailable:
 
 
 # ------------------------------------------------------------------
-# Tests: ConnectionError in _do_propose_nm marks server unavailable
+# Tests: PREFILL state and failover
 # ------------------------------------------------------------------
 
 
-class TestConnectionErrorHandling:
-    """ConnectionError during speculation marks server unavailable."""
+class TestPrefillState:
+    """Only successfully prefilled requests may speculate."""
 
-    def test_connection_error_marks_server_failed(self):
-        router = _make_router(2, available=[True, True])
+    def test_missing_prompt_does_not_mark_request_prefilled(self):
+        router = _make_router(1)
         proxy = _make_proxy(router=router, num_steps=3)
 
-        # Simulate: server 0 raises ConnectionError on send
-        async def _raise_conn_error(*args, **kwargs):
-            raise ConnectionError("server down")
+        batch = _make_input_batch(["r0"])
+        ctx = proxy._do_propose_dispatch(
+            input_batch=batch,
+            num_sampled=torch.tensor([1]),
+            last_sampled=torch.tensor([[5]]),
+            temperature=torch.tensor([1.0]),
+        )
 
-        router.connectors[0].send_verification_outcome = _raise_conn_error
+        assert ctx is None
+        assert "r0" in proxy._disagg_req_to_seq_id
+        assert "r0" not in proxy._disagg_prefilled_reqs
+        router.connectors[0].send_prefill.assert_not_awaited()
 
-        # Assign a request to server 0
+    def test_failed_prefill_keeps_prompt_for_retry(self):
+        router = _make_router(1)
+        proxy = _make_proxy(router=router)
+        connector = router.connectors[0]
+        connector.send_prefill.side_effect = [
+            RuntimeError("temporary send failure"),
+            None,
+        ]
+        proxy.cache_new_request_tokens("r0", [1, 2, 3])
+
+        proxy._prefill_new_requests(["r0"])
+
+        assert "r0" not in proxy._disagg_prefilled_reqs
+        assert proxy._pending_prompt_tokens["r0"] == [1, 2, 3]
+
+        proxy._prefill_new_requests(["r0"])
+
+        assert "r0" in proxy._disagg_prefilled_reqs
+        assert connector.send_prefill.await_count == 2
+
+    def test_connection_failure_invalidates_same_server_prefills(self):
+        router = _make_router(2)
+        proxy = _make_proxy(router=router)
+        connector = router.connectors[0]
+        connector.send_prefill.side_effect = [
+            None,
+            ConnectionError("server failed"),
+        ]
+        router.assignment.update({"r0": 0, "r1": 0})
+        proxy.cache_new_request_tokens("r0", [1])
+        proxy.cache_new_request_tokens("r1", [2])
+
+        proxy._prefill_new_requests(["r0", "r1"])
+
+        assert proxy._disagg_prefilled_reqs.isdisjoint({"r0", "r1"})
+        assert router.assignment["r0"] == 1
+        assert router.assignment["r1"] == 1
+
+
+class TestServerFailover:
+    """Reassigned requests replay PREFILL before speculation resumes."""
+
+    def test_failover_invalidates_and_reprefills_request(self):
+        router = _make_router(2)
+        proxy = _make_proxy(router=router)
+        proxy.cache_new_request_tokens("r0", [4, 5, 6])
+        proxy._disagg_req_to_seq_id["r0"] = 7
+        proxy._disagg_prefilled_reqs.add("r0")
         router.assign("r0")
         assert router.assignment["r0"] == 0
 
-        # Prefill the request so it has a seq_id
-        proxy._disagg_req_to_seq_id["r0"] = 0
-        proxy._disagg_prefilled_reqs.add("r0")
+        proxy._handle_server_failure(0)
 
-        # Call _do_propose_nm — should catch ConnectionError and
-        # call handle_server_failure
-        draft_toks, draft_logits = proxy._do_propose_nm(
-            active_req_ids=["r0"],
-            active_req_indices=[0],
-            seq_ids=torch.tensor([0], dtype=torch.int64),
-            k_accepted=torch.tensor([0], dtype=torch.int64),
-            bonus_tokens=torch.tensor([5], dtype=torch.int64),
-            temperatures=torch.tensor([1.0]),
-            hidden_states=None,
-            extend_counts=None,
-            extend_hidden_states=None,
-            extend_token_ids=None,
-            B_active=1,
-        )
+        assert router.assignment["r0"] == 1
+        assert "r0" not in proxy._disagg_prefilled_reqs
 
-        # Server 0 should now be marked unavailable
-        assert router._available[0] is False
-        assert router._available[1] is True
+        proxy._prefill_new_requests(["r0"])
 
-        # Draft tokens should be zeros (fallback)
-        assert (draft_toks == 0).all()
+        assert "r0" in proxy._disagg_prefilled_reqs
+        router.connectors[1].send_prefill.assert_awaited_once()
+        call = router.connectors[1].send_prefill.await_args
+        assert call.kwargs["seq_id"] == 7
+        assert call.kwargs["prompt_token_ids"].tolist() == [4, 5, 6]
 
 
 # ------------------------------------------------------------------
