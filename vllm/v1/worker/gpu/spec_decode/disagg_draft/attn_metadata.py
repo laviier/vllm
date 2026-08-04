@@ -23,9 +23,7 @@ class DraftAttnMetadataMixin:
     ) -> torch.Tensor:
         """Build a [B, max_blocks] block table tensor from GPU-resident table."""
         if isinstance(seq_ids, list):
-            seq_ids_t = torch.tensor(
-                seq_ids, dtype=torch.int64, device=self.device
-            )
+            seq_ids_t = torch.tensor(seq_ids, dtype=torch.int64, device=self.device)
         else:
             seq_ids_t = seq_ids.to(torch.int64)
         # Return a contiguous copy so callers cannot mutate _block_table_gpu
@@ -46,16 +44,14 @@ class DraftAttnMetadataMixin:
             physical_block = block_table_gpu[seq_id, logical_block]
         """
         if isinstance(seq_ids, list):
-            seq_ids_t = torch.tensor(
-                seq_ids, dtype=torch.int64, device=self.device
-            )
+            seq_ids_t = torch.tensor(seq_ids, dtype=torch.int64, device=self.device)
         else:
             seq_ids_t = seq_ids.to(torch.int64)
         logical_blocks = (positions // self.block_size).to(torch.int64)
         offsets = (positions % self.block_size).to(torch.int64)
-        physical_blocks = self._block_table_gpu[
-            seq_ids_t, logical_blocks
-        ].to(torch.int64)
+        physical_blocks = self._block_table_gpu[seq_ids_t, logical_blocks].to(
+            torch.int64
+        )
         return physical_blocks * self.block_size + offsets
 
     def _build_slot_mapping_dict(
@@ -71,9 +67,7 @@ class DraftAttnMetadataMixin:
         """
         from vllm.model_executor.layers.attention import Attention
 
-        forward_ctx = (
-            self._draft_vllm_config.compilation_config.static_forward_context
-        )
+        forward_ctx = self._draft_vllm_config.compilation_config.static_forward_context
         mapping: dict[str, torch.Tensor] = {}
         for layer_name, layer in forward_ctx.items():
             if isinstance(layer, Attention):

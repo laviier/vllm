@@ -86,9 +86,7 @@ class DraftModelRunner(
         # OutcomePredictor's total_budget on the server side). Used by
         # the CUDA graph capture mixin to size graphs for parallel
         # fanout (N×K) and KV cleanup (N×(K-1)) call shapes.
-        self._sum_fan_out = (
-            spec_config.disagg_fan_out * (self._num_spec_tokens + 1)
-        )
+        self._sum_fan_out = spec_config.disagg_fan_out * (self._num_spec_tokens + 1)
 
         # KV cache parameters
         self.block_size = vllm_config.cache_config.block_size
@@ -99,9 +97,7 @@ class DraftModelRunner(
             self.draft_config.hf_text_config, "num_attention_heads", 1
         )
         self.num_layers = self.draft_config.hf_text_config.num_hidden_layers
-        self.head_dim = getattr(
-            self.draft_config.hf_text_config, "head_dim", 128
-        )
+        self.head_dim = getattr(self.draft_config.hf_text_config, "head_dim", 128)
 
         # Model and KV cache (allocated during load_model)
         self.model: nn.Module | None = None
@@ -203,10 +199,14 @@ class DraftModelRunner(
             return
         cap = max(max_n, self._KV_COPY_BUF_MAX)
         self._kv_copy_src_buf = torch.zeros(
-            cap, dtype=torch.int64, device=self.device,
+            cap,
+            dtype=torch.int64,
+            device=self.device,
         )
         self._kv_copy_dst_buf = torch.zeros(
-            cap, dtype=torch.int64, device=self.device,
+            cap,
+            dtype=torch.int64,
+            device=self.device,
         )
 
     def _capture_kv_copy_graph(self, n: int) -> torch.cuda.CUDAGraph:
@@ -225,7 +225,7 @@ class DraftModelRunner(
         # and register the fancy-index kernels in the current stream.
         for layer_kv in self.kv_caches:
             layer_kv[dst] = layer_kv[src]
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._kv_copy_graph_pool):
             for layer_kv in self.kv_caches:
@@ -253,8 +253,6 @@ class DraftModelRunner(
         # entries_per_seq = disagg_fan_out × (K+1) = sum_fan_out;
         # blocks_per_branch = (K + bs) // bs + 1 (typically 2 for K≤bs,
         # 3 for bs < K ≤ 2*bs). Capture both to be safe.
-        K = self._num_spec_tokens
-        bs = self.block_size
         sum_fan = self._sum_fan_out
         candidates: set[int] = set()
         for bpb in (2, 3):
@@ -267,7 +265,9 @@ class DraftModelRunner(
                 self._kv_copy_graphs[n] = self._capture_kv_copy_graph(n)
             except Exception as e:
                 logger.warning(
-                    "KV copy graph capture for n=%d failed: %s", n, e,
+                    "KV copy graph capture for n=%d failed: %s",
+                    n,
+                    e,
                 )
         logger.info(
             "KV copy graphs captured: %d sizes.",
@@ -275,7 +275,9 @@ class DraftModelRunner(
         )
 
     def run_kv_copy(
-        self, src_indices: torch.Tensor, dst_indices: torch.Tensor,
+        self,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
     ) -> None:
         """Batched fancy-index KV copy across all attention layers.
 
@@ -400,9 +402,7 @@ class DraftModelRunner(
             # Eager fallback — wrap in the drafter's ir_op priority so
             # the fused vllm_c RMSNorm kernel is picked (see load_model()
             # for the reason).
-            query_start_loc = torch.arange(
-                N + 1, dtype=torch.int32, device=self.device
-            )
+            query_start_loc = torch.arange(N + 1, dtype=torch.int32, device=self.device)
             attn_metadata = self._build_flash_attn_metadata(
                 num_tokens=N,
                 seq_lens_tensor=seq_lens_i32,
@@ -414,13 +414,16 @@ class DraftModelRunner(
             )
             slot_mapping_dict = self._build_slot_mapping_dict(slot_mapping)
             batch_descriptor = BatchDescriptor(num_tokens=N)
-            with set_forward_context(
-                attn_metadata=attn_metadata,
-                vllm_config=self._draft_vllm_config,
-                num_tokens=N,
-                slot_mapping=slot_mapping_dict,
-                batch_descriptor=batch_descriptor,
-            ), self._ir_priority_ctx():
+            with (
+                set_forward_context(
+                    attn_metadata=attn_metadata,
+                    vllm_config=self._draft_vllm_config,
+                    num_tokens=N,
+                    slot_mapping=slot_mapping_dict,
+                    batch_descriptor=batch_descriptor,
+                ),
+                self._ir_priority_ctx(),
+            ):
                 hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -437,7 +440,7 @@ class DraftModelRunner(
                 self.model.get_input_embeddings().weight.T,
             )
 
-        return logits[:, :self.vocab_size]
+        return logits[:, : self.vocab_size]
 
     def load_model(self) -> None:
         """Load the draft model and allocate KV cache."""
@@ -450,8 +453,11 @@ class DraftModelRunner(
         t0 = time.perf_counter()
 
         from copy import deepcopy
+
         from vllm.config.compilation import (
-            CompilationConfig, CompilationMode, CUDAGraphMode,
+            CompilationConfig,
+            CompilationMode,
+            CUDAGraphMode,
         )
         from vllm.model_executor.model_loader import get_model
 
@@ -471,8 +477,7 @@ class DraftModelRunner(
         )
         # Use TP=1 parallel config for the draft model.
         spec_config = self.vllm_config.speculative_config
-        if (spec_config is not None
-                and spec_config.draft_parallel_config is not None):
+        if spec_config is not None and spec_config.draft_parallel_config is not None:
             draft_vllm_config.parallel_config = spec_config.draft_parallel_config
         else:
             draft_vllm_config.parallel_config = deepcopy(
@@ -515,6 +520,7 @@ class DraftModelRunner(
         # itself in ``self._ir_priority_ctx()`` so this override applies
         # exactly where we need it and nowhere else.
         from vllm.config.kernel import IrOpPriorityConfig
+
         self._drafter_ir_priority = IrOpPriorityConfig.with_default(
             ["vllm_c", "native"]
         )
@@ -541,9 +547,7 @@ class DraftModelRunner(
         try:
             self._capture_kv_copy_graphs()
         except Exception as e:
-            logger.warning(
-                "KV copy CUDA graph capture failed: %s. Using eager.", e
-            )
+            logger.warning("KV copy CUDA graph capture failed: %s. Using eager.", e)
             # Callers fall through to the per-layer eager loop when the
             # graph dict is empty (see ``run_kv_copy``).
             self._kv_copy_graphs = {}
@@ -588,7 +592,7 @@ class DraftModelRunner(
         expanded_seq_ids = []
         for i in range(B):
             n = int(num_tokens_per_seq[i].item())
-            positions[offset:offset + n] = torch.arange(n, device=self.device)
+            positions[offset : offset + n] = torch.arange(n, device=self.device)
             expanded_seq_ids.extend([int(seq_ids[i].item())] * n)
             offset += n
 
@@ -602,12 +606,8 @@ class DraftModelRunner(
         max_prompt_len = int(num_tokens_per_seq.max().item())
 
         # query_start_loc: cumulative sum of per-seq token counts
-        query_start_loc = torch.zeros(
-            B + 1, dtype=torch.int32, device=self.device
-        )
-        torch.cumsum(
-            num_tokens_per_seq.to(torch.int32), dim=0, out=query_start_loc[1:]
-        )
+        query_start_loc = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        torch.cumsum(num_tokens_per_seq.to(torch.int32), dim=0, out=query_start_loc[1:])
 
         attn_metadata = self._build_flash_attn_metadata(
             num_tokens=total,
@@ -626,13 +626,16 @@ class DraftModelRunner(
         # Run model forward with proper context. ``_ir_priority_ctx()``
         # picks the fused vllm_c RMSNorm impl (see load_model()).
         batch_descriptor = BatchDescriptor(num_tokens=total)
-        with set_forward_context(
-            attn_metadata=attn_metadata,
-            vllm_config=self._draft_vllm_config,
-            num_tokens=total,
-            slot_mapping=slot_mapping_dict,
-            batch_descriptor=batch_descriptor,
-        ), self._ir_priority_ctx():
+        with (
+            set_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=self._draft_vllm_config,
+                num_tokens=total,
+                slot_mapping=slot_mapping_dict,
+                batch_descriptor=batch_descriptor,
+            ),
+            self._ir_priority_ctx(),
+        ):
             # V1 models don't accept kv_caches as a forward argument;
             # KV cache is managed through the attention backend via
             # set_forward_context.
@@ -658,7 +661,7 @@ class DraftModelRunner(
             )
 
         logger.debug("Draft prefill: %d sequences, %d tokens", B, total)
-        return last_logits[:, :self.vocab_size]
+        return last_logits[:, : self.vocab_size]
 
     @torch.inference_mode()
     def decode_step(
@@ -681,9 +684,9 @@ class DraftModelRunner(
         logical_blocks = (positions // self.block_size).to(torch.int64)
         offsets = (positions % self.block_size).to(torch.int64)
         seq_ids_long = seq_ids.to(torch.int64)
-        physical_blocks = self._block_table_gpu[
-            seq_ids_long, logical_blocks
-        ].to(torch.int64)
+        physical_blocks = self._block_table_gpu[seq_ids_long, logical_blocks].to(
+            torch.int64
+        )
         slot_mapping = physical_blocks * self.block_size + offsets
 
         block_tables = self._block_table_gpu[seq_ids_long]
@@ -708,7 +711,7 @@ class DraftModelRunner(
             hidden_states = g["hidden"][:B]
         else:
             # Eager fallback for batch sizes without captured graphs
-            query_start_loc = self._decode_query_start_loc[:B + 1]
+            query_start_loc = self._decode_query_start_loc[: B + 1]
             attn_metadata = self._build_flash_attn_metadata(
                 num_tokens=B,
                 seq_lens_tensor=seq_lens,
@@ -720,13 +723,16 @@ class DraftModelRunner(
             )
             slot_mapping_dict = self._build_slot_mapping_dict(slot_mapping)
             batch_descriptor = BatchDescriptor(num_tokens=B)
-            with set_forward_context(
-                attn_metadata=attn_metadata,
-                vllm_config=self._draft_vllm_config,
-                num_tokens=B,
-                slot_mapping=slot_mapping_dict,
-                batch_descriptor=batch_descriptor,
-            ), self._ir_priority_ctx():
+            with (
+                set_forward_context(
+                    attn_metadata=attn_metadata,
+                    vllm_config=self._draft_vllm_config,
+                    num_tokens=B,
+                    slot_mapping=slot_mapping_dict,
+                    batch_descriptor=batch_descriptor,
+                ),
+                self._ir_priority_ctx(),
+            ):
                 hidden_states = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -748,4 +754,4 @@ class DraftModelRunner(
         for i, sid in enumerate(seq_ids_list):
             self._seq_lens[int(sid)] = int(positions[i].item()) + 1
 
-        return logits[:, :self.vocab_size], hidden_states
+        return logits[:, : self.vocab_size], hidden_states

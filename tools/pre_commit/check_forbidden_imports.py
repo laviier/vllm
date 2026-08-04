@@ -40,6 +40,9 @@ CHECK_IMPORTS = {
             "vllm/model_executor/models/registry.py",
             "vllm/compilation/caching.py",
             "vllm/env_override.py",
+            # CUDA IPC handshakes serialize PyTorch tensor rebuild callables.
+            "vllm/v1/spec_decode/draft_connector.py",
+            "vllm/v1/spec_decode/draft_server.py",
             "vllm/compilation/piecewise_backend.py",
             "vllm/distributed/utils.py",
             "vllm/distributed/parallel_state.py",

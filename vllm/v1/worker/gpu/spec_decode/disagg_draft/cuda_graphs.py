@@ -77,8 +77,28 @@ class DraftCudaGraphMixin:
         at c=8 with K=5, fan_out=3 produces N=2160 for parallel and
         N=1728 for cleanup; without these captures both fall to eager).
         """
-        dense = [7, 10, 14, 18, 21, 28, 35, 36, 42, 49, 54, 56,
-                 63, 70, 72, 80, 84, 90, 98, 108]
+        dense = [
+            7,
+            10,
+            14,
+            18,
+            21,
+            28,
+            35,
+            36,
+            42,
+            49,
+            54,
+            56,
+            63,
+            70,
+            72,
+            80,
+            84,
+            90,
+            98,
+            108,
+        ]
         coarse = [126, 144, 168, 192, 256, 336, 504]
         # Parallel-fanout and KV-cleanup call shapes:
         #   parallel fanout call: N = B_total × sum_fan_out × K
@@ -115,8 +135,8 @@ class DraftCudaGraphMixin:
         # plus typical mixed shapes. Reuses dense+coarse for small
         # values; adds B × K for B in {1..8, 12, 16, 24, 32}.
         for b_total in (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32):
-            parallel.add(b_total)              # all-miss
-            parallel.add(b_total * K)          # all-hit
+            parallel.add(b_total)  # all-miss
+            parallel.add(b_total * K)  # all-hit
         sizes = sorted(set(dense + coarse) | parallel)
         logger.info("Capturing CUDA graphs for tree_decode_step: N=%s", sizes)
         self._capture_graphs_for_sizes(sizes, self._tree_graphs)
@@ -140,13 +160,13 @@ class DraftCudaGraphMixin:
         max_n = max(sizes)
         g_input_ids = torch.zeros(max_n, dtype=torch.int64, device=self.device)
         g_positions = torch.zeros(max_n, dtype=torch.long, device=self.device)
-        g_slot_mapping = torch.zeros(
-            max_n, dtype=torch.int64, device=self.device
-        )
+        g_slot_mapping = torch.zeros(max_n, dtype=torch.int64, device=self.device)
         g_seq_lens = torch.ones(max_n, dtype=torch.int32, device=self.device)
         g_block_tables = torch.zeros(
-            max_n, self.max_num_blocks,
-            dtype=torch.int32, device=self.device,
+            max_n,
+            self.max_num_blocks,
+            dtype=torch.int32,
+            device=self.device,
         )
         g_query_start_loc = torch.arange(
             max_n + 1, dtype=torch.int32, device=self.device
@@ -161,13 +181,11 @@ class DraftCudaGraphMixin:
                 seq_lens_tensor=g_seq_lens[:n],
                 max_seq_len=self.max_model_len,
                 max_query_len=1,
-                query_start_loc=g_query_start_loc[:n + 1],
+                query_start_loc=g_query_start_loc[: n + 1],
                 block_table=g_block_tables[:n],
                 slot_mapping=g_slot_mapping[:n],
             )
-            slot_mapping_dict = self._build_slot_mapping_dict(
-                g_slot_mapping[:n]
-            )
+            slot_mapping_dict = self._build_slot_mapping_dict(g_slot_mapping[:n])
             batch_descriptor = BatchDescriptor(num_tokens=n)
 
             # Warmup
@@ -185,18 +203,20 @@ class DraftCudaGraphMixin:
 
             # Capture
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self._decode_graph_pool):
-                with set_forward_context(
+            with (
+                torch.cuda.graph(graph, pool=self._decode_graph_pool),
+                set_forward_context(
                     attn_metadata=attn_metadata,
                     vllm_config=self._draft_vllm_config,
                     num_tokens=n,
                     slot_mapping=slot_mapping_dict,
                     batch_descriptor=batch_descriptor,
-                ):
-                    g_hidden[:n] = self.model(
-                        input_ids=g_input_ids[:n],
-                        positions=g_positions[:n],
-                    )
+                ),
+            ):
+                g_hidden[:n] = self.model(
+                    input_ids=g_input_ids[:n],
+                    positions=g_positions[:n],
+                )
 
             if self._decode_graph_pool is None:
                 self._decode_graph_pool = graph.pool()
@@ -214,4 +234,4 @@ class DraftCudaGraphMixin:
                 "slot_mapping_dict": slot_mapping_dict,
                 "batch_descriptor": batch_descriptor,
             }
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()

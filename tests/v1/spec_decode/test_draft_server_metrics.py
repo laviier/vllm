@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for DraftServerMetrics on the draft server side."""
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -17,10 +18,8 @@ def _reset_prometheus_registry():
     duplicate metric registration errors."""
     collectors = list(prometheus_client.REGISTRY._names_to_collectors.values())
     for c in collectors:
-        try:
+        with contextlib.suppress(Exception):
             prometheus_client.REGISTRY.unregister(c)
-        except Exception:
-            pass
     yield
 
 
@@ -45,6 +44,7 @@ def _load_draft_server_module():
     # Stub vllm.logger
     if "vllm.logger" not in sys.modules:
         import logging
+
         logger_mod = types.ModuleType("vllm.logger")
         logger_mod.init_logger = logging.getLogger
         sys.modules["vllm.logger"] = logger_mod
@@ -60,14 +60,34 @@ def _load_draft_server_module():
     if "vllm.v1.spec_decode.draft_data_models" not in sys.modules:
         ddm_mod = types.ModuleType("vllm.v1.spec_decode.draft_data_models")
         for name in [
-            "DraftCommand", "FreeSeqRequest", "PrefillRequest",
-            "SpeculationResponse", "TensorRef", "VerificationOutcome",
+            "DraftCommand",
+            "FreeSeqRequest",
+            "IpcHandshake",
+            "IpcHandshakeAck",
+            "PrefillRequest",
+            "SpeculationResponse",
+            "TensorRef",
+            "VerificationOutcome",
         ]:
             setattr(ddm_mod, name, type(name, (), {}))
         ddm_mod.decode = lambda *a, **kw: None
         ddm_mod.decode_command = lambda *a, **kw: None
         ddm_mod.encode = lambda *a, **kw: b""
         sys.modules["vllm.v1.spec_decode.draft_data_models"] = ddm_mod
+
+    # Stub draft_server_mixins
+    mixins_name = "vllm.v1.spec_decode.draft_server_mixins"
+    if mixins_name not in sys.modules:
+        mixins_mod = types.ModuleType(mixins_name)
+        for name in [
+            "DraftServerCacheBuildMixin",
+            "DraftServerFanoutMixin",
+            "DraftServerSeqIdMixin",
+            "DraftServerSpeculateMixin",
+            "DraftServerTransportMixin",
+        ]:
+            setattr(mixins_mod, name, type(name, (), {}))
+        sys.modules[mixins_name] = mixins_mod
 
     # Stub vllm.utils.network_utils
     if "vllm.utils" not in sys.modules:
@@ -84,8 +104,13 @@ def _load_draft_server_module():
 
     file_path = os.path.join(
         os.path.dirname(__file__),
-        "..", "..", "..",
-        "vllm", "v1", "spec_decode", "draft_server.py",
+        "..",
+        "..",
+        "..",
+        "vllm",
+        "v1",
+        "spec_decode",
+        "draft_server.py",
     )
     file_path = os.path.normpath(file_path)
     spec = importlib.util.spec_from_file_location(mod_name, file_path)

@@ -54,7 +54,9 @@ class DraftServerCacheBuildMixin:
 
     @staticmethod
     def _shrink_fan_out_to_budget(
-        fan_out_list: list[int], B: int, max_branches: int,
+        fan_out_list: list[int],
+        B: int,
+        max_branches: int,
     ) -> list[int]:
         """Proportionally scale ``fan_out_list`` so B × sum(...) <= budget.
 
@@ -95,9 +97,7 @@ class DraftServerCacheBuildMixin:
         runner = self.draft_model_runner
         if runner is None:
             return
-        with torch.profiler.record_function(
-            f"cache_build_B{batch_size}"
-        ):
+        with torch.profiler.record_function(f"cache_build_B{batch_size}"):
             # Apply any swap deferred from the synchronous SPECULATE
             # path. Mutates _seq_lens / block tables and recycles
             # displaced blocks; running it here (rather than on the
@@ -165,11 +165,12 @@ class DraftServerCacheBuildMixin:
         # stashes doesn't silently send mask=False through to glue
         # input selection.
         miss_mask_full = (
-            self._last_miss_mask if self._last_miss_mask is not None
+            self._last_miss_mask
+            if self._last_miss_mask is not None
             else torch.zeros_like(self._last_bonus_tokens, dtype=torch.bool)
         )
-        bonus_tokens = self._last_bonus_tokens                  # [B]
-        last_draft_last_col = self._last_draft_tokens[:, -1]    # [B]
+        bonus_tokens = self._last_bonus_tokens  # [B]
+        last_draft_last_col = self._last_draft_tokens[:, -1]  # [B]
         B = bonus_tokens.shape[0]
         K = self.K
         D = K - 1
@@ -181,7 +182,7 @@ class DraftServerCacheBuildMixin:
         # a redundant .tolist() sync at the start of every cache_build.
         cached_cpu: list[int] | None = None
         if pending is not None:
-            seq_ids_full = pending["seq_ids"]                   # [B]
+            seq_ids_full = pending["seq_ids"]  # [B]
             cached_cpu = pending.get("seq_ids_list")
         else:
             # No swap pending (cold start / all-miss round): the SPECULATE
@@ -203,24 +204,24 @@ class DraftServerCacheBuildMixin:
             int(runner._seq_lens.get(int(sid), 0)) for sid in seq_ids_list
         ]
         glue_positions = torch.tensor(
-            glue_positions_cpu, dtype=torch.int64, device=self.device,
+            glue_positions_cpu,
+            dtype=torch.int64,
+            device=self.device,
         )
         # Per-seq glue input: bonus for miss rows (zero-fallback), last
         # cached draft for hit rows.
         glue_input = torch.where(
-            miss_mask_full, bonus_tokens, last_draft_last_col,
+            miss_mask_full,
+            bonus_tokens,
+            last_draft_last_col,
         ).to(torch.int32)
 
         # Hit-side cleanup payload (only meaningful when parallel fanout
         # is active and last round's branches actually got installed).
-        do_cleanup = (
-            self._use_parallel_fanout
-            and K > 1
-            and pending is not None
-        )
+        do_cleanup = self._use_parallel_fanout and K > 1 and pending is not None
         if do_cleanup:
             cache_hits = pending["cache_hits"]
-            hit_prefix_lens = pending["hit_prefix_lens"]            # [H]
+            hit_prefix_lens = pending["hit_prefix_lens"]  # [H]
             hit_mask = cache_hits.bool()
             # H comes from hit_prefix_lens.shape[0] — that shape was
             # resolved upstream when ``hit_prefix_lens`` was produced
@@ -248,26 +249,30 @@ class DraftServerCacheBuildMixin:
         #     count = 1
         # We build flat tensors of total length (H * K + (B - H) * 1).
         if H > 0:
-            hit_indices = hit_mask.nonzero(as_tuple=True)[0]   # [H]
+            hit_indices = hit_mask.nonzero(as_tuple=True)[0]  # [H]
             assert hit_prefix_lens is not None  # for type checker
             depth_offsets = torch.arange(
-                1, K, device=self.device, dtype=torch.int64,
-            )                                                   # [K-1]
-            cleanup_positions = (
-                hit_prefix_lens.to(torch.int64).unsqueeze(1)
-                + depth_offsets.unsqueeze(0)
-            )                                                   # [H, K-1]
+                1,
+                K,
+                device=self.device,
+                dtype=torch.int64,
+            )  # [K-1]
+            cleanup_positions = hit_prefix_lens.to(torch.int64).unsqueeze(
+                1
+            ) + depth_offsets.unsqueeze(0)  # [H, K-1]
             cleanup_inputs = self._last_draft_tokens[hit_indices, :D]
-            cleanup_inputs = cleanup_inputs.to(torch.int32)     # [H, K-1]
+            cleanup_inputs = cleanup_inputs.to(torch.int32)  # [H, K-1]
             hit_glue_pos = glue_positions[hit_indices].unsqueeze(1)  # [H,1]
-            hit_glue_inp = glue_input[hit_indices].unsqueeze(1)      # [H,1]
+            hit_glue_inp = glue_input[hit_indices].unsqueeze(1)  # [H,1]
             # Per-hit-seq segment: [cleanup..., glue]
             hit_positions = torch.cat(
-                [cleanup_positions, hit_glue_pos], dim=1,
-            ).reshape(-1)                                       # [H*K]
+                [cleanup_positions, hit_glue_pos],
+                dim=1,
+            ).reshape(-1)  # [H*K]
             hit_inputs = torch.cat(
-                [cleanup_inputs, hit_glue_inp], dim=1,
-            ).reshape(-1)                                       # [H*K]
+                [cleanup_inputs, hit_glue_inp],
+                dim=1,
+            ).reshape(-1)  # [H*K]
         else:
             hit_indices = torch.empty(0, dtype=torch.int64, device=self.device)
             hit_positions = torch.empty(0, dtype=torch.int64, device=self.device)
@@ -292,10 +297,13 @@ class DraftServerCacheBuildMixin:
 
         # Per-token block_tables: each token attends over its seq's main
         # block table (post-swap for hits, unchanged for non-hits).
-        per_token_seq_ids = torch.cat([
-            seq_ids_full[hit_indices].repeat_interleave(K),
-            seq_ids_full[nonhit_indices],
-        ], dim=0)
+        per_token_seq_ids = torch.cat(
+            [
+                seq_ids_full[hit_indices].repeat_interleave(K),
+                seq_ids_full[nonhit_indices],
+            ],
+            dim=0,
+        )
         block_tables = runner._block_table_gpu[per_token_seq_ids]
 
         # Upper bound for max_seq_len_hint (used for CUDA-graph slot
@@ -303,13 +311,9 @@ class DraftServerCacheBuildMixin:
         # behind cache_build's own kernels). glue_positions_cpu is
         # already on CPU (line ~205); cleanup adds at most K-1 to
         # per-seq positions, so ``max(glue) + K`` is a safe over-bound.
-        max_context_hint = (
-            max(glue_positions_cpu) + K if glue_positions_cpu else 1
-        )
+        max_context_hint = max(glue_positions_cpu) + K if glue_positions_cpu else 1
 
-        with torch.profiler.record_function(
-            f"fused_cleanup_glue_H{H}_M{nB}"
-        ):
+        with torch.profiler.record_function(f"fused_cleanup_glue_H{H}_M{nB}"):
             logits_flat = runner.tree_decode_step(
                 input_ids=input_ids,
                 positions=positions,
@@ -323,17 +327,20 @@ class DraftServerCacheBuildMixin:
         # First H*K rows: per-hit segments [cleanup_0..K-2, glue].
         # Next nB rows: per-non-hit glue.
         glue_logits = torch.zeros(
-            B, self.vocab_size, dtype=self.dtype, device=self.device,
+            B,
+            self.vocab_size,
+            dtype=self.dtype,
+            device=self.device,
         )
         if H > 0:
             hit_logits = logits_flat[: H * K].view(H, K, -1)
-            cleanup_logits = hit_logits[:, :D, :]               # [H, K-1, V]
-            hit_glue_logits = hit_logits[:, D, :]               # [H, V]
+            cleanup_logits = hit_logits[:, :D, :]  # [H, K-1, V]
+            hit_glue_logits = hit_logits[:, D, :]  # [H, V]
             self._last_draft_logits = self._last_draft_logits.clone()
             self._last_draft_logits[hit_indices, 1:K, :] = cleanup_logits
             glue_logits[hit_indices] = hit_glue_logits
         if nB > 0:
-            nonhit_glue_logits = logits_flat[H * K :]            # [nB, V]
+            nonhit_glue_logits = logits_flat[H * K :]  # [nB, V]
             glue_logits[nonhit_indices] = nonhit_glue_logits
 
         self._pending_glue_logits = glue_logits
@@ -351,9 +358,7 @@ class DraftServerCacheBuildMixin:
             try:
                 await t
             except Exception:
-                logger.exception(
-                    "DraftServer per-VS cache build task failed."
-                )
+                logger.exception("DraftServer per-VS cache build task failed.")
 
     async def _run_cache_build_merged(
         self,
@@ -379,15 +384,10 @@ class DraftServerCacheBuildMixin:
             return
 
         K = self.K
-        if (
-            self.cache is None
-            or self.outcome_predictor is None
-        ):
+        if self.cache is None or self.outcome_predictor is None:
             return
 
-        with torch.profiler.record_function(
-            f"cache_build_merged_n{len(slice_metas)}"
-        ):
+        with torch.profiler.record_function(f"cache_build_merged_n{len(slice_metas)}"):
             # Merged path runs swap_block_tables synchronously in the
             # SPECULATE handler (deferring it regressed multi-VS TPOT
             # by 1-3 %). The fused cleanup+glue forward then refreshes
@@ -406,10 +406,12 @@ class DraftServerCacheBuildMixin:
             # Concatenate.
             with _cb_span("cb3_concat_inputs"):
                 seq_ids_cat = torch.cat(
-                    [sm["seq_ids"] for sm in slice_metas], dim=0,
+                    [sm["seq_ids"] for sm in slice_metas],
+                    dim=0,
                 )
                 draft_tokens_cat = torch.cat(
-                    [sm["draft_tokens"] for sm in slice_metas], dim=0,
+                    [sm["draft_tokens"] for sm in slice_metas],
+                    dim=0,
                 )
             # Note: sm["draft_logits"] is intentionally NOT
             # concatenated here. ``_select_bonus_candidates`` below
@@ -423,7 +425,8 @@ class DraftServerCacheBuildMixin:
             # parallel-MTP drafter.
             with _cb_span("cb3_bonus_and_seqids"):
                 bonus_cat = torch.cat(
-                    [sm["bonus_tokens"] for sm in slice_metas], dim=0,
+                    [sm["bonus_tokens"] for sm in slice_metas],
+                    dim=0,
                 )
                 B_total = seq_ids_cat.shape[0]
                 # The CPU-side seq_ids list was already materialized
@@ -435,8 +438,7 @@ class DraftServerCacheBuildMixin:
                 # Python band at 3V c=8.
                 if all("seq_ids_cpu" in sm for sm in slice_metas):
                     seq_ids_list = [
-                        sid for sm in slice_metas
-                        for sid in sm["seq_ids_cpu"]
+                        sid for sm in slice_metas for sid in sm["seq_ids_cpu"]
                     ]
                 else:
                     seq_ids_list = seq_ids_cat.tolist()
@@ -445,15 +447,14 @@ class DraftServerCacheBuildMixin:
                 # Geometric fan-out (shared across VSes).
                 fan_out_list = self._shrink_fan_out_to_budget(
                     list(self.outcome_predictor.fan_out_list),
-                    B_total, self.MAX_BRANCHES,
+                    B_total,
+                    self.MAX_BRANCHES,
                 )
                 entries_per_seq = sum(fan_out_list)
                 N = B_total * entries_per_seq
                 if N > self.MAX_BRANCHES or N == 0:
                     return
-                max_fan_out = (
-                    max(fan_out_list) if fan_out_list else 0
-                )
+                max_fan_out = max(fan_out_list) if fan_out_list else 0
 
             with _cb_span("cb3_glue_input"):
                 # Per-row glue input: bonus token for miss rows
@@ -462,7 +463,8 @@ class DraftServerCacheBuildMixin:
                 merged_miss_mask = None
                 if all("miss_mask" in sm for sm in slice_metas):
                     merged_miss_mask = torch.cat(
-                        [sm["miss_mask"] for sm in slice_metas], dim=0,
+                        [sm["miss_mask"] for sm in slice_metas],
+                        dim=0,
                     )
                 if self._pending_glue_logits is not None:
                     glue_logits = self._pending_glue_logits
@@ -485,7 +487,8 @@ class DraftServerCacheBuildMixin:
                     # the fused-prologue path).
                     with _cb_span("cb3_glue_decode"):
                         glue_logits = runner.glue_decode(
-                            tokens=glue_input, seq_ids=seq_ids_cat,
+                            tokens=glue_input,
+                            seq_ids=seq_ids_cat,
                         )
 
             # Use ``self._last_draft_logits`` (cleanup-spliced) as
@@ -502,9 +505,7 @@ class DraftServerCacheBuildMixin:
                 # the mask is all-False; gating with .any().item() was
                 # a CPU↔GPU sync per round.
                 if merged_miss_mask is not None:
-                    draft_logits_for_select = (
-                        draft_logits_for_select.clone()
-                    )
+                    draft_logits_for_select = draft_logits_for_select.clone()
                     # torch.where instead of boolean-mask indexing (see
                     # single-path comment for reasoning).
                     V = draft_logits_for_select.shape[2]
@@ -549,8 +550,7 @@ class DraftServerCacheBuildMixin:
                 # every merged cb cycle because it forced the
                 # ``_select_bonus_candidates`` GPU queue to drain.
                 entry_owner = [
-                    vs_of_seq[b] for b in range(B_total)
-                    for _ in range(entries_per_seq)
+                    vs_of_seq[b] for b in range(B_total) for _ in range(entries_per_seq)
                 ]
 
                 # ONE merged block allocation. Block reservation is
@@ -558,9 +558,8 @@ class DraftServerCacheBuildMixin:
                 bs = runner.block_size
                 blocks_per_branch = (K + bs) // bs + 1
                 total_needed = N * blocks_per_branch
-                available = (
-                    (runner.num_kv_blocks - runner._next_free_block)
-                    + len(runner._free_list)
+                available = (runner.num_kv_blocks - runner._next_free_block) + len(
+                    runner._free_list
                 )
                 if available < total_needed:
                     # Pool exhausted; abort. No need to restore
@@ -576,12 +575,13 @@ class DraftServerCacheBuildMixin:
                 for n in range(N):
                     base = n * blocks_per_branch
                     blocks_by_vs[entry_owner[n]].extend(
-                        dedicated_blocks[base:base + blocks_per_branch]
+                        dedicated_blocks[base : base + blocks_per_branch]
                     )
                 for vs_idx, blks in blocks_by_vs.items():
                     if blks:
                         runner.reserve_dedicated_blocks(
-                            blks, slice_metas[vs_idx]["vs_id"],
+                            blks,
+                            slice_metas[vs_idx]["vs_id"],
                         )
 
             with _cb_span("cb3_branch_block_tables"):
@@ -594,24 +594,17 @@ class DraftServerCacheBuildMixin:
                 # seq_ids_cat[b].item(), which adds B_total CPU↔GPU
                 # syncs.
                 base_lens_t = torch.tensor(
-                    [
-                        self._round_base_lens.get(sid, 0)
-                        for sid in seq_ids_list
-                    ],
+                    [self._round_base_lens.get(sid, 0) for sid in seq_ids_list],
                     dtype=torch.int64,
                     device=self.device,
                 )
-                prefix_lens = (
-                    base_lens_t[entry_batch_ids] + 1 + k_positions
-                )
-                seq_ids_for_branches = (
-                    seq_ids_cat[entry_batch_ids].to(torch.int64)
-                )
+                prefix_lens = base_lens_t[entry_batch_ids] + 1 + k_positions
+                seq_ids_for_branches = seq_ids_cat[entry_batch_ids].to(torch.int64)
                 branch_block_tables = runner._block_table_gpu[
                     seq_ids_for_branches
                 ].contiguous()
                 first_write_blk = prefix_lens // bs
-                ded_tensor = torch.tensor(
+                dedicated_tensor = torch.tensor(
                     dedicated_blocks,
                     dtype=torch.int64,
                     device=self.device,
@@ -621,9 +614,7 @@ class DraftServerCacheBuildMixin:
                     device=self.device,
                     dtype=torch.int64,
                 )
-                tbl_indices = (
-                    first_write_blk.unsqueeze(1) + j_range.unsqueeze(0)
-                )
+                tbl_indices = first_write_blk.unsqueeze(1) + j_range.unsqueeze(0)
                 valid = tbl_indices < M
                 n_idx = (
                     torch.arange(N, device=self.device)
@@ -634,16 +625,16 @@ class DraftServerCacheBuildMixin:
                 # branch_block_tables: at this point it's still a
                 # clean copy of the parent table, so we can skip a
                 # second _block_table_gpu gather.
-                src_indices_i64 = tbl_indices.clamp(max=M - 1).to(
-                    torch.int64
-                )
+                src_indices_i64 = tbl_indices.clamp(max=M - 1).to(torch.int64)
                 src_block_ids = branch_block_tables[
-                    n_idx, src_indices_i64,
+                    n_idx,
+                    src_indices_i64,
                 ].to(torch.int64)
 
                 branch_block_tables[
-                    n_idx[valid], tbl_indices[valid].to(torch.int64),
-                ] = ded_tensor[valid].to(torch.int32)
+                    n_idx[valid],
+                    tbl_indices[valid].to(torch.int64),
+                ] = dedicated_tensor[valid].to(torch.int32)
 
             with _cb_span("cb3_run_kv_copy"):
                 # KV copy from parent into newly-reserved blocks.
@@ -655,20 +646,16 @@ class DraftServerCacheBuildMixin:
                 # kernel (~28 launches ≈ 4 ms dominated by launch
                 # overhead); the graph replay folds them into a
                 # single dispatch.
-                dst_block_ids = ded_tensor
-                copy_mask = (
-                    valid & (src_block_ids != dst_block_ids)
-                )
+                dst_block_ids = dedicated_tensor
+                copy_mask = valid & (src_block_ids != dst_block_ids)
                 if runner.kv_caches is not None:
-                    src_flat_all = src_block_ids.reshape(-1).to(
-                        torch.int64
-                    )
-                    dst_flat_all = dst_block_ids.reshape(-1).to(
-                        torch.int64
-                    )
+                    src_flat_all = src_block_ids.reshape(-1).to(torch.int64)
+                    dst_flat_all = dst_block_ids.reshape(-1).to(torch.int64)
                     copy_flat = copy_mask.reshape(-1)
                     safe_src = torch.where(
-                        copy_flat, src_flat_all, dst_flat_all,
+                        copy_flat,
+                        src_flat_all,
+                        dst_flat_all,
                     )
                     runner.run_kv_copy(safe_src, dst_flat_all)
 
@@ -721,9 +708,7 @@ class DraftServerCacheBuildMixin:
                         bonus_tokens=bonus_candidates[start:end],
                         draft_tokens=all_tokens[start:end],
                         draft_logits=all_logits[start:end],
-                        branch_block_tables=branch_block_tables[
-                            start:end
-                        ],
+                        branch_block_tables=branch_block_tables[start:end],
                         prefix_lens=prefix_lens[start:end],
                         vs_id=sm["vs_id"],
                     )
@@ -751,10 +736,7 @@ class DraftServerCacheBuildMixin:
         runner = self.draft_model_runner
         if runner is None or not runner._model_loaded:
             return
-        if (
-            self._last_draft_tokens is None
-            or self._last_draft_logits is None
-        ):
+        if self._last_draft_tokens is None or self._last_draft_logits is None:
             return
 
         B = batch_size
@@ -765,7 +747,8 @@ class DraftServerCacheBuildMixin:
         # budget since they're more likely to be the actual outcome).
         fan_out_list = self._shrink_fan_out_to_budget(
             list(self.outcome_predictor.fan_out_list),
-            B, self.MAX_BRANCHES,
+            B,
+            self.MAX_BRANCHES,
         )
         entries_per_seq = sum(fan_out_list)
         N = B * entries_per_seq
@@ -790,8 +773,14 @@ class DraftServerCacheBuildMixin:
             seq_ids_list = seq_ids.tolist()
 
         self._build_standalone_cache(
-            B, K, fan_out_list, max_fan_out, N,
-            seq_ids, seq_ids_list, runner,
+            B,
+            K,
+            fan_out_list,
+            max_fan_out,
+            N,
+            seq_ids,
+            seq_ids_list,
+            runner,
             self._last_draft_tokens,
             self._last_draft_logits,
             self._last_bonus_tokens,
@@ -809,7 +798,10 @@ class DraftServerCacheBuildMixin:
         rec_tokens: torch.Tensor,
         glue_logits: torch.Tensor,
     ) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
     ]:
         """Pick top-F bonus-token candidates per acceptance position.
 
@@ -818,12 +810,8 @@ class DraftServerCacheBuildMixin:
         (entry_batch_ids, k_positions, bonus_candidates) triple plus
         branches_per_seq.
         """
-        outcome_logits = torch.cat(
-            [draft_logits, glue_logits.unsqueeze(1)], dim=1
-        )
-        outcome_tokens = torch.cat(
-            [rec_tokens.unsqueeze(1), draft_tokens], dim=1
-        )
+        outcome_logits = torch.cat([draft_logits, glue_logits.unsqueeze(1)], dim=1)
+        outcome_tokens = torch.cat([rec_tokens.unsqueeze(1), draft_tokens], dim=1)
 
         masked_logits = outcome_logits.clone()
         masked_logits[:, :-1, :] = masked_logits[:, :-1, :].scatter(
@@ -852,33 +840,39 @@ class DraftServerCacheBuildMixin:
             for k, F_k in enumerate(fan_out_list):
                 if F_k <= 0:
                     continue
-                per_seq_k_chunks.append(torch.full(
-                    (F_k,), k, dtype=torch.int64, device=self.device
-                ))
-                per_seq_cand_chunks.append(torch.arange(
-                    F_k, dtype=torch.int64, device=self.device,
-                ))
+                per_seq_k_chunks.append(
+                    torch.full((F_k,), k, dtype=torch.int64, device=self.device)
+                )
+                per_seq_cand_chunks.append(
+                    torch.arange(
+                        F_k,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                )
             empty = torch.zeros(0, dtype=torch.int64, device=self.device)
-            per_seq_k_flat = (
-                torch.cat(per_seq_k_chunks) if per_seq_k_chunks else empty
-            )
+            per_seq_k_flat = torch.cat(per_seq_k_chunks) if per_seq_k_chunks else empty
             per_seq_cand_flat = (
-                torch.cat(per_seq_cand_chunks) if per_seq_cand_chunks
-                else empty
+                torch.cat(per_seq_cand_chunks) if per_seq_cand_chunks else empty
             )
 
-        k_positions = per_seq_k_flat.unsqueeze(0).expand(
-            B, branches_per_seq
-        ).reshape(-1)
-        entry_batch_ids = torch.arange(
-            B, device=self.device, dtype=torch.int64,
-        ).unsqueeze(1).expand(B, branches_per_seq).reshape(-1)
-        cand_slots_full = per_seq_cand_flat.unsqueeze(0).expand(
-            B, branches_per_seq
-        ).reshape(-1)
-        bonus_candidates = topk_indices[
-            entry_batch_ids, k_positions, cand_slots_full
-        ]
+        k_positions = (
+            per_seq_k_flat.unsqueeze(0).expand(B, branches_per_seq).reshape(-1)
+        )
+        entry_batch_ids = (
+            torch.arange(
+                B,
+                device=self.device,
+                dtype=torch.int64,
+            )
+            .unsqueeze(1)
+            .expand(B, branches_per_seq)
+            .reshape(-1)
+        )
+        cand_slots_full = (
+            per_seq_cand_flat.unsqueeze(0).expand(B, branches_per_seq).reshape(-1)
+        )
+        bonus_candidates = topk_indices[entry_batch_ids, k_positions, cand_slots_full]
         return entry_batch_ids, k_positions, bonus_candidates, branches_per_seq
 
     def _allocate_branch_blocks_and_copy_kv(
@@ -905,9 +899,8 @@ class DraftServerCacheBuildMixin:
         M = runner.max_num_blocks
         blocks_per_branch = (K + bs) // bs + 1
         total_needed = N * blocks_per_branch
-        available = (
-            (runner.num_kv_blocks - runner._next_free_block)
-            + len(runner._free_list)
+        available = (runner.num_kv_blocks - runner._next_free_block) + len(
+            runner._free_list
         )
         if available < total_needed:
             return None
@@ -935,38 +928,31 @@ class DraftServerCacheBuildMixin:
         prefix_lens = base_lens_t[entry_batch_ids] + 1 + k_positions
 
         seq_ids_for_branches = seq_ids[entry_batch_ids].to(torch.int64)
-        branch_block_tables = runner._block_table_gpu[
-            seq_ids_for_branches
-        ].contiguous()
+        branch_block_tables = runner._block_table_gpu[seq_ids_for_branches].contiguous()
 
         first_write_blk = prefix_lens // bs
         # Same pinned+non_blocking pattern for dedicated_blocks.
-        ded_pin_view = self._cb_ded_blocks_pin[:total_needed]
+        dedicated_pin_view = self._cb_dedicated_blocks_pin[:total_needed]
         # Fastest bulk fill: torch.as_tensor materializes from list w/o
         # extra copies. total_needed ≤ MAX_BRANCHES by contract above.
-        ded_pin_view.copy_(
+        dedicated_pin_view.copy_(
             torch.as_tensor(dedicated_blocks, dtype=torch.int64),
         )
-        ded_gpu = self._cb_ded_blocks_gpu[:total_needed]
-        ded_gpu.copy_(ded_pin_view, non_blocking=True)
-        ded_tensor = ded_gpu.view(N, blocks_per_branch)
+        dedicated_gpu = self._cb_dedicated_blocks_gpu[:total_needed]
+        dedicated_gpu.copy_(dedicated_pin_view, non_blocking=True)
+        dedicated_tensor = dedicated_gpu.view(N, blocks_per_branch)
 
-        j_range = torch.arange(
-            blocks_per_branch, device=self.device, dtype=torch.int64
-        )
+        j_range = torch.arange(blocks_per_branch, device=self.device, dtype=torch.int64)
         tbl_indices = first_write_blk.unsqueeze(1) + j_range.unsqueeze(0)
         valid = tbl_indices < M
-        n_idx = (
-            torch.arange(N, device=self.device)
-            .unsqueeze(1)
-            .expand_as(tbl_indices)
-        )
+        n_idx = torch.arange(N, device=self.device).unsqueeze(1).expand_as(tbl_indices)
         # Read parent block IDs BEFORE mutating branch_block_tables:
         # at this point it's still a clean copy of the parent table,
         # so we can skip a second _block_table_gpu gather.
         src_indices_i64 = tbl_indices.clamp(max=M - 1).to(torch.int64)
         src_block_ids = branch_block_tables[
-            n_idx, src_indices_i64,
+            n_idx,
+            src_indices_i64,
         ].to(torch.int64)
 
         # NOTE: this write MUST use boolean-mask indexing (or an
@@ -979,11 +965,11 @@ class DraftServerCacheBuildMixin:
         # Boolean-mask indexing does sync via ``aten::nonzero``, but
         # this whole method runs inside cache_build (background), not
         # the SPECULATE hot path, so the sync is tolerable here.
-        branch_block_tables[
-            n_idx[valid], tbl_indices[valid].to(torch.int64)
-        ] = ded_tensor[valid].to(torch.int32)
+        branch_block_tables[n_idx[valid], tbl_indices[valid].to(torch.int64)] = (
+            dedicated_tensor[valid].to(torch.int32)
+        )
 
-        dst_block_ids = ded_tensor
+        dst_block_ids = dedicated_tensor
         copy_mask = valid & (src_block_ids != dst_block_ids)
         if runner.kv_caches is not None:
             # Sync-avoiding KV copy: redirect non-copy positions to a
@@ -991,7 +977,7 @@ class DraftServerCacheBuildMixin:
             # fancy-index write is shape-invariant. Adds a few redundant
             # self-copies per iter but avoids the boolean-mask
             # ``aten::nonzero`` sync (~1-2 ms per call). Safe because
-            # ``ded_tensor`` contains UNIQUE block IDs (fresh allocation
+            # ``dedicated_tensor`` contains UNIQUE block IDs (fresh allocation
             # from ``runner._alloc_n_blocks(total_needed)``), so no
             # aliasing between real copies and self-copies.
             src_flat_all = src_block_ids.reshape(-1).to(torch.int64)
@@ -1009,7 +995,8 @@ class DraftServerCacheBuildMixin:
 
     def _build_standalone_cache(
         self,
-        B: int, K: int,
+        B: int,
+        K: int,
         fan_out_list: list[int],
         max_fan_out: int,
         N: int,
@@ -1052,14 +1039,10 @@ class DraftServerCacheBuildMixin:
             # result is the last-col tokens when the mask is all-False.
             # Mirrors the fix on the merged path.
             if miss_mask is not None:
-                glue_input = torch.where(
-                    miss_mask, rec_tokens, draft_tokens[:, -1]
-                )
+                glue_input = torch.where(miss_mask, rec_tokens, draft_tokens[:, -1])
             else:
                 glue_input = draft_tokens[:, -1]
-            glue_logits = runner.glue_decode(
-                tokens=glue_input, seq_ids=seq_ids
-            )
+            glue_logits = runner.glue_decode(tokens=glue_input, seq_ids=seq_ids)
 
         # Zero-fallback miss rows: draft_logits is all zeros (no JIT
         # ran). _select_bonus_candidates would compute top-F over zeros
@@ -1078,7 +1061,9 @@ class DraftServerCacheBuildMixin:
             V = draft_logits.shape[2]
             mask_v = miss_mask.view(-1, 1).expand(-1, V)
             draft_logits[:, 0] = torch.where(
-                mask_v, glue_logits, draft_logits[:, 0],
+                mask_v,
+                glue_logits,
+                draft_logits[:, 0],
             )
 
         entry_batch_ids, k_positions, bonus_candidates, _branches = (
@@ -1164,4 +1149,3 @@ class DraftServerCacheBuildMixin:
     # ------------------------------------------------------------------
     # Prefill and free_seq command handlers
     # ------------------------------------------------------------------
-

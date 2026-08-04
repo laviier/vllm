@@ -37,9 +37,7 @@ class DraftServerFanoutMixin:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run K tree-decode steps and return (tokens, logits) per branch."""
         seq_ids_expanded = seq_ids[entry_batch_ids]
-        all_tokens = torch.zeros(
-            N, K, dtype=torch.int64, device=self.device
-        )
+        all_tokens = torch.zeros(N, K, dtype=torch.int64, device=self.device)
         all_logits = torch.zeros(
             N, K, self.vocab_size, dtype=self.dtype, device=self.device
         )
@@ -113,13 +111,13 @@ class DraftServerFanoutMixin:
         # Depth 0 (first in each branch): bonus candidate token
         # Depth 1+ (rest): MTP mask token
         input_ids = torch.full(
-            (total_tokens,), self._mtp_token_id,
-            dtype=torch.int32, device=self.device,
+            (total_tokens,),
+            self._mtp_token_id,
+            dtype=torch.int32,
+            device=self.device,
         )
         # Set depth-0 positions to bonus candidates
-        depth0_indices = torch.arange(
-            0, total_tokens, K, device=self.device
-        )
+        depth0_indices = torch.arange(0, total_tokens, K, device=self.device)
         input_ids[depth0_indices] = bonus_candidates.to(torch.int32)
 
         # --- Build positions: [N*K] ---
@@ -130,8 +128,7 @@ class DraftServerFanoutMixin:
         # add + copy_ slice).
         depth_offsets = torch.arange(K, device=self.device, dtype=torch.int64)
         positions = (
-            prefix_lens.to(torch.int64).unsqueeze(1)
-            + depth_offsets.unsqueeze(0)
+            prefix_lens.to(torch.int64).unsqueeze(1) + depth_offsets.unsqueeze(0)
         ).reshape(total_tokens)
 
         # --- Build seq_lens: [N*K] ---
@@ -156,9 +153,7 @@ class DraftServerFanoutMixin:
         # --- Build block_tables: [N*K, max_blocks] ---
         # All depths in a branch share the same block table (they all
         # attend to the same prefix KV, no branch-local KV needed).
-        block_tables_expanded = branch_block_tables.repeat_interleave(
-            K, dim=0
-        )
+        block_tables_expanded = branch_block_tables.repeat_interleave(K, dim=0)
 
         # --- Run single forward pass ---
         # Use caller-provided upper bound if available (avoids a

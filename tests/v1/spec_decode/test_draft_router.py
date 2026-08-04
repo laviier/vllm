@@ -42,6 +42,45 @@ class TestDraftRouterInit:
         )
         assert router.draft_server_addresses == addrs
 
+    def test_affinity_explicit_primary(self):
+        conns = _make_connectors(2)
+        router = DraftRouter(
+            connectors=conns,
+            policy="affinity",
+            primary_index=1,
+        )
+        assert router.assign("r0") is conns[1]
+        assert router.assign("r1") is conns[1]
+
+    def test_affinity_explicit_primary_must_be_in_range(self):
+        with pytest.raises(ValueError, match="primary_index 2 out of range"):
+            DraftRouter(
+                connectors=_make_connectors(2),
+                policy="affinity",
+                primary_index=2,
+            )
+
+    def test_affinity_explicit_primary_overrides_hash(self):
+        conns = _make_connectors(2)
+        router = DraftRouter(
+            connectors=conns,
+            policy="affinity",
+            verify_server_id="any-id",
+            primary_index=1,
+        )
+        assert router.assign("r0") is conns[1]
+
+    def test_affinity_explicit_primary_fails_over(self):
+        conns = _make_connectors(2)
+        router = DraftRouter(
+            connectors=conns,
+            policy="affinity",
+            primary_index=0,
+        )
+        assert router.assign("r0") is conns[0]
+        assert router.handle_server_failure(0) == ["r0"]
+        assert router.get_connector("r0") is conns[1]
+
 
 # ------------------------------------------------------------------
 # assign / release / get_connector

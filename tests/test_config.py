@@ -1648,6 +1648,54 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
+def test_disagg_draft_primary_index_is_accepted_for_affinity():
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+        disagg_draft_addresses=["draft-0", "draft-1"],
+        disagg_draft_routing_policy="affinity",
+        disagg_draft_primary_index=1,
+    )
+    assert speculative_config.disagg_draft_primary_index == 1
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        (
+            {
+                "disagg_draft_addresses": ["draft-0"],
+                "disagg_draft_primary_index": 0,
+            },
+            "routing_policy='affinity'",
+        ),
+        (
+            {
+                "disagg_draft_addresses": None,
+                "disagg_draft_routing_policy": "affinity",
+                "disagg_draft_primary_index": 0,
+            },
+            "requires at least one",
+        ),
+        (
+            {
+                "disagg_draft_addresses": ["draft-0"],
+                "disagg_draft_routing_policy": "affinity",
+                "disagg_draft_primary_index": 1,
+            },
+            "must be less than",
+        ),
+    ],
+)
+def test_disagg_draft_primary_index_rejects_invalid_config(overrides, error):
+    with pytest.raises(ValidationError, match=error):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            **overrides,
+        )
+
+
 def test_ir_op_priority_default():
     """Test that IR op priority defaults are set correctly."""
     from vllm.config.kernel import IrOpPriorityConfig

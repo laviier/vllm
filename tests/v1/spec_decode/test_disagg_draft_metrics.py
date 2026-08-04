@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for DisaggDraftMetrics on the verify server side."""
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -17,10 +18,8 @@ def _reset_prometheus_registry():
     duplicate metric registration errors."""
     collectors = list(prometheus_client.REGISTRY._names_to_collectors.values())
     for c in collectors:
-        try:
+        with contextlib.suppress(Exception):
             prometheus_client.REGISTRY.unregister(c)
-        except Exception:
-            pass
     yield
 
 
@@ -50,6 +49,7 @@ def _load_speculator_module():
     # Stub vllm.logger
     if "vllm.logger" not in sys.modules:
         import logging
+
         logger_mod = types.ModuleType("vllm.logger")
         logger_mod.init_logger = logging.getLogger  # type: ignore
         sys.modules["vllm.logger"] = logger_mod
@@ -60,9 +60,16 @@ def _load_speculator_module():
 
     file_path = os.path.join(
         os.path.dirname(__file__),
-        "..", "..", "..",
-        "vllm", "v1", "worker", "gpu", "spec_decode",
-        "disagg_draft", "speculator.py",
+        "..",
+        "..",
+        "..",
+        "vllm",
+        "v1",
+        "worker",
+        "gpu",
+        "spec_decode",
+        "disagg_draft",
+        "speculator.py",
     )
     file_path = os.path.normpath(file_path)
     spec = importlib.util.spec_from_file_location(mod_name, file_path)
@@ -85,31 +92,26 @@ class TestDisaggDraftMetrics:
 
     def test_record_increments_counters(self):
         m = _make_metrics()
-        m.record_speculation(tokens_requested=10, tokens_accepted=7,
-                             latency_s=0.05)
+        m.record_speculation(tokens_requested=10, tokens_accepted=7, latency_s=0.05)
         assert m.draft_tokens_requested._value.get() == 10
         assert m.draft_tokens_accepted._value.get() == 7
 
     def test_record_updates_acceptance_rate_gauge(self):
         m = _make_metrics()
-        m.record_speculation(tokens_requested=20, tokens_accepted=10,
-                             latency_s=0.01)
+        m.record_speculation(tokens_requested=20, tokens_accepted=10, latency_s=0.01)
         assert m.draft_acceptance_rate._value.get() == pytest.approx(0.5)
 
-        m.record_speculation(tokens_requested=20, tokens_accepted=20,
-                             latency_s=0.01)
+        m.record_speculation(tokens_requested=20, tokens_accepted=20, latency_s=0.01)
         # cumulative: 30 accepted / 40 requested = 0.75
         assert m.draft_acceptance_rate._value.get() == pytest.approx(0.75)
 
     def test_record_observes_histogram(self):
         m = _make_metrics()
-        m.record_speculation(tokens_requested=5, tokens_accepted=3,
-                             latency_s=0.042)
+        m.record_speculation(tokens_requested=5, tokens_accepted=3, latency_s=0.042)
         assert m.draft_round_trip_latency._sum.get() == pytest.approx(0.042)
 
     def test_zero_requested_no_division_error(self):
         m = _make_metrics()
-        m.record_speculation(tokens_requested=0, tokens_accepted=0,
-                             latency_s=0.01)
+        m.record_speculation(tokens_requested=0, tokens_accepted=0, latency_s=0.01)
         assert m._total_requested == 0
         assert m.draft_acceptance_rate._value.get() == 0.0

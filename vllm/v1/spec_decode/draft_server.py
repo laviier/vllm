@@ -16,6 +16,7 @@ so KV cache and speculation-cache state stays isolated.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
 import os
@@ -34,7 +35,6 @@ from vllm.v1.spec_decode.draft_data_models import (
     IpcHandshake,
     IpcHandshakeAck,
     PrefillRequest,
-    SpeculationResponse,
     VerificationOutcome,
     decode,
     decode_command,
@@ -67,45 +67,45 @@ class DraftServerMetrics:
     def __init__(self) -> None:
         self.draft_batch_size = prometheus_client.Gauge(
             name="vllm:draft_server_batch_size",
-            documentation=(
-                "Current batch size being processed by the draft server."
-            ),
+            documentation=("Current batch size being processed by the draft server."),
         )
         self.draft_generation_latency = prometheus_client.Histogram(
             name="vllm:draft_server_generation_latency_seconds",
             documentation=(
-                "Latency (seconds) per speculation batch on the draft "
-                "server."
+                "Latency (seconds) per speculation batch on the draft server."
             ),
             buckets=(
-                0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.075,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
             ),
         )
         self.draft_cache_hit_rate = prometheus_client.Gauge(
             name="vllm:draft_server_cache_hit_rate",
-            documentation=(
-                "Rolling speculation cache hit rate on the draft server."
-            ),
+            documentation=("Rolling speculation cache hit rate on the draft server."),
         )
         self.draft_eviction_count = prometheus_client.Counter(
             name="vllm:draft_server_eviction_total",
             documentation=(
-                "Total number of request evictions due to verify server "
-                "timeout."
+                "Total number of request evictions due to verify server timeout."
             ),
         )
         self.draft_connected_verify_servers = prometheus_client.Gauge(
             name="vllm:draft_server_connected_verify_servers",
             documentation=(
-                "Number of verify servers currently connected to the "
-                "draft server."
+                "Number of verify servers currently connected to the draft server."
             ),
         )
         self.draft_active_requests = prometheus_client.Gauge(
             name="vllm:draft_server_active_requests",
             documentation=(
-                "Total active requests across all connected verify "
-                "servers."
+                "Total active requests across all connected verify servers."
             ),
         )
 
@@ -123,9 +123,7 @@ class DraftServerMetrics:
         # Cross-VS SPECULATE merge counters (Option A).
         self.draft_speculate_total = prometheus_client.Counter(
             name="vllm:draft_server_speculate_total",
-            documentation=(
-                "Total SPECULATEs processed (a merged round counts as 2)."
-            ),
+            documentation=("Total SPECULATEs processed (a merged round counts as 2)."),
         )
         self.draft_speculate_merged = prometheus_client.Counter(
             name="vllm:draft_server_speculate_merged_total",
@@ -167,9 +165,7 @@ class _DraftServerIpcPeer:
         self.gpu_bufs = gpu_bufs
         # `resp_draft_tokens.device` is the verifier's GPU (tensors were
         # allocated on that GPU by the verifier and IPC-opened here).
-        self.target_device: torch.device = gpu_bufs[
-            "resp_draft_tokens"
-        ].device
+        self.target_device: torch.device = gpu_bufs["resp_draft_tokens"].device
         self.last_seen = [0] * n_slots
         # GPU doorbells (IPC-shared via cudaIpc).
         self._dbell_req = gpu_bufs["dbell_req_gpu"]
@@ -178,29 +174,37 @@ class _DraftServerIpcPeer:
         # values. Cheap to reuse; a single D2H picks up all slots at
         # once so the per-tick poll cost is one memcpy, not n_slots.
         self._dbell_req_cpu = torch.zeros(
-            n_slots, dtype=torch.int32, pin_memory=True,
+            n_slots,
+            dtype=torch.int32,
+            pin_memory=True,
         )
         # Pinned staging for seq_ids D2H (side-stream) and remapped-ids
         # H2D (side-stream). Both must be pinned so the non-blocking
         # copies don't serialize with the default stream (cache_build
         # kernels). Sized to max_batch — the actual per-round B <= this.
         self._seq_ids_cpu = torch.zeros(
-            max_batch, dtype=torch.int64, pin_memory=True,
+            max_batch,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         self._remap_ids_cpu = torch.zeros(
-            max_batch, dtype=torch.int64, pin_memory=True,
+            max_batch,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         # Same pattern for k_accepted D2H — used to build the CPU list
         # that ``_sync_runner_seq_lens_and_blocks`` needs. Skipping
         # this side-stream fetch causes the inner handler's
         # ``k_accepted.tolist()`` to stall ~3 ms behind cache_build.
         self._k_accepted_cpu = torch.zeros(
-            max_batch, dtype=torch.int64, pin_memory=True,
+            max_batch,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         # Dedicated side stream for the poll D2H and seq_ids H2D/D2H.
         # Using the default stream serializes with cache_build kernels;
         # a side stream lets these fire while cache_build is running.
-        with torch.cuda.device(self.target_device):
+        with torch.accelerator.device_index(self.target_device.index):
             self._poll_stream = torch.cuda.Stream()
 
     def poll_all_reqs(self) -> torch.Tensor:
@@ -296,7 +300,7 @@ class DraftServer(
         self._last_miss_mask: torch.Tensor | None = None
 
         # Determine device (use current CUDA device, set by entrypoint)
-        self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        self.device = torch.device(f"cuda:{torch.accelerator.current_device_index()}")
 
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
 
@@ -391,9 +395,7 @@ class DraftServer(
         # safely dispatch inline (because doing so would violate per-VS
         # FIFO with the held primary SPECULATE). The serve loop drains
         # this queue before polling ZMQ.
-        self._deferred_messages: list[
-            tuple[str, bytes, DraftCommand, list[bytes]]
-        ] = []
+        self._deferred_messages: list[tuple[str, bytes, DraftCommand, list[bytes]]] = []
 
         # ----- Per-VS CUDA-IPC state (Path C SPECULATE transport) -----
         # If a verify server sent an IPC_HANDSHAKE, we hold its shared
@@ -401,7 +403,7 @@ class DraftServer(
         # this dict is empty. Poll path in serve() scans this dict each
         # tick alongside the ZMQ poll.
         # Keyed by verify_server_id.
-        self._ipc_peers: dict[str, "_DraftServerIpcPeer"] = {}
+        self._ipc_peers: dict[str, _DraftServerIpcPeer] = {}
         # Round-robin cursor for ``_poll_ipc_speculates`` to prevent
         # a fast peer from starving a slower peer under multi-VS load.
         self._ipc_poll_cursor: int = 0
@@ -413,18 +415,26 @@ class DraftServer(
         # default-stream kernels. Pinned copies do not.
         # Sizes:
         #  base_lens_pin: [max_batch_size] — one entry per seq_id.
-        #  ded_blocks_pin: [MAX_BRANCHES] — one entry per branch block.
+        #  dedicated_blocks_pin: [MAX_BRANCHES] — one entry per branch block.
         self._cb_base_lens_pin = torch.zeros(
-            max_batch_size, dtype=torch.int64, pin_memory=True,
+            max_batch_size,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         self._cb_base_lens_gpu = torch.zeros(
-            max_batch_size, dtype=torch.int64, device=self.device,
+            max_batch_size,
+            dtype=torch.int64,
+            device=self.device,
         )
-        self._cb_ded_blocks_pin = torch.zeros(
-            self.MAX_BRANCHES, dtype=torch.int64, pin_memory=True,
+        self._cb_dedicated_blocks_pin = torch.zeros(
+            self.MAX_BRANCHES,
+            dtype=torch.int64,
+            pin_memory=True,
         )
-        self._cb_ded_blocks_gpu = torch.zeros(
-            self.MAX_BRANCHES, dtype=torch.int64, device=self.device,
+        self._cb_dedicated_blocks_gpu = torch.zeros(
+            self.MAX_BRANCHES,
+            dtype=torch.int64,
+            device=self.device,
         )
 
         # ----- Cross-VS SPECULATE merging (Option A) -----
@@ -556,6 +566,7 @@ class DraftServer(
                 "all depths generated in single forward pass",
                 self._mtp_token_id,
             )
+
     async def serve(self) -> None:
         """Main loop: accept commands from multiple verify servers.
 
@@ -589,9 +600,7 @@ class DraftServer(
                 # more than sub-N-µs response latency for a peer that
                 # arrived first.
                 if pending_ipc and len(pending_ipc) < len(self._ipc_peers):
-                    accum_us = int(
-                        os.environ.get("VLLM_DISAGG_IPC_ACCUM_US", "0")
-                    )
+                    accum_us = int(os.environ.get("VLLM_DISAGG_IPC_ACCUM_US", "0"))
                     if accum_us > 0:
                         await asyncio.sleep(accum_us / 1_000_000.0)
                         # Re-poll to pick up any straggler doorbells that
@@ -626,9 +635,7 @@ class DraftServer(
                         except Exception:
                             if not self._running:
                                 break
-                            logger.exception(
-                                "DraftServer ZMQ drain error"
-                            )
+                            logger.exception("DraftServer ZMQ drain error")
                             break
                         if len(zmq_frames) < 2:
                             continue
@@ -636,7 +643,8 @@ class DraftServer(
                         metadata_frame = zmq_frames[1]
                         tensor_frames = list(zmq_frames[2:])
                         vs_id_zmq = identity.decode(
-                            "utf-8", errors="replace",
+                            "utf-8",
+                            errors="replace",
                         )
                         try:
                             command = decode_command(metadata_frame)
@@ -657,7 +665,9 @@ class DraftServer(
                         self._current_tensor_frames = frames_msg
                         self._current_tensor_idx = 0
                         await self._dispatch(
-                            vs_id_msg, identity_msg, command_msg,
+                            vs_id_msg,
+                            identity_msg,
+                            command_msg,
                         )
                     # Await any in-flight cache build (SPECULATE is
                     # single-threaded with cache_build).
@@ -682,8 +692,7 @@ class DraftServer(
                     # VSes here so we don't scramble the merged
                     # cache.lookup.
                     live_ipc = [
-                        item for item in pending_ipc
-                        if item[0] in self._verify_servers
+                        item for item in pending_ipc if item[0] in self._verify_servers
                     ]
                     if not live_ipc:
                         self._check_evictions()
@@ -694,7 +703,10 @@ class DraftServer(
                     if len(live_ipc) == 1:
                         vs_id, slot, batch_size, seq16 = live_ipc[0]
                         await self._handle_ipc_speculation(
-                            vs_id, slot, batch_size, seq16,
+                            vs_id,
+                            slot,
+                            batch_size,
+                            seq16,
                         )
                     else:
                         await self._handle_ipc_speculation_merged(
@@ -738,14 +750,14 @@ class DraftServer(
             # per round even when nothing's pending and would
             # regress single-VS latency for no benefit.
             vs_id, identity, command, frames = msg
-            merged: list[tuple[str, bytes, DraftCommand,
-                               list[bytes]]] | None = None
+            merged: list[tuple[str, bytes, DraftCommand, list[bytes]]] | None = None
             if (
                 command.command.upper() == "SPECULATE"
                 and len(self._verify_servers) >= 2
             ):
                 extras = await self._drain_pending_speculates(
-                    zmq, already_collected={vs_id},
+                    zmq,
+                    already_collected={vs_id},
                 )
                 if extras:
                     merged = [msg, *extras]
@@ -765,16 +777,15 @@ class DraftServer(
             self._check_evictions()
 
     async def _recv_one_message(
-        self, zmq: Any,
+        self,
+        zmq: Any,
     ) -> tuple[str, bytes, DraftCommand, list[bytes]] | None:
         """Receive one full ZMQ message; decode header. Returns None on
         recv error or malformed input. Returns (vs_id, identity, command,
         tensor_frames) on success.
         """
         try:
-            frames = await self._socket.recv_multipart(
-                flags=zmq.NOBLOCK
-            )
+            frames = await self._socket.recv_multipart(flags=zmq.NOBLOCK)
         except Exception:
             if not self._running:
                 return None
@@ -783,8 +794,8 @@ class DraftServer(
 
         if len(frames) < 2:
             logger.warning(
-                "DraftServer received malformed message with %d frames; "
-                "skipping", len(frames),
+                "DraftServer received malformed message with %d frames; skipping",
+                len(frames),
             )
             return None
 
@@ -797,14 +808,17 @@ class DraftServer(
             command = decode_command(metadata_frame)
         except Exception:
             logger.exception(
-                "DraftServer failed to decode command from %s", vs_id,
+                "DraftServer failed to decode command from %s",
+                vs_id,
             )
             return None
 
         return vs_id, identity, command, tensor_frames
 
     async def _drain_pending_speculates(
-        self, zmq: Any, already_collected: set[str],
+        self,
+        zmq: Any,
+        already_collected: set[str],
         peek_timeout_ms: int | None = None,
     ) -> list[tuple[str, bytes, DraftCommand, list[bytes]]]:
         """Opportunistically peek for additional pending SPECULATEs from
@@ -923,9 +937,7 @@ class DraftServer(
             prof.export_chrome_trace(out_path)
             logger.info("DraftServer profile written to %s", out_path)
         except Exception:
-            logger.exception(
-                "DraftServer profile export failed; trace lost."
-            )
+            logger.exception("DraftServer profile export failed; trace lost.")
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -950,9 +962,7 @@ class DraftServer(
         self._verify_server_last_seen[verify_server_id] = time.monotonic()
 
         # Update connected server count metric.
-        self.metrics.draft_connected_verify_servers.set(
-            len(self._verify_servers)
-        )
+        self.metrics.draft_connected_verify_servers.set(len(self._verify_servers))
 
         cmd = command.command.upper()
 
@@ -961,9 +971,7 @@ class DraftServer(
             self.metrics.draft_speculate_total.inc()
             # Process immediately — sequential is correct for ZMQ
             # tensor transport (frames must be consumed before next msg).
-            await self._handle_speculation(
-                verify_server_id, identity, outcome
-            )
+            await self._handle_speculation(verify_server_id, identity, outcome)
             return
 
         # Non-SPECULATE commands (PREFILL / FREE_SEQ) also touch runner
@@ -974,20 +982,14 @@ class DraftServer(
 
         if cmd == "PREFILL":
             prefill = decode(command.payload, PrefillRequest)
-            await self._handle_prefill(
-                verify_server_id, identity, prefill
-            )
+            await self._handle_prefill(verify_server_id, identity, prefill)
 
         elif cmd == "FREE_SEQ":
             free_req = decode(command.payload, FreeSeqRequest)
-            await self._handle_free_seq(
-                verify_server_id, identity, free_req
-            )
+            await self._handle_free_seq(verify_server_id, identity, free_req)
 
         elif cmd == "EXIT":
-            logger.info(
-                "DraftServer received EXIT from %s", verify_server_id
-            )
+            logger.info("DraftServer received EXIT from %s", verify_server_id)
             await self._handle_exit(verify_server_id, identity)
 
         elif cmd == "HEALTHCHECK":
@@ -995,7 +997,9 @@ class DraftServer(
 
         elif cmd == "IPC_HANDSHAKE":
             await self._handle_ipc_handshake(
-                verify_server_id, identity, command,
+                verify_server_id,
+                identity,
+                command,
             )
 
         else:
@@ -1078,7 +1082,6 @@ class DraftServer(
             self._verify_servers.pop(vs_id, None)
             self._verify_server_last_seen.pop(vs_id, None)
 
-
     # ------------------------------------------------------------------
     # Command handlers
     # ------------------------------------------------------------------
@@ -1097,9 +1100,7 @@ class DraftServer(
         try:
             await task
         except Exception:
-            logger.exception(
-                "DraftServer background cache build failed"
-            )
+            logger.exception("DraftServer background cache build failed")
 
     async def _handle_prefill(
         self,
@@ -1112,7 +1113,9 @@ class DraftServer(
         key = self._register_request(verify_server_id, prefill.seq_id)
         logger.debug(
             "DraftServer PREFILL from %s, seq_id=%d, key=%s",
-            verify_server_id, prefill.seq_id, key,
+            verify_server_id,
+            prefill.seq_id,
+            key,
         )
 
         prompt_token_ids = self._recv_tensor(
@@ -1123,15 +1126,19 @@ class DraftServer(
         seq_id = self._map_seq_id(verify_server_id, prefill.seq_id)
         num_tokens = torch.tensor(
             [prompt_token_ids.shape[0]],
-            dtype=torch.int64, device=self.device,
+            dtype=torch.int64,
+            device=self.device,
         )
         seq_ids = torch.tensor(
-            [seq_id], dtype=torch.int64, device=self.device,
+            [seq_id],
+            dtype=torch.int64,
+            device=self.device,
         )
 
         logger.info(
             "DraftServer prefill: seq_id=%d, num_tokens=%d",
-            seq_id, int(num_tokens[0].item()),
+            seq_id,
+            int(num_tokens[0].item()),
         )
 
         runner = self.draft_model_runner
@@ -1169,9 +1176,7 @@ class DraftServer(
         Before freeing, caches the EAGLE KV blocks for prefix reuse
         (mirrors ``DisaggDraftWorker._handle_free_seq``).
         """
-        logger.debug(
-            "DraftServer FREE_SEQ from %s", verify_server_id
-        )
+        logger.debug("DraftServer FREE_SEQ from %s", verify_server_id)
 
         # ---- Step 1: Receive seq_ids tensor ----
         # Tensor frames are already in self._current_tensor_frames.
@@ -1224,13 +1229,9 @@ class DraftServer(
         # entries for active sequences while still protecting against
         # stale-sid cross-VS collisions.
         if self.cache is not None and freed_internal_sids:
-            self.cache.drop_entries_by_seq_ids(
-                verify_server_id, freed_internal_sids
-            )
+            self.cache.drop_entries_by_seq_ids(verify_server_id, freed_internal_sids)
 
-    async def _handle_exit(
-        self, verify_server_id: str, identity: bytes
-    ) -> None:
+    async def _handle_exit(self, verify_server_id: str, identity: bytes) -> None:
         """Handle EXIT command from a verify server.
 
         Cleans up all state for the disconnecting verify server,
@@ -1249,15 +1250,12 @@ class DraftServer(
             self.cache.reset_vs(verify_server_id)
 
         logger.info(
-            "DraftServer cleaned up %d requests for exiting "
-            "verify server %s",
+            "DraftServer cleaned up %d requests for exiting verify server %s",
             len(keys),
             verify_server_id,
         )
 
-    async def _handle_healthcheck(
-        self, verify_server_id: str, identity: bytes
-    ) -> None:
+    async def _handle_healthcheck(self, verify_server_id: str, identity: bytes) -> None:
         """Handle HEALTHCHECK command — respond with an ack.
 
         Sends a simple acknowledgement back to the verify server so it
@@ -1316,13 +1314,17 @@ class DraftServer(
             logger.info(
                 "DraftServer registered IPC peer %s: max_batch=%d K=%d "
                 "n_slots=%d target_device=%s",
-                verify_server_id, handshake.max_batch, handshake.K,
-                handshake.n_slots, peer.target_device,
+                verify_server_id,
+                handshake.max_batch,
+                handshake.K,
+                handshake.n_slots,
+                peer.target_device,
             )
             ack = IpcHandshakeAck(ok=True)
         except Exception as e:
             logger.exception(
-                "DraftServer IPC_HANDSHAKE failed for %s", verify_server_id,
+                "DraftServer IPC_HANDSHAKE failed for %s",
+                verify_server_id,
             )
             ack = IpcHandshakeAck(ok=False, error=repr(e))
 
@@ -1368,7 +1370,8 @@ class DraftServer(
                 if encoded < 0:
                     logger.info(
                         "IPC peer %s signalled shutdown on slot %d",
-                        vs_id, slot,
+                        vs_id,
+                        slot,
                     )
                     peer.last_seen[slot] = encoded
                     continue
@@ -1418,7 +1421,8 @@ class DraftServer(
                 if encoded < 0:
                     logger.info(
                         "IPC peer %s signalled shutdown on slot %d",
-                        vs_id, slot,
+                        vs_id,
+                        slot,
                     )
                     peer.last_seen[slot] = encoded
                     continue
@@ -1494,18 +1498,26 @@ class DraftServer(
             # (masked when CUDA_LAUNCH_BLOCKING=1). Pinned source keeps
             # the copy non-blocking on the default stream.
             seq_ids = torch.empty(
-                B, dtype=torch.int64, device=self.device,
+                B,
+                dtype=torch.int64,
+                device=self.device,
             )
             seq_ids.copy_(remap_view, non_blocking=True)
 
             k_accepted = buf["req_k_accepted"][slot, :B].to(
-                device=self.device, non_blocking=True, copy=True,
+                device=self.device,
+                non_blocking=True,
+                copy=True,
             )
             bonus_tokens = buf["req_bonus_tokens"][slot, :B].to(
-                device=self.device, non_blocking=True, copy=True,
+                device=self.device,
+                non_blocking=True,
+                copy=True,
             )
             temperatures = buf["req_temperatures"][slot, :B].to(
-                device=self.device, non_blocking=True, copy=True,
+                device=self.device,
+                non_blocking=True,
+                copy=True,
             )
 
             # Synthesize a VerificationOutcome for the inner handler.
@@ -1535,7 +1547,10 @@ class DraftServer(
                 identity=b"",  # unused on IPC path
                 outcome=outcome,
                 preloaded_tensors=(
-                    seq_ids, k_accepted, bonus_tokens, temperatures,
+                    seq_ids,
+                    k_accepted,
+                    bonus_tokens,
+                    temperatures,
                 ),
                 preloaded_seq_ids_list=internal_ids,
                 preloaded_k_accepted_list=k_accepted_list,
@@ -1547,10 +1562,12 @@ class DraftServer(
                 # ipc_send_ctx wasn't honored (should not happen).
                 cache_hits, draft_tokens, _dl, _nl = result
                 buf["resp_cache_hits"][slot, :B].copy_(
-                    cache_hits.to(torch.int64), non_blocking=True,
+                    cache_hits.to(torch.int64),
+                    non_blocking=True,
                 )
                 buf["resp_draft_tokens"][slot, :B].copy_(
-                    draft_tokens, non_blocking=True,
+                    draft_tokens,
+                    non_blocking=True,
                 )
                 peer.set_resp(slot, seq16)
 
@@ -1563,7 +1580,8 @@ class DraftServer(
         except Exception:
             logger.exception(
                 "DraftServer IPC speculation failed for %s slot %d",
-                verify_server_id, slot,
+                verify_server_id,
+                slot,
             )
             try:
                 buf["resp_cache_hits"][slot, :B].zero_()
@@ -1643,17 +1661,25 @@ class DraftServer(
                 # under sustained multi-VS load (masked when
                 # CUDA_LAUNCH_BLOCKING=1).
                 seq_ids = torch.empty(
-                    B, dtype=torch.int64, device=self.device,
+                    B,
+                    dtype=torch.int64,
+                    device=self.device,
                 )
                 seq_ids.copy_(remap_view, non_blocking=True)
                 k_accepted = buf["req_k_accepted"][slot, :B].to(
-                    device=self.device, non_blocking=True, copy=True,
+                    device=self.device,
+                    non_blocking=True,
+                    copy=True,
                 )
                 bonus_tokens = buf["req_bonus_tokens"][slot, :B].to(
-                    device=self.device, non_blocking=True, copy=True,
+                    device=self.device,
+                    non_blocking=True,
+                    copy=True,
                 )
                 temperatures = buf["req_temperatures"][slot, :B].to(
-                    device=self.device, non_blocking=True, copy=True,
+                    device=self.device,
+                    non_blocking=True,
+                    copy=True,
                 )
                 outcome = VerificationOutcome(
                     verify_server_id=vs_id,
@@ -1664,23 +1690,25 @@ class DraftServer(
                     temperatures_ref=self._make_tensor_ref(temperatures),
                     needs_logits=False,
                 )
-                per_vs.append({
-                    "vs_id": vs_id,
-                    "identity": b"",  # unused on IPC path
-                    "outcome": outcome,
-                    "B": B,
-                    "seq_ids": seq_ids,
-                    "k_accepted": k_accepted,
-                    "bonus_tokens": bonus_tokens,
-                    "temperatures": temperatures,
-                    "seq_ids_list": internal_ids,
-                    "k_accepted_list": k_accepted_list,
-                    # IPC response-fill hook consumed by
-                    # ``_handle_speculation_merged_inner``.
-                    "ipc_peer": peer,
-                    "ipc_slot": slot,
-                    "ipc_seq16": seq16,
-                })
+                per_vs.append(
+                    {
+                        "vs_id": vs_id,
+                        "identity": b"",  # unused on IPC path
+                        "outcome": outcome,
+                        "B": B,
+                        "seq_ids": seq_ids,
+                        "k_accepted": k_accepted,
+                        "bonus_tokens": bonus_tokens,
+                        "temperatures": temperatures,
+                        "seq_ids_list": internal_ids,
+                        "k_accepted_list": k_accepted_list,
+                        # IPC response-fill hook consumed by
+                        # ``_handle_speculation_merged_inner``.
+                        "ipc_peer": peer,
+                        "ipc_slot": slot,
+                        "ipc_seq16": seq16,
+                    }
+                )
 
             if not per_vs:
                 return
@@ -1692,7 +1720,8 @@ class DraftServer(
                 for p in per_vs
             ]
             await self._handle_speculation_merged_inner(
-                items_stub, preloaded_per_vs=per_vs,
+                items_stub,
+                preloaded_per_vs=per_vs,
             )
 
         except Exception:
@@ -1724,16 +1753,12 @@ class DraftServer(
     def _cleanup(self) -> None:
         """Release ZMQ resources."""
         if self._socket is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._socket.close(linger=0)
-            except Exception:
-                pass
             self._socket = None
         if self._ctx is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._ctx.term()
-            except Exception:
-                pass
             self._ctx = None
         for peer in self._ipc_peers.values():
             peer.close()

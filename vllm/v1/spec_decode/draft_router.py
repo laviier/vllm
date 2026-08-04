@@ -45,6 +45,8 @@ class DraftRouter:
         verify_server_id: Stable identifier used to compute the
             affinity primary draft. Required when ``policy="affinity"``;
             ignored otherwise.
+        primary_index: Explicit affinity primary. When provided, this takes
+            precedence over hashing ``verify_server_id``.
     """
 
     def __init__(
@@ -53,6 +55,7 @@ class DraftRouter:
         draft_server_addresses: list[str] | None = None,
         policy: str = "round_robin",
         verify_server_id: str | None = None,
+        primary_index: int | None = None,
     ) -> None:
         if not connectors:
             raise ValueError("DraftRouter requires at least one connector")
@@ -81,23 +84,28 @@ class DraftRouter:
         # when verify_server_id is stable (SHA1 of the id mod N).
         self._primary_idx: int | None = None
         if policy == "affinity":
-            if not verify_server_id:
+            if primary_index is not None:
+                if not 0 <= primary_index < len(connectors):
+                    raise ValueError(
+                        f"primary_index {primary_index} out of range "
+                        f"[0, {len(connectors)})"
+                    )
+                self._primary_idx = primary_index
+            elif not verify_server_id:
                 raise ValueError(
                     "DraftRouter policy='affinity' requires "
-                    "verify_server_id to pick a primary"
+                    "verify_server_id or primary_index to pick a primary"
                 )
-            digest = hashlib.sha1(
-                verify_server_id.encode("utf-8")
-            ).digest()
-            self._primary_idx = int.from_bytes(digest[:4], "big") % len(
-                connectors
-            )
+            else:
+                digest = hashlib.sha1(verify_server_id.encode("utf-8")).digest()
+                self._primary_idx = int.from_bytes(digest[:4], "big") % len(connectors)
             logger.info(
                 "DraftRouter affinity: VS %s pinned primary=server-%d "
-                "(of %d)",
+                "(of %d, source=%s)",
                 verify_server_id,
                 self._primary_idx,
                 len(connectors),
+                "explicit" if primary_index is not None else "hash",
             )
 
         logger.info(
@@ -118,9 +126,7 @@ class DraftRouter:
         """
         if request_id in self.assignment:
             idx = self.assignment[request_id]
-            logger.debug(
-                "Request %s already assigned to server %d", request_id, idx
-            )
+            logger.debug("Request %s already assigned to server %d", request_id, idx)
             return self.connectors[idx]
 
         idx = self._pick_next_available()
@@ -132,13 +138,9 @@ class DraftRouter:
         """Release the assignment for *request_id*."""
         idx = self.assignment.pop(request_id, None)
         if idx is not None:
-            logger.debug(
-                "Released request %s from server %d", request_id, idx
-            )
+            logger.debug("Released request %s from server %d", request_id, idx)
         else:
-            logger.debug(
-                "Release called for unknown request %s (no-op)", request_id
-            )
+            logger.debug("Release called for unknown request %s (no-op)", request_id)
 
     def get_connector(self, request_id: str) -> DraftConnector:
         """Return the connector for an already-assigned *request_id*.
@@ -159,22 +161,15 @@ class DraftRouter:
         """
         if server_index < 0 or server_index >= len(self.connectors):
             raise IndexError(
-                f"server_index {server_index} out of range "
-                f"[0, {len(self.connectors)})"
+                f"server_index {server_index} out of range [0, {len(self.connectors)})"
             )
 
         self._available[server_index] = False
         addr = self.draft_server_addresses[server_index]
-        logger.warning(
-            "Draft server %d (%s) marked unavailable", server_index, addr
-        )
+        logger.warning("Draft server %d (%s) marked unavailable", server_index, addr)
 
         # Collect requests that need reassignment
-        affected = [
-            rid
-            for rid, idx in self.assignment.items()
-            if idx == server_index
-        ]
+        affected = [rid for rid, idx in self.assignment.items() if idx == server_index]
 
         if not affected:
             return []
@@ -186,9 +181,7 @@ class DraftRouter:
                 # No servers available — remove assignment so the caller
                 # can handle graceful degradation.
                 del self.assignment[rid]
-                logger.error(
-                    "No available servers to reassign request %s", rid
-                )
+                logger.error("No available servers to reassign request %s", rid)
                 continue
 
             self.assignment[rid] = new_idx
@@ -213,8 +206,7 @@ class DraftRouter:
         """Re-enable a previously failed server (e.g. after reconnect)."""
         if server_index < 0 or server_index >= len(self.connectors):
             raise IndexError(
-                f"server_index {server_index} out of range "
-                f"[0, {len(self.connectors)})"
+                f"server_index {server_index} out of range [0, {len(self.connectors)})"
             )
         self._available[server_index] = True
         addr = self.draft_server_addresses[server_index]

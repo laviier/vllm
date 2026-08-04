@@ -23,6 +23,7 @@ so the model runner can call it uniformly. Under the hood it:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time as _time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
@@ -45,30 +46,31 @@ class DisaggDraftMetrics:
     def __init__(self) -> None:
         self.draft_tokens_requested = prometheus_client.Counter(
             name="vllm:disagg_draft_tokens_requested_total",
-            documentation=(
-                "Total draft tokens requested from draft server(s)."
-            ),
+            documentation=("Total draft tokens requested from draft server(s)."),
         )
         self.draft_tokens_accepted = prometheus_client.Counter(
             name="vllm:disagg_draft_tokens_accepted_total",
-            documentation=(
-                "Total draft tokens accepted after verification."
-            ),
+            documentation=("Total draft tokens accepted after verification."),
         )
         self.draft_round_trip_latency = prometheus_client.Histogram(
             name="vllm:disagg_draft_round_trip_latency_seconds",
-            documentation=(
-                "Round-trip latency (seconds) for SPECULATE requests."
-            ),
+            documentation=("Round-trip latency (seconds) for SPECULATE requests."),
             buckets=(
-                0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.075,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
             ),
         )
         self.draft_acceptance_rate = prometheus_client.Gauge(
             name="vllm:disagg_draft_acceptance_rate",
             documentation=(
-                "Rolling acceptance rate of draft tokens "
-                "(accepted / requested)."
+                "Rolling acceptance rate of draft tokens (accepted / requested)."
             ),
         )
         self._total_requested: int = 0
@@ -87,9 +89,7 @@ class DisaggDraftMetrics:
         self._total_requested += tokens_requested
         self._total_accepted += tokens_accepted
         if self._total_requested > 0:
-            self.draft_acceptance_rate.set(
-                self._total_accepted / self._total_requested
-            )
+            self.draft_acceptance_rate.set(self._total_accepted / self._total_requested)
 
 
 class DisaggSpeculatorProxy:
@@ -107,9 +107,7 @@ class DisaggSpeculatorProxy:
 
         self.speculative_config = vllm_config.speculative_config
         assert self.speculative_config is not None
-        self.num_speculative_steps = (
-            self.speculative_config.num_speculative_tokens
-        )
+        self.num_speculative_steps = self.speculative_config.num_speculative_tokens
         self.draft_model_config = self.speculative_config.draft_model_config
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -130,24 +128,36 @@ class DisaggSpeculatorProxy:
         # such serialization (measured 10 ms wait); pinned + non-blocking
         # ``copy_`` does not.
         self._active_idx_pinned_cpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int64, pin_memory=True,
+            self.max_num_reqs,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         self._seq_ids_pinned_cpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int64, pin_memory=True,
+            self.max_num_reqs,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         self._active_idx_gpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int64, device=device,
+            self.max_num_reqs,
+            dtype=torch.int64,
+            device=device,
         )
         self._seq_ids_gpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int64, device=device,
+            self.max_num_reqs,
+            dtype=torch.int64,
+            device=device,
         )
         # Per-server local-indices staging (used in dispatch to pick out
         # a per-server slice of the batch). Same pinned pattern.
         self._srv_idx_pinned_cpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int64, pin_memory=True,
+            self.max_num_reqs,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         self._srv_idx_gpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int64, device=device,
+            self.max_num_reqs,
+            dtype=torch.int64,
+            device=device,
         )
         self.draft_logits: torch.Tensor | None = None
         if self.speculative_config.rejection_sample_method == "probabilistic":
@@ -194,13 +204,13 @@ class DisaggSpeculatorProxy:
         # model runner to receive the final draft tokens.
         try:
             from vllm.distributed.parallel_state import get_tp_group
+
             self._tp_rank = get_tp_group().rank_in_group
         except Exception:
             self._tp_rank = 0
 
         logger.info(
-            "DisaggSpeculatorProxy created: K=%d, V=%d, device=%s, "
-            "tp_rank=%d",
+            "DisaggSpeculatorProxy created: K=%d, V=%d, device=%s, tp_rank=%d",
             self.num_speculative_steps,
             self.vocab_size,
             device,
@@ -231,7 +241,8 @@ class DisaggSpeculatorProxy:
                 except Exception:
                     logger.exception(
                         "IPC handshake failed for connector %d; "
-                        "SPECULATE will use ZMQ fallback", i,
+                        "SPECULATE will use ZMQ fallback",
+                        i,
                     )
 
         logger.info(
@@ -267,15 +278,16 @@ class DisaggSpeculatorProxy:
             if available:
                 continue
             connector = self.router.connectors[srv_idx]
-            if not getattr(connector, 'connected', False):
-                try:
-                    connector._reconnect()
-                except Exception:
-                    pass
-            if getattr(connector, 'connected', False):
+            if not getattr(connector, "connected", False):
+                reconnect = getattr(connector, "_reconnect", None)
+                if reconnect is not None:
+                    with contextlib.suppress(Exception):
+                        reconnect()
+            if getattr(connector, "connected", False):
                 self.router.mark_server_available(srv_idx)
                 logger.info(
-                    "Draft server %d reconnected successfully.", srv_idx,
+                    "Draft server %d reconnected successfully.",
+                    srv_idx,
                 )
 
     def _handle_server_failure(self, server_index: int) -> None:
@@ -337,23 +349,28 @@ class DisaggSpeculatorProxy:
         speculator isn't ready (non-rank-0 TP, no router, warmup, etc.)
         returns None — the caller must handle this by returning zeros.
         """
-        num_reqs = input_batch.num_reqs
         if self._tp_rank != 0 or self.router is None:
             return None
         self._propose_count += 1
-        if (self.router.num_available_servers < len(self.router.connectors)
-                and self._propose_count
-                    % self._reconnect_check_interval == 0):
+        if (
+            self.router.num_available_servers < len(self.router.connectors)
+            and self._propose_count % self._reconnect_check_interval == 0
+        ):
             self._attempt_reconnect_unavailable_servers()
         if self.router.num_available_servers == 0:
             return None
-        if any(rid.startswith("_warmup_") or rid.startswith("_dummy_")
-               for rid in input_batch.req_ids):
+        if any(
+            rid.startswith("_warmup_") or rid.startswith("_dummy_")
+            for rid in input_batch.req_ids
+        ):
             return None
 
         try:
             return self._do_propose_dispatch(
-                input_batch, num_sampled, last_sampled, temperature,
+                input_batch,
+                num_sampled,
+                last_sampled,
+                temperature,
             )
         except Exception:
             logger.exception("propose_dispatch failed; awaiting will zero.")
@@ -373,14 +390,20 @@ class DisaggSpeculatorProxy:
         K = self.num_speculative_steps
         if ctx is None:
             return torch.zeros(
-                num_reqs, K, dtype=torch.int64, device=self.device,
+                num_reqs,
+                K,
+                dtype=torch.int64,
+                device=self.device,
             )
         try:
             return self._do_propose_await(ctx, num_reqs)
         except Exception:
             logger.exception("propose_await failed; returning zeros.")
             return torch.zeros(
-                num_reqs, K, dtype=torch.int64, device=self.device,
+                num_reqs,
+                K,
+                dtype=torch.int64,
+                device=self.device,
             )
 
     @torch.inference_mode()
@@ -434,7 +457,10 @@ class DisaggSpeculatorProxy:
         num_reqs = input_batch.num_reqs
         K = self.num_speculative_steps
         zeros = torch.zeros(
-            num_reqs, K, dtype=torch.int64, device=self.device,
+            num_reqs,
+            K,
+            dtype=torch.int64,
+            device=self.device,
         )
 
         if dummy_run or is_profile or self._tp_rank != 0 or self.router is None:
@@ -443,9 +469,10 @@ class DisaggSpeculatorProxy:
         self._propose_count += 1
 
         # Periodically try to recover unavailable draft servers.
-        if (self.router.num_available_servers < len(self.router.connectors)
-                and self._propose_count
-                    % self._reconnect_check_interval == 0):
+        if (
+            self.router.num_available_servers < len(self.router.connectors)
+            and self._propose_count % self._reconnect_check_interval == 0
+        ):
             self._attempt_reconnect_unavailable_servers()
 
         if self.router.num_available_servers == 0:
@@ -455,19 +482,25 @@ class DisaggSpeculatorProxy:
                 logger.warning(
                     "All draft servers unavailable — returning zero "
                     "draft tokens. Will retry reconnection. "
-                    "(propose_count=%d)", self._propose_count,
+                    "(propose_count=%d)",
+                    self._propose_count,
                 )
             return zeros
 
         # Skip warmup/dummy requests — they pollute the draft server's
         # state with fake seq_ids that never get freed.
-        if any(rid.startswith("_warmup_") or rid.startswith("_dummy_")
-               for rid in input_batch.req_ids):
+        if any(
+            rid.startswith("_warmup_") or rid.startswith("_dummy_")
+            for rid in input_batch.req_ids
+        ):
             return zeros
 
         try:
             return self._do_propose(
-                input_batch, num_sampled, last_sampled, temperature,
+                input_batch,
+                num_sampled,
+                last_sampled,
+                temperature,
             )
         except Exception:
             logger.exception("Disagg propose failed; returning zeros.")
@@ -481,15 +514,18 @@ class DisaggSpeculatorProxy:
         temperature: torch.Tensor,
     ) -> torch.Tensor:
         from torch.profiler import record_function
+
         num_reqs = input_batch.num_reqs
         K = self.num_speculative_steps
         req_ids = input_batch.req_ids
-        idx_mapping = getattr(input_batch, 'idx_mapping', None)
+        idx_mapping = getattr(input_batch, "idx_mapping", None)
         if idx_mapping is not None:
             idx_mapping = idx_mapping[:num_reqs]
         else:
             idx_mapping = torch.arange(
-                num_reqs, dtype=torch.int64, device=self.device,
+                num_reqs,
+                dtype=torch.int64,
+                device=self.device,
             )
 
         # Step 1: Send FREE_SEQ for requests that have just finished.
@@ -500,7 +536,8 @@ class DisaggSpeculatorProxy:
         # their prompt processing.
         with record_function("propose_step2_check_prefill_needed"):
             new_req_ids = [
-                rid for i, rid in enumerate(req_ids)
+                rid
+                for i, rid in enumerate(req_ids)
                 if rid not in self._disagg_prefilled_reqs
                 and int(num_sampled[i].item()) > 0
             ]
@@ -512,26 +549,31 @@ class DisaggSpeculatorProxy:
         # of requests that are prefilled and ready for decode.
         with record_function("propose_step3_build_outcome_tensors"):
             active_req_indices = [
-                i for i, rid in enumerate(req_ids)
+                i
+                for i, rid in enumerate(req_ids)
                 if rid in self._disagg_prefilled_reqs
                 and rid in self._disagg_req_to_seq_id
             ]
             if not active_req_indices:
                 return torch.zeros(
-                    num_reqs, K, dtype=torch.int64, device=self.device,
+                    num_reqs,
+                    K,
+                    dtype=torch.int64,
+                    device=self.device,
                 )
 
             active_req_ids = [req_ids[i] for i in active_req_indices]
             active_idx = torch.tensor(
-                active_req_indices, dtype=torch.int64, device=self.device,
+                active_req_indices,
+                dtype=torch.int64,
+                device=self.device,
             )
             seq_ids = torch.tensor(
                 [self._disagg_req_to_seq_id[rid] for rid in active_req_ids],
-                dtype=torch.int64, device=self.device,
+                dtype=torch.int64,
+                device=self.device,
             )
-            k_accepted = (
-                num_sampled[active_idx] - 1
-            ).clamp(min=0).to(torch.int64)
+            k_accepted = (num_sampled[active_idx] - 1).clamp(min=0).to(torch.int64)
 
             # last_sampled is [num_reqs, max_sampled, 1] or [num_reqs, 1];
             # the bonus token is the last valid sample per request.
@@ -541,7 +583,8 @@ class DisaggSpeculatorProxy:
                 last_idx = (_ns - 1).clamp(min=0).long()
                 bonus_tokens = _ls[
                     torch.arange(_ls.shape[0], device=_ls.device),
-                    last_idx, 0,
+                    last_idx,
+                    0,
                 ].to(torch.int64)
             elif _ls.dim() == 2:
                 last_idx = (_ns - 1).clamp(min=0).long()
@@ -556,6 +599,7 @@ class DisaggSpeculatorProxy:
 
         # Step 4: Dispatch SPECULATE requests to the draft servers.
         import time as _time
+
         t0 = _time.perf_counter()
         B_active = len(active_req_indices)
         with record_function("propose_step4_dispatch_speculation"):
@@ -581,7 +625,10 @@ class DisaggSpeculatorProxy:
             logger.warning(
                 "Disagg SPECULATE latency %.2fms exceeds threshold "
                 "%.2fms (B_active=%d, K=%d)",
-                dt_ms, self._latency_warn_ms, B_active, K,
+                dt_ms,
+                self._latency_warn_ms,
+                B_active,
+                K,
             )
 
         # Step 5: Map draft tokens back into the full-batch buffer.
@@ -590,9 +637,7 @@ class DisaggSpeculatorProxy:
             K_actual = min(draft_logits.shape[1], self.draft_logits.shape[1])
             self.draft_logits[:num_reqs].zero_()
             for j, orig_i in enumerate(active_req_indices):
-                self.draft_logits[orig_i, :K_actual] = draft_logits[
-                    j, :K_actual
-                ]
+                self.draft_logits[orig_i, :K_actual] = draft_logits[j, :K_actual]
 
         target_vocab = self.vllm_config.model_config.get_vocab_size()
         draft_toks = draft_toks.clamp(min=0, max=target_vocab - 1)
@@ -636,14 +681,18 @@ class DisaggSpeculatorProxy:
             self.router.release(rid)
         for srv_idx, sids in stale_by_server.items():
             free_ids = torch.tensor(
-                sids, dtype=torch.int64, device=self.device,
+                sids,
+                dtype=torch.int64,
+                device=self.device,
             )
             connector = self.router.connectors[srv_idx]
             try:
                 self._run_async(connector.send_free_seq(free_ids))
             except Exception as e:
                 logger.warning(
-                    "FREE_SEQ to draft server %d failed: %s", srv_idx, e,
+                    "FREE_SEQ to draft server %d failed: %s",
+                    srv_idx,
+                    e,
                 )
 
     def _prefill_new_requests(self, new_req_ids: list[str]) -> None:
@@ -666,8 +715,8 @@ class DisaggSpeculatorProxy:
             prompt_ids = self._pending_prompt_tokens.get(rid)
             if not prompt_ids:
                 logger.warning(
-                    "Disagg prefill req %s: no cached prompt tokens, "
-                    "skipping.", rid,
+                    "Disagg prefill req %s: no cached prompt tokens, skipping.",
+                    rid,
                 )
                 continue
 
@@ -675,12 +724,15 @@ class DisaggSpeculatorProxy:
                 connector = self.router.assign(rid)
             except RuntimeError:
                 logger.error(
-                    "No available draft servers for prefill of req %s", rid,
+                    "No available draft servers for prefill of req %s",
+                    rid,
                 )
                 continue
 
             prompt_ids_t = torch.tensor(
-                prompt_ids, dtype=torch.int64, device=self.device,
+                prompt_ids,
+                dtype=torch.int64,
+                device=self.device,
             )
             try:
                 self._run_async(
@@ -711,17 +763,19 @@ class DisaggSpeculatorProxy:
         active work to do (empty batch after prefill filtering).
         """
         from torch.profiler import record_function
+
         from vllm.v1.spec_decode.draft_connector import PendingSpeculation
 
         num_reqs = input_batch.num_reqs
-        K = self.num_speculative_steps
         req_ids = input_batch.req_ids
-        idx_mapping = getattr(input_batch, 'idx_mapping', None)
+        idx_mapping = getattr(input_batch, "idx_mapping", None)
         if idx_mapping is not None:
             idx_mapping = idx_mapping[:num_reqs]
         else:
             idx_mapping = torch.arange(
-                num_reqs, dtype=torch.int64, device=self.device,
+                num_reqs,
+                dtype=torch.int64,
+                device=self.device,
             )
 
         with record_function("propose_step1_free_stale"):
@@ -729,7 +783,8 @@ class DisaggSpeculatorProxy:
 
         with record_function("propose_step2_check_prefill_needed"):
             new_req_ids = [
-                rid for i, rid in enumerate(req_ids)
+                rid
+                for i, rid in enumerate(req_ids)
                 if rid not in self._disagg_prefilled_reqs
                 and int(num_sampled[i].item()) > 0
             ]
@@ -740,7 +795,8 @@ class DisaggSpeculatorProxy:
         with record_function("propose_step3_build_outcome_tensors"):
             with record_function("propose_step3a_active_req_indices"):
                 active_req_indices = [
-                    i for i, rid in enumerate(req_ids)
+                    i
+                    for i, rid in enumerate(req_ids)
                     if rid in self._disagg_prefilled_reqs
                     and rid in self._disagg_req_to_seq_id
                 ]
@@ -757,13 +813,11 @@ class DisaggSpeculatorProxy:
                 # copy_ from Python list into pinned buffer is a plain
                 # memcpy (no CUDA involved).
                 self._active_idx_pinned_cpu[:n_active] = torch.as_tensor(
-                    active_req_indices, dtype=torch.int64,
+                    active_req_indices,
+                    dtype=torch.int64,
                 )
                 self._seq_ids_pinned_cpu[:n_active] = torch.as_tensor(
-                    [
-                        self._disagg_req_to_seq_id[rid]
-                        for rid in active_req_ids
-                    ],
+                    [self._disagg_req_to_seq_id[rid] for rid in active_req_ids],
                     dtype=torch.int64,
                 )
                 active_idx = self._active_idx_gpu[:n_active]
@@ -778,9 +832,7 @@ class DisaggSpeculatorProxy:
                 )
 
             with record_function("propose_step3c_k_accepted"):
-                k_accepted = (
-                    num_sampled[active_idx] - 1
-                ).clamp(min=0).to(torch.int64)
+                k_accepted = (num_sampled[active_idx] - 1).clamp(min=0).to(torch.int64)
 
             with record_function("propose_step3d_bonus_tokens"):
                 _ls = last_sampled[idx_mapping[active_idx]]
@@ -789,7 +841,8 @@ class DisaggSpeculatorProxy:
                     last_idx = (_ns - 1).clamp(min=0).long()
                     bonus_tokens = _ls[
                         torch.arange(_ls.shape[0], device=_ls.device),
-                        last_idx, 0,
+                        last_idx,
+                        0,
                     ].to(torch.int64)
                 elif _ls.dim() == 2:
                     last_idx = (_ns - 1).clamp(min=0).long()
@@ -825,11 +878,25 @@ class DisaggSpeculatorProxy:
             srv_order: list[int] = []
             srv_local_indices: list[list[int]] = []
             handles: list[PendingSpeculation] = []
-            single_server_fast_path = (
-                len(server_groups) == 1
-                and next(iter(server_groups.values())) ==
-                    list(range(B_active))
-            )
+            single_server_fast_path = len(server_groups) == 1 and next(
+                iter(server_groups.values())
+            ) == list(range(B_active))
+            srv_index_offset = 0
+            if not single_server_fast_path:
+                grouped_indices = [
+                    idx
+                    for local_indices in server_groups.values()
+                    for idx in local_indices
+                ]
+                self._srv_idx_pinned_cpu[:B_active] = torch.as_tensor(
+                    grouped_indices,
+                    dtype=torch.int64,
+                )
+                self._srv_idx_gpu[:B_active].copy_(
+                    self._srv_idx_pinned_cpu[:B_active],
+                    non_blocking=True,
+                )
+
             for srv_idx, local_indices in server_groups.items():
                 connector = self.router.connectors[srv_idx]
                 n = len(local_indices)
@@ -853,15 +920,12 @@ class DisaggSpeculatorProxy:
                         )
                     )
                 else:
-                    # Multi-server: build per-server index tensor via
-                    # pinned staging (same trick as step3b).
-                    self._srv_idx_pinned_cpu[:n] = torch.as_tensor(
-                        local_indices, dtype=torch.int64,
-                    )
-                    idx_t = self._srv_idx_gpu[:n]
-                    idx_t.copy_(
-                        self._srv_idx_pinned_cpu[:n], non_blocking=True,
-                    )
+                    # Each server gets a disjoint slice of the single
+                    # asynchronous H2D above. Reusing the same prefix can
+                    # overwrite an earlier server's indices before its
+                    # dispatch has consumed them.
+                    idx_t = self._srv_idx_gpu[srv_index_offset : srv_index_offset + n]
+                    srv_index_offset += n
                     handles.append(
                         connector.dispatch_speculation(
                             batch_size=n,
@@ -898,15 +962,19 @@ class DisaggSpeculatorProxy:
         dispatch_t0 = ctx["dispatch_t0"]
 
         assert self.router is not None
+        router = self.router
 
         draft_toks_out = torch.zeros(
-            B_active, K, dtype=torch.int64, device=self.device,
+            B_active,
+            K,
+            dtype=torch.int64,
+            device=self.device,
         )
         draft_logits_out: torch.Tensor | None = None
 
         async def _gather_awaits():
             coros = [
-                self.router.connectors[srv_idx].await_speculation(h)
+                router.connectors[srv_idx].await_speculation(h)
                 for srv_idx, h in zip(srv_order, handles)
             ]
             return await asyncio.gather(*coros, return_exceptions=True)
@@ -915,19 +983,23 @@ class DisaggSpeculatorProxy:
             results = self._run_async(_gather_awaits())
 
         for srv_idx, local_indices, result in zip(
-            srv_order, srv_local_indices, results,
+            srv_order,
+            srv_local_indices,
+            results,
         ):
             if isinstance(result, ConnectionError):
                 logger.warning(
                     "Draft server %d failed (%s); marking unavailable.",
-                    srv_idx, result,
+                    srv_idx,
+                    result,
                 )
                 self._handle_server_failure(srv_idx)
                 continue
             if isinstance(result, BaseException):
                 logger.warning(
-                    "Draft server %d error: %s; affected requests "
-                    "get zero drafts.", srv_idx, result,
+                    "Draft server %d error: %s; affected requests get zero drafts.",
+                    srv_idx,
+                    result,
                 )
                 continue
 
@@ -938,8 +1010,11 @@ class DisaggSpeculatorProxy:
             if srv_draft_logits is not None:
                 if draft_logits_out is None:
                     draft_logits_out = torch.zeros(
-                        B_active, K, self.vocab_size,
-                        dtype=self.dtype, device=self.device,
+                        B_active,
+                        K,
+                        self.vocab_size,
+                        dtype=self.dtype,
+                        device=self.device,
                     )
                 for local_j, global_j in enumerate(local_indices):
                     if local_j < srv_draft_logits.shape[0]:
@@ -947,9 +1022,9 @@ class DisaggSpeculatorProxy:
                             srv_draft_logits.shape[1],
                             draft_logits_out.shape[1],
                         )
-                        draft_logits_out[global_j, :K_actual] = (
-                            srv_draft_logits[local_j, :K_actual]
-                        )
+                        draft_logits_out[global_j, :K_actual] = srv_draft_logits[
+                            local_j, :K_actual
+                        ]
 
         dt_ms = (_time.perf_counter() - dispatch_t0) * 1000.0
         tokens_requested = B_active * K
@@ -963,20 +1038,22 @@ class DisaggSpeculatorProxy:
             logger.warning(
                 "Disagg SPECULATE latency %.2fms exceeds threshold "
                 "%.2fms (B_active=%d, K=%d)",
-                dt_ms, self._latency_warn_ms, B_active, K,
+                dt_ms,
+                self._latency_warn_ms,
+                B_active,
+                K,
             )
 
         # Stitch into self.draft_tokens
         self.draft_tokens[:num_reqs].zero_()
         if self.draft_logits is not None and draft_logits_out is not None:
             K_actual = min(
-                draft_logits_out.shape[1], self.draft_logits.shape[1],
+                draft_logits_out.shape[1],
+                self.draft_logits.shape[1],
             )
             self.draft_logits[:num_reqs].zero_()
             for j, orig_i in enumerate(active_req_indices):
-                self.draft_logits[orig_i, :K_actual] = (
-                    draft_logits_out[j, :K_actual]
-                )
+                self.draft_logits[orig_i, :K_actual] = draft_logits_out[j, :K_actual]
 
         target_vocab = self.vllm_config.model_config.get_vocab_size()
         draft_toks_out = draft_toks_out.clamp(min=0, max=target_vocab - 1)
@@ -997,6 +1074,7 @@ class DisaggSpeculatorProxy:
         """Group requests by draft server, send per-server SPECULATEs
         concurrently, stitch results back to active-batch order."""
         from torch.profiler import record_function
+
         assert self.router is not None
         K = self.num_speculative_steps
 
@@ -1011,7 +1089,10 @@ class DisaggSpeculatorProxy:
                 server_groups[srv_idx].append(j)
 
             draft_toks_out = torch.zeros(
-                B_active, K, dtype=torch.int64, device=self.device,
+                B_active,
+                K,
+                dtype=torch.int64,
+                device=self.device,
             )
             draft_logits_out: torch.Tensor | None = None
             needs_logits = self.draft_logits is not None
@@ -1023,7 +1104,9 @@ class DisaggSpeculatorProxy:
                 connector = self.router.connectors[srv_idx]
                 n = len(local_indices)
                 idx_t = torch.tensor(
-                    local_indices, dtype=torch.int64, device=self.device,
+                    local_indices,
+                    dtype=torch.int64,
+                    device=self.device,
                 )
                 srv_order.append(srv_idx)
                 srv_local_indices.append(local_indices)
@@ -1052,14 +1135,16 @@ class DisaggSpeculatorProxy:
             if isinstance(result, ConnectionError):
                 logger.warning(
                     "Draft server %d failed (%s); marking unavailable.",
-                    srv_idx, result,
+                    srv_idx,
+                    result,
                 )
                 self._handle_server_failure(srv_idx)
                 continue
             if isinstance(result, BaseException):
                 logger.warning(
-                    "Draft server %d error: %s; affected requests "
-                    "get zero drafts.", srv_idx, result,
+                    "Draft server %d error: %s; affected requests get zero drafts.",
+                    srv_idx,
+                    result,
                 )
                 continue
 
@@ -1071,8 +1156,11 @@ class DisaggSpeculatorProxy:
             if srv_draft_logits is not None:
                 if draft_logits_out is None:
                     draft_logits_out = torch.zeros(
-                        B_active, K, self.vocab_size,
-                        dtype=self.dtype, device=self.device,
+                        B_active,
+                        K,
+                        self.vocab_size,
+                        dtype=self.dtype,
+                        device=self.device,
                     )
                 for local_j, global_j in enumerate(local_indices):
                     if local_j < srv_draft_logits.shape[0]:
@@ -1080,9 +1168,9 @@ class DisaggSpeculatorProxy:
                             srv_draft_logits.shape[1],
                             draft_logits_out.shape[1],
                         )
-                        draft_logits_out[global_j, :K_actual] = (
-                            srv_draft_logits[local_j, :K_actual]
-                        )
+                        draft_logits_out[global_j, :K_actual] = srv_draft_logits[
+                            local_j, :K_actual
+                        ]
 
         return draft_toks_out, draft_logits_out
 

@@ -38,6 +38,7 @@ def _init_distributed_for_draft_server(vllm_config) -> None:
 
     if not model_parallel_is_initialized():
         from vllm.utils.network_utils import get_open_port
+
         init_port = get_open_port()
         init_distributed_environment(
             world_size=1,
@@ -61,9 +62,11 @@ def run_draft_server(args: argparse.Namespace) -> None:
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
 
-    if engine_args.speculative_config is not None:
-        if "model" not in engine_args.speculative_config:
-            engine_args.speculative_config["model"] = engine_args.model
+    if (
+        engine_args.speculative_config is not None
+        and "model" not in engine_args.speculative_config
+    ):
+        engine_args.speculative_config["model"] = engine_args.model
 
     vllm_config = engine_args.create_engine_config(
         usage_context=UsageContext.OPENAI_API_SERVER,
@@ -84,7 +87,8 @@ def run_draft_server(args: argparse.Namespace) -> None:
     # so NCCL can see all GPUs for P2P transfers.
     if device_id is not None:
         import torch
-        torch.cuda.set_device(device_id)
+
+        torch.accelerator.set_device_index(device_id)
         logger.info("Draft server using GPU %d", device_id)
 
     # Expose Prometheus metrics over HTTP so operators can scrape
@@ -92,10 +96,10 @@ def run_draft_server(args: argparse.Namespace) -> None:
     # ZMQ port + 1000 so 50051 → 51051, 50052 → 51052. Override with
     # DRAFT_METRICS_PORT env var if that collides.
     import os
+
     import prometheus_client
-    metrics_port = int(
-        os.environ.get("DRAFT_METRICS_PORT", port + 1000)
-    )
+
+    metrics_port = int(os.environ.get("DRAFT_METRICS_PORT", port + 1000))
     try:
         prometheus_client.start_http_server(metrics_port)
         logger.info(
@@ -105,7 +109,8 @@ def run_draft_server(args: argparse.Namespace) -> None:
     except OSError as e:
         logger.warning(
             "Could not start metrics HTTP server on port %d: %s",
-            metrics_port, e,
+            metrics_port,
+            e,
         )
 
     logger.info("Starting Draft Server on %s", bind_address)
@@ -138,7 +143,8 @@ def run_draft_server(args: argparse.Namespace) -> None:
         # VLLM_DRAFT_TORCH_PROFILER_DIR before launching the server.
         if serve_task is None:
             logger.warning(
-                "Received profile signal %d but server not running.", signum,
+                "Received profile signal %d but server not running.",
+                signum,
             )
             return
         loop = serve_task.get_loop()

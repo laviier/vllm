@@ -90,7 +90,10 @@ class DraftServerSpeculateMixin:
                     # Send response FIRST — unblocks the verify server
                     with torch.profiler.record_function("send_speculation_response"):
                         await self._send_speculation_response(
-                            verify_server_id, identity, cache_hits, draft_tokens,
+                            verify_server_id,
+                            identity,
+                            cache_hits,
+                            draft_tokens,
                             draft_logits,
                         )
                 # Schedule cache build as a background task so the
@@ -104,9 +107,7 @@ class DraftServerSpeculateMixin:
                     _seq_ids = self._last_spec_seq_ids
                     if _seq_ids is not None:
                         self._inflight_cache_build = asyncio.create_task(
-                            self._run_cache_build(
-                                B, _seq_ids, verify_server_id
-                            )
+                            self._run_cache_build(B, _seq_ids, verify_server_id)
                         )
             except Exception:
                 logger.exception(
@@ -115,15 +116,12 @@ class DraftServerSpeculateMixin:
                 )
                 # Send fallback response so the verify server doesn't hang
                 try:
-                    await self._send_fallback_speculation(
-                        verify_server_id, identity, B
-                    )
+                    await self._send_fallback_speculation(verify_server_id, identity, B)
                 except Exception:
                     logger.exception(
                         "DraftServer failed to send fallback response to %s",
                         verify_server_id,
                     )
-
 
     def _sync_runner_seq_lens_and_blocks(
         self,
@@ -141,9 +139,7 @@ class DraftServerSpeculateMixin:
         for i, sid in enumerate(seq_ids_list):
             if sid in self._round_base_lens:
                 runner._seq_lens[sid] = (
-                    self._round_base_lens[sid]
-                    + 1
-                    + int(k_accepted_list[i])
+                    self._round_base_lens[sid] + 1 + int(k_accepted_list[i])
                 )
 
         for sid in seq_ids_list:
@@ -155,9 +151,7 @@ class DraftServerSpeculateMixin:
         for sid in seq_ids_list:
             self._round_base_lens[sid] = runner._seq_lens.get(sid, 0)
 
-    def _accumulate_hit_metrics(
-        self, cache_hits: torch.Tensor, batch: int
-    ) -> None:
+    def _accumulate_hit_metrics(self, cache_hits: torch.Tensor, batch: int) -> None:
         """Update the rolling cache-hit-rate gauge without a per-round
         sync. Accumulates ``cache_hits.sum()`` lazily into a 0-d GPU
         tensor and only ``.item()``-s it once every
@@ -176,9 +170,7 @@ class DraftServerSpeculateMixin:
             m._pending_hits_gpu = None
             m._hit_rate_sync_round = 0
             if m._total_lookups > 0:
-                m.draft_cache_hit_rate.set(
-                    m._total_hits / m._total_lookups
-                )
+                m.draft_cache_hit_rate.set(m._total_hits / m._total_lookups)
 
     def _response_for_hits(
         self,
@@ -294,7 +286,8 @@ class DraftServerSpeculateMixin:
         )
         for sid, blocks in owned.items():
             runner.exclude_from_dedicated(
-                blocks, sid_to_vs.get(sid, "__default__"),
+                blocks,
+                sid_to_vs.get(sid, "__default__"),
             )
         if displaced:
             runner._free_list.extend(displaced)
@@ -336,9 +329,7 @@ class DraftServerSpeculateMixin:
         identity: bytes,
         outcome: VerificationOutcome,
         preloaded_tensors: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                  torch.Tensor | None]
-            | None
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None] | None
         ) = None,
         preloaded_seq_ids_list: list[int] | None = None,
         preloaded_k_accepted_list: list[int] | None = None,
@@ -366,9 +357,7 @@ class DraftServerSpeculateMixin:
         # ---- Step 1: Receive tensor payloads ----
         with torch.profiler.record_function("recv_spec_tensors"):
             if preloaded_tensors is not None:
-                seq_ids, k_accepted, bonus_tokens, temperatures = (
-                    preloaded_tensors
-                )
+                seq_ids, k_accepted, bonus_tokens, temperatures = preloaded_tensors
             else:
                 seq_ids, k_accepted, bonus_tokens, temperatures = (
                     self._recv_speculation_tensors(verify_server_id, outcome)
@@ -395,17 +384,17 @@ class DraftServerSpeculateMixin:
                 else:
                     k_accepted_list = k_accepted.tolist()
                 self._sync_runner_seq_lens_and_blocks(
-                    runner, seq_ids_list, k_accepted_list,
+                    runner,
+                    seq_ids_list,
+                    k_accepted_list,
                 )
 
         # ---- Step 3: Cache lookup ----
         with torch.profiler.record_function("cache_lookup"):
-            cached_tokens, cached_logits, cache_hits, _cached_hs = (
-                self.cache.lookup(
-                    seq_ids=seq_ids,
-                    k_accepted=k_accepted,
-                    bonus_tokens=bonus_tokens,
-                )
+            cached_tokens, cached_logits, cache_hits, _cached_hs = self.cache.lookup(
+                seq_ids=seq_ids,
+                k_accepted=k_accepted,
+                bonus_tokens=bonus_tokens,
             )
 
         hit_mask = cache_hits.bool()
@@ -432,10 +421,12 @@ class DraftServerSpeculateMixin:
             peer, slot, seq16 = ipc_send_ctx
             buf = peer.gpu_bufs
             buf["resp_cache_hits"][slot, :B].copy_(
-                cache_hits.to(torch.int64), non_blocking=True,
+                cache_hits.to(torch.int64),
+                non_blocking=True,
             )
             buf["resp_draft_tokens"][slot, :B].copy_(
-                draft_tokens, non_blocking=True,
+                draft_tokens,
+                non_blocking=True,
             )
             peer.set_resp(slot, seq16)
             self.metrics.draft_generation_latency.observe(
@@ -450,26 +441,31 @@ class DraftServerSpeculateMixin:
             # runner state, so the deferred ``_pending_swap`` /
             # ``_last_*`` writes remain safe.
             self._inflight_cache_build = asyncio.create_task(
-                self._phase_b_and_cache_build_solo({
-                    "verify_server_id": verify_server_id,
-                    "B": B,
-                    "cache_hits": cache_hits,
-                    "cached_logits": cached_logits,
-                    "hit_mask": hit_mask,
-                    "miss_mask": miss_mask,
-                    "draft_tokens": draft_tokens,
-                    "seq_ids": seq_ids,
-                    "seq_ids_list": seq_ids_list,
-                    "bonus_tokens": bonus_tokens,
-                    "runner": runner,
-                })
+                self._phase_b_and_cache_build_solo(
+                    {
+                        "verify_server_id": verify_server_id,
+                        "B": B,
+                        "cache_hits": cache_hits,
+                        "cached_logits": cached_logits,
+                        "hit_mask": hit_mask,
+                        "miss_mask": miss_mask,
+                        "draft_tokens": draft_tokens,
+                        "seq_ids": seq_ids,
+                        "seq_ids_list": seq_ids_list,
+                        "bonus_tokens": bonus_tokens,
+                        "runner": runner,
+                    }
+                )
             )
             return None
 
         # ZMQ / non-IPC path: original synchronous Phase B + return.
         draft_logits = torch.zeros(
-            B, self.K, self.vocab_size,
-            dtype=self.dtype, device=self.device,
+            B,
+            self.K,
+            self.vocab_size,
+            dtype=self.dtype,
+            device=self.device,
         )
 
         # ---- Step 4: Copy cache hits into response (swap deferred) ----
@@ -477,17 +473,20 @@ class DraftServerSpeculateMixin:
         pending_swap: dict[str, Any] | None = None
         if cached_logits is not None and runner is not None:
             with torch.profiler.record_function("copy_hits"):
-                hit_tables, hit_prefix_lens = (
-                    self.cache.get_hit_block_tables(cache_hits)
+                hit_tables, hit_prefix_lens = self.cache.get_hit_block_tables(
+                    cache_hits
                 )
-                if (hit_tables is not None
-                        and hit_prefix_lens is not None):
+                if hit_tables is not None and hit_prefix_lens is not None:
                     hit_mask_ktv = cache_hits.view(-1, 1, 1).expand(
-                        -1, self.K, self.vocab_size,
+                        -1,
+                        self.K,
+                        self.vocab_size,
                     )
                     draft_logits.copy_(
                         torch.where(
-                            hit_mask_ktv, cached_logits, draft_logits,
+                            hit_mask_ktv,
+                            cached_logits,
+                            draft_logits,
                         ),
                     )
                     pending_swap = {
@@ -512,12 +511,13 @@ class DraftServerSpeculateMixin:
         self._last_miss_mask = miss_mask.clone()
 
         send_logits = outcome.needs_logits
-        self.metrics.draft_generation_latency.observe(
-            time.monotonic() - _spec_start
+        self.metrics.draft_generation_latency.observe(time.monotonic() - _spec_start)
+        return (
+            cache_hits,
+            draft_tokens,
+            draft_logits if send_logits else None,
+            send_logits,
         )
-        return (cache_hits, draft_tokens,
-                draft_logits if send_logits else None,
-                send_logits)
 
     # ------------------------------------------------------------------
     # Merged SPECULATE handler (Option A: cross-VS batching)
@@ -540,9 +540,7 @@ class DraftServerSpeculateMixin:
         per-VS-correct because we track which batch indices originated
         from which VS via ``entry_vs``.
         """
-        with torch.profiler.record_function(
-            f"speculate_merged_n{len(items)}"
-        ):
+        with torch.profiler.record_function(f"speculate_merged_n{len(items)}"):
             with torch.profiler.record_function("await_inflight_cache_build"):
                 await self._await_inflight_cache_build()
 
@@ -557,11 +555,14 @@ class DraftServerSpeculateMixin:
                     outcome = decode(command.payload, VerificationOutcome)
                     try:
                         await self._send_fallback_speculation(
-                            vs_id, identity, outcome.batch_size,
+                            vs_id,
+                            identity,
+                            outcome.batch_size,
                         )
                     except Exception:
                         logger.exception(
-                            "DraftServer fallback to %s failed", vs_id,
+                            "DraftServer fallback to %s failed",
+                            vs_id,
                         )
 
     async def _handle_speculation_merged_inner(
@@ -610,7 +611,9 @@ class DraftServerSpeculateMixin:
             for vs_id, identity, command, _ in items:
                 outcome = decode(command.payload, VerificationOutcome)
                 await self._send_fallback_speculation(
-                    vs_id, identity, outcome.batch_size,
+                    vs_id,
+                    identity,
+                    outcome.batch_size,
                 )
             return
 
@@ -623,31 +626,28 @@ class DraftServerSpeculateMixin:
                 outcome = decode(command.payload, VerificationOutcome)
                 seq_ids, k_accepted, bonus_tokens, temperatures = (
                     self._recv_speculation_tensors(
-                        vs_id, outcome, frames=frames,
+                        vs_id,
+                        outcome,
+                        frames=frames,
                     )
                 )
-                per_vs.append({
-                    "vs_id": vs_id,
-                    "identity": identity,
-                    "outcome": outcome,
-                    "B": outcome.batch_size,
-                    "seq_ids": seq_ids,
-                    "k_accepted": k_accepted,
-                    "bonus_tokens": bonus_tokens,
-                    "temperatures": temperatures,
-                })
+                per_vs.append(
+                    {
+                        "vs_id": vs_id,
+                        "identity": identity,
+                        "outcome": outcome,
+                        "B": outcome.batch_size,
+                        "seq_ids": seq_ids,
+                        "k_accepted": k_accepted,
+                        "bonus_tokens": bonus_tokens,
+                        "temperatures": temperatures,
+                    }
+                )
 
         # ---- Concatenate along batch dim ----
         seq_ids_cat = torch.cat([p["seq_ids"] for p in per_vs], dim=0)
         k_accepted_cat = torch.cat([p["k_accepted"] for p in per_vs], dim=0)
         bonus_cat = torch.cat([p["bonus_tokens"] for p in per_vs], dim=0)
-        # All-or-nothing on temperatures: if any VS sent them, all must.
-        if all(p["temperatures"] is not None for p in per_vs):
-            temps_cat: torch.Tensor | None = torch.cat(
-                [p["temperatures"] for p in per_vs], dim=0,
-            )
-        else:
-            temps_cat = None
 
         # entry_vs[i] = index into items for the i-th merged batch row
         entry_vs: list[int] = []
@@ -659,20 +659,12 @@ class DraftServerSpeculateMixin:
         # D2Hs; concatenate them here to skip the ``.tolist()`` syncs
         # that would otherwise stall behind cache_build kernels on the
         # default stream.
-        if preloaded_per_vs is not None and all(
-            "seq_ids_list" in p for p in per_vs
-        ):
-            seq_ids_list = [
-                sid for p in per_vs for sid in p["seq_ids_list"]
-            ]
+        if preloaded_per_vs is not None and all("seq_ids_list" in p for p in per_vs):
+            seq_ids_list = [sid for p in per_vs for sid in p["seq_ids_list"]]
         else:
             seq_ids_list = seq_ids_cat.tolist()
-        if preloaded_per_vs is not None and all(
-            "k_accepted_list" in p for p in per_vs
-        ):
-            k_accepted_list = [
-                ka for p in per_vs for ka in p["k_accepted_list"]
-            ]
+        if preloaded_per_vs is not None and all("k_accepted_list" in p for p in per_vs):
+            k_accepted_list = [ka for p in per_vs for ka in p["k_accepted_list"]]
         else:
             k_accepted_list = k_accepted_cat.tolist()
 
@@ -686,17 +678,17 @@ class DraftServerSpeculateMixin:
         # ---- Reconcile runner state ----
         with torch.profiler.record_function("sync_seq_lens_merged"):
             self._sync_runner_seq_lens_and_blocks(
-                runner, seq_ids_list, k_accepted_list,
+                runner,
+                seq_ids_list,
+                k_accepted_list,
             )
 
         # ---- Cache lookup (one merged call) ----
         with torch.profiler.record_function("cache_lookup_merged"):
-            cached_tokens, cached_logits, cache_hits, _hs = (
-                self.cache.lookup(
-                    seq_ids=seq_ids_cat,
-                    k_accepted=k_accepted_cat,
-                    bonus_tokens=bonus_cat,
-                )
+            cached_tokens, cached_logits, cache_hits, _hs = self.cache.lookup(
+                seq_ids=seq_ids_cat,
+                k_accepted=k_accepted_cat,
+                bonus_tokens=bonus_cat,
             )
         hit_mask = cache_hits.bool()
         miss_mask = ~hit_mask
@@ -710,8 +702,7 @@ class DraftServerSpeculateMixin:
         # per-round staging (draft_logits blend, _pending_swap_merged
         # build, _last_* clones, get_hit_block_tables) to Phase B below
         # where it overlaps with the verifier's target forward.
-        all_ipc = all("ipc_peer" in p and not p["outcome"].needs_logits
-                      for p in per_vs)
+        all_ipc = all("ipc_peer" in p and not p["outcome"].needs_logits for p in per_vs)
         # cache.lookup already returned cached_tokens[B, K] with zeros
         # on miss rows and real tokens on hit rows. Clone so downstream
         # miss-fill can mutate col 0 without affecting the cache. Cost:
@@ -736,10 +727,12 @@ class DraftServerSpeculateMixin:
                 seq16 = p["ipc_seq16"]
                 buf = peer.gpu_bufs
                 buf["resp_cache_hits"][slot, :B].copy_(
-                    cache_hits[sl].to(torch.int64), non_blocking=True,
+                    cache_hits[sl].to(torch.int64),
+                    non_blocking=True,
                 )
                 buf["resp_draft_tokens"][slot, :B].copy_(
-                    draft_tokens[sl], non_blocking=True,
+                    draft_tokens[sl],
+                    non_blocking=True,
                 )
                 peer.set_resp(slot, seq16)
                 offset += B
@@ -782,8 +775,11 @@ class DraftServerSpeculateMixin:
         # + response send, kept for ZMQ callers that need
         # ``draft_logits`` in the response.
         draft_logits = torch.zeros(
-            B_total, self.K, self.vocab_size,
-            dtype=self.dtype, device=self.device,
+            B_total,
+            self.K,
+            self.vocab_size,
+            dtype=self.dtype,
+            device=self.device,
         )
 
         # ---- Apply cache hits (swap inline on merged path) ----
@@ -791,8 +787,8 @@ class DraftServerSpeculateMixin:
         self._pending_swap_merged = None
         if cached_logits is not None:
             with torch.profiler.record_function("swap_hits_merged"):
-                hit_tables, hit_prefix_lens = (
-                    self.cache.get_hit_block_tables(cache_hits)
+                hit_tables, hit_prefix_lens = self.cache.get_hit_block_tables(
+                    cache_hits
                 )
                 if hit_tables is not None and hit_prefix_lens is not None:
                     draft_logits[hit_mask] = cached_logits[hit_mask]
@@ -828,9 +824,7 @@ class DraftServerSpeculateMixin:
         self._last_bonus_tokens = bonus_cat.clone()
         self._last_miss_mask = miss_mask.clone()
 
-        self.metrics.draft_generation_latency.observe(
-            time.monotonic() - _spec_start
-        )
+        self.metrics.draft_generation_latency.observe(time.monotonic() - _spec_start)
 
         # ---- Send per-VS responses (ZMQ path) ----
         offset = 0
@@ -838,12 +832,12 @@ class DraftServerSpeculateMixin:
             B = p["B"]
             sl = slice(offset, offset + B)
             send_logits = p["outcome"].needs_logits
-            with torch.profiler.record_function(
-                "send_speculation_response"
-            ):
+            with torch.profiler.record_function("send_speculation_response"):
                 await self._send_speculation_response(
-                    p["vs_id"], p["identity"],
-                    cache_hits[sl], draft_tokens[sl],
+                    p["vs_id"],
+                    p["identity"],
+                    cache_hits[sl],
+                    draft_tokens[sl],
                     draft_logits[sl] if send_logits else None,
                 )
             offset += B
@@ -858,7 +852,7 @@ class DraftServerSpeculateMixin:
                 "vs_id": p["vs_id"],
                 "B": B,
                 "seq_ids": seq_ids_cat[sl].clone(),
-                "seq_ids_cpu": seq_ids_list[offset:offset + B],
+                "seq_ids_cpu": seq_ids_list[offset : offset + B],
                 "bonus_tokens": bonus_cat[sl].clone(),
                 "draft_tokens": draft_tokens[sl].clone(),
                 "draft_logits": draft_logits[sl].clone(),
@@ -872,7 +866,8 @@ class DraftServerSpeculateMixin:
         )
 
     async def _phase_b_and_cache_build_solo(
-        self, ctx: dict[str, Any],
+        self,
+        ctx: dict[str, Any],
     ) -> None:
         """Async continuation of the single-VS IPC path. Runs Phase B
         (draft_logits blend + pending_swap setup + _last_* clones),
@@ -884,7 +879,6 @@ class DraftServerSpeculateMixin:
         B = ctx["B"]
         cache_hits = ctx["cache_hits"]
         cached_logits = ctx["cached_logits"]
-        hit_mask = ctx["hit_mask"]
         miss_mask = ctx["miss_mask"]
         draft_tokens = ctx["draft_tokens"]
         seq_ids = ctx["seq_ids"]
@@ -893,25 +887,31 @@ class DraftServerSpeculateMixin:
         runner = ctx["runner"]
 
         draft_logits = torch.zeros(
-            B, self.K, self.vocab_size,
-            dtype=self.dtype, device=self.device,
+            B,
+            self.K,
+            self.vocab_size,
+            dtype=self.dtype,
+            device=self.device,
         )
 
         used_swap_for_hits = False
         pending_swap: dict[str, Any] | None = None
         if cached_logits is not None and runner is not None:
             with torch.profiler.record_function("copy_hits"):
-                hit_tables, hit_prefix_lens = (
-                    self.cache.get_hit_block_tables(cache_hits)
+                hit_tables, hit_prefix_lens = self.cache.get_hit_block_tables(
+                    cache_hits
                 )
-                if (hit_tables is not None
-                        and hit_prefix_lens is not None):
+                if hit_tables is not None and hit_prefix_lens is not None:
                     hit_mask_ktv = cache_hits.view(-1, 1, 1).expand(
-                        -1, self.K, self.vocab_size,
+                        -1,
+                        self.K,
+                        self.vocab_size,
                     )
                     draft_logits.copy_(
                         torch.where(
-                            hit_mask_ktv, cached_logits, draft_logits,
+                            hit_mask_ktv,
+                            cached_logits,
+                            draft_logits,
                         ),
                     )
                     pending_swap = {
@@ -942,7 +942,8 @@ class DraftServerSpeculateMixin:
         await self._run_cache_build(B, seq_ids, verify_server_id)
 
     async def _phase_b_and_cache_build_merged(
-        self, ctx: dict[str, Any],
+        self,
+        ctx: dict[str, Any],
     ) -> None:
         """Async continuation of the IPC merged path.
 
@@ -979,8 +980,11 @@ class DraftServerSpeculateMixin:
         runner = ctx["runner"]
 
         draft_logits = torch.zeros(
-            B_total, self.K, self.vocab_size,
-            dtype=self.dtype, device=self.device,
+            B_total,
+            self.K,
+            self.vocab_size,
+            dtype=self.dtype,
+            device=self.device,
         )
 
         # All-miss shortcut: no swap, no blend, no pending_swap_merged.
@@ -991,8 +995,8 @@ class DraftServerSpeculateMixin:
         self._pending_swap_merged = None
         if cached_logits is not None:
             with torch.profiler.record_function("swap_hits_merged"):
-                hit_tables, hit_prefix_lens = (
-                    self.cache.get_hit_block_tables(cache_hits)
+                hit_tables, hit_prefix_lens = self.cache.get_hit_block_tables(
+                    cache_hits
                 )
                 if hit_tables is not None and hit_prefix_lens is not None:
                     draft_logits[hit_mask] = cached_logits[hit_mask]
@@ -1039,7 +1043,7 @@ class DraftServerSpeculateMixin:
                 "vs_id": p["vs_id"],
                 "B": B,
                 "seq_ids": seq_ids_cat[sl].clone(),
-                "seq_ids_cpu": seq_ids_list[offset:offset + B],
+                "seq_ids_cpu": seq_ids_list[offset : offset + B],
                 "bonus_tokens": bonus_cat[sl].clone(),
                 "draft_tokens": draft_tokens[sl].clone(),
                 "draft_logits": draft_logits[sl].clone(),
@@ -1049,4 +1053,3 @@ class DraftServerSpeculateMixin:
             slice_metas.append(sm)
             offset += B
         await self._run_cache_build_merged(slice_metas)
-

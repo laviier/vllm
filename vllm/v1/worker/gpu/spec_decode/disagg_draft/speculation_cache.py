@@ -88,16 +88,12 @@ class SpeculationCache:
         # evict another's entries. Per-VS partitioning is the fix for
         # 3V+2D cache thrashing (see draft_server.py / dedicated
         # blocks are also partitioned per VS in DraftModelRunner).
-        self.max_entries = (
-            max_batch_size * self.entries_per_seq * max_verify_servers
-        )
+        self.max_entries = max_batch_size * self.entries_per_seq * max_verify_servers
 
         # Cache keys: [max_entries, 3] — (seq_id, k_accepted, bonus_token).
         # Internal seq_ids are globally unique across VSes (remapped by
         # DraftServer._map_seq_id), so seq_id alone disambiguates.
-        self.keys = torch.zeros(
-            self.max_entries, 3, dtype=torch.int64, device=device
-        )
+        self.keys = torch.zeros(self.max_entries, 3, dtype=torch.int64, device=device)
         self.tokens = torch.zeros(
             self.max_entries, self.K, dtype=torch.int64, device=device
         )
@@ -109,8 +105,7 @@ class SpeculationCache:
         if needs_hidden_states:
             if hidden_size <= 0:
                 raise ValueError(
-                    "hidden_size must be positive when "
-                    "needs_hidden_states=True"
+                    "hidden_size must be positive when needs_hidden_states=True"
                 )
             self._hidden_states = torch.zeros(
                 self.max_entries,
@@ -135,9 +130,7 @@ class SpeculationCache:
         self._vs_branch_block_tables: dict[str, torch.Tensor] = {}
         self._vs_prefix_lens: dict[str, torch.Tensor] = {}
         # Owner tensor per cache slot: small_id that maps back to vs_id.
-        self._owners = torch.zeros(
-            self.max_entries, dtype=torch.int32, device=device
-        )
+        self._owners = torch.zeros(self.max_entries, dtype=torch.int32, device=device)
         self._vs_small_id: dict[str, int] = {}
         self._small_id_to_vs: list[str] = []
 
@@ -150,16 +143,24 @@ class SpeculationCache:
         # syncs, which stall behind cache_build kernels on the default
         # stream when the SPECULATE handler is called concurrently.
         self._vs_start_cpu_pin = torch.zeros(
-            max_verify_servers, dtype=torch.int64, pin_memory=True,
+            max_verify_servers,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         self._vs_offset_cpu_pin = torch.zeros(
-            max_verify_servers, dtype=torch.int64, pin_memory=True,
+            max_verify_servers,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         self._vs_start_gpu = torch.zeros(
-            max_verify_servers, dtype=torch.int64, device=device,
+            max_verify_servers,
+            dtype=torch.int64,
+            device=device,
         )
         self._vs_offset_gpu = torch.zeros(
-            max_verify_servers, dtype=torch.int64, device=device,
+            max_verify_servers,
+            dtype=torch.int64,
+            device=device,
         )
 
     @property
@@ -214,17 +215,13 @@ class SpeculationCache:
             tail = N - end
             self.keys[offset : offset + tail] = self.keys[end:N].clone()
             self.tokens[offset : offset + tail] = self.tokens[end:N].clone()
-            self._owners[offset : offset + tail] = (
-                self._owners[end:N].clone()
-            )
+            self._owners[offset : offset + tail] = self._owners[end:N].clone()
             if self._logits is not None and self._logits_allocated >= N:
-                self._logits[offset : offset + tail] = (
-                    self._logits[end:N].clone()
-                )
+                self._logits[offset : offset + tail] = self._logits[end:N].clone()
             if self._hidden_states is not None:
-                self._hidden_states[offset : offset + tail] = (
-                    self._hidden_states[end:N].clone()
-                )
+                self._hidden_states[offset : offset + tail] = self._hidden_states[
+                    end:N
+                ].clone()
             # Shift down the offsets of partitions that moved.
             for other_vs, other_off in list(self._vs_offsets.items()):
                 if other_off >= end:
@@ -283,9 +280,9 @@ class SpeculationCache:
         keep_count = count - n_drop
 
         # Gather kept rows within this partition.
-        keep_idx = keep_mask.nonzero(as_tuple=True)[0]           # [keep_count]
+        keep_idx = keep_mask.nonzero(as_tuple=True)[0]  # [keep_count]
         # Global indices of kept rows:
-        kept_global = keep_idx + offset                           # [keep_count]
+        kept_global = keep_idx + offset  # [keep_count]
 
         # Overwrite the partition's slice with kept rows compacted
         # to the front. We use gather via fancy indexing (safe: dest
@@ -327,15 +324,15 @@ class SpeculationCache:
         N = self.num_entries
         if partition_end_old < N:
             tail = N - partition_end_old
-            self.keys[partition_end_new : partition_end_new + tail] = (
-                self.keys[partition_end_old:N].clone()
-            )
-            self.tokens[partition_end_new : partition_end_new + tail] = (
-                self.tokens[partition_end_old:N].clone()
-            )
-            self._owners[partition_end_new : partition_end_new + tail] = (
-                self._owners[partition_end_old:N].clone()
-            )
+            self.keys[partition_end_new : partition_end_new + tail] = self.keys[
+                partition_end_old:N
+            ].clone()
+            self.tokens[partition_end_new : partition_end_new + tail] = self.tokens[
+                partition_end_old:N
+            ].clone()
+            self._owners[partition_end_new : partition_end_new + tail] = self._owners[
+                partition_end_old:N
+            ].clone()
             if self._logits is not None and self._logits_allocated >= N:
                 self._logits[partition_end_new : partition_end_new + tail] = (
                     self._logits[partition_end_old:N].clone()
@@ -419,7 +416,10 @@ class SpeculationCache:
                 "SpeculationCache capacity exceeded: need %d slots "
                 "but only %d available (num_entries=%d, vs_id=%s). "
                 "Dropping populate.",
-                N, self.max_entries - offset, self.num_entries, vs_id,
+                N,
+                self.max_entries - offset,
+                self.num_entries,
+                vs_id,
             )
             return
 
@@ -449,8 +449,7 @@ class SpeculationCache:
         seq_ids: torch.Tensor,
         k_accepted: torch.Tensor,
         bonus_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor,
-               torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
         """Look up verification outcomes in the cache.
 
         Returns pre-computed draft tokens, logits, and optionally hidden states
@@ -531,7 +530,9 @@ class SpeculationCache:
         draft_logits_out: torch.Tensor | None = None
         if self._logits is not None and self._logits_allocated >= N:
             hit_mask_ktv = hit_mask.view(B, 1, 1).expand(
-                -1, self.K, self.vocab_size,
+                -1,
+                self.K,
+                self.vocab_size,
             )
             gathered_logits = self._logits[match_idx]  # [B, K, V]
             draft_logits_out = torch.where(
@@ -553,7 +554,8 @@ class SpeculationCache:
         return draft_tokens_out, draft_logits_out, cache_hits, hidden_states_out
 
     def get_hit_block_tables(
-        self, hit_mask: torch.Tensor,
+        self,
+        hit_mask: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Get branch block tables and prefix_lens for cache hits.
 
@@ -581,15 +583,15 @@ class SpeculationCache:
         if not self._vs_branch_block_tables:
             return None, None
 
-        match_idx = self._last_match_idx                  # [B]
+        match_idx = self._last_match_idx  # [B]
         # Boolean-mask index: forces a CUDA sync to resolve output shape.
         # If prior-round cache_build kernels are still draining on the
         # default stream, this is where that wait lands.
         if _GHBT_TRACE:
             with torch.profiler.record_function("ghbt_hit_indices"):
-                hit_indices = match_idx[hit_mask]         # [num_hits]
+                hit_indices = match_idx[hit_mask]  # [num_hits]
         else:
-            hit_indices = match_idx[hit_mask]             # [num_hits]
+            hit_indices = match_idx[hit_mask]  # [num_hits]
         # ``numel()`` on the result reads shape only — the sync above
         # already resolved it, so this is a cheap host-side query.
         if hit_indices.numel() == 0:
@@ -609,10 +611,10 @@ class SpeculationCache:
         if _GHBT_TRACE:
             with torch.profiler.record_function("ghbt_clamp_owners"):
                 hit_indices = hit_indices.clamp(max=n_entries - 1)
-                owners = self._owners[hit_indices]        # [num_hits]
+                owners = self._owners[hit_indices]  # [num_hits]
         else:
             hit_indices = hit_indices.clamp(max=n_entries - 1)
-            owners = self._owners[hit_indices]            # [num_hits]
+            owners = self._owners[hit_indices]  # [num_hits]
 
         # Build a flat concatenation of per-VS branch tables indexed
         # by small_id. Per-hit lookup maps global cache index →
@@ -683,8 +685,8 @@ class SpeculationCache:
         if _GHBT_TRACE:
             with torch.profiler.record_function("ghbt_flat_idx"):
                 owners_i64 = owners.to(torch.int64)
-                per_hit_start = start_gpu[owners_i64]       # [num_hits]
-                per_hit_offset = offset_gpu[owners_i64]     # [num_hits]
+                per_hit_start = start_gpu[owners_i64]  # [num_hits]
+                per_hit_offset = offset_gpu[owners_i64]  # [num_hits]
                 flat_idx = per_hit_start + (hit_indices - per_hit_offset)
             with torch.profiler.record_function("ghbt_gather_out"):
                 out_tables = flat_tables[flat_idx]
@@ -692,8 +694,8 @@ class SpeculationCache:
             return out_tables, out_prefix
 
         owners_i64 = owners.to(torch.int64)
-        per_hit_start = start_gpu[owners_i64]              # [num_hits]
-        per_hit_offset = offset_gpu[owners_i64]            # [num_hits]
+        per_hit_start = start_gpu[owners_i64]  # [num_hits]
+        per_hit_offset = offset_gpu[owners_i64]  # [num_hits]
         flat_idx = per_hit_start + (hit_indices - per_hit_offset)
 
         return flat_tables[flat_idx], flat_prefix[flat_idx]

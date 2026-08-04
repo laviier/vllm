@@ -16,9 +16,14 @@ consumer's ``__init__``:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -26,50 +31,75 @@ logger = init_logger(__name__)
 class DraftKVCacheMixin:
     """Block-allocator and KV-cache management for DraftModelRunner."""
 
+    device: torch.device
+    dtype: torch.dtype
+    block_size: int
+    num_kv_heads: int
+    num_layers: int
+    head_dim: int
+    max_num_blocks: int
+    num_kv_blocks: int
+    kv_caches: list[torch.Tensor] | None
+    _draft_vllm_config: VllmConfig
+    _block_table_gpu: torch.Tensor
+    _block_tables: dict[int, list[int]]
+    _dedicated_blocks_by_vs: dict[str, list[int]]
+    _seq_lens: dict[int, int]
+    _free_list: list[int]
+    _next_free_block: int
+    _kv_snapshot: dict[int, int] | None
+
     def _allocate_kv_cache(self) -> None:
         """Allocate KV cache on the draft GPU."""
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
-        free_mem, _ = torch.cuda.mem_get_info(self.device)
+        free_mem, _ = torch.accelerator.get_memory_info(self.device)
         usable_bytes = int(free_mem * 0.8)
 
         bytes_per_block = (
-            2 * self.num_layers * self.block_size
-            * self.num_kv_heads * self.head_dim
-            * torch.finfo(self.dtype).bits // 8
+            2
+            * self.num_layers
+            * self.block_size
+            * self.num_kv_heads
+            * self.head_dim
+            * torch.finfo(self.dtype).bits
+            // 8
         )
 
         self.num_kv_blocks = max(1, usable_bytes // bytes_per_block)
 
         logger.info(
-            "Draft KV cache: %d blocks × %d tokens/block = %d max tokens, "
-            "%.1f GB",
-            self.num_kv_blocks, self.block_size,
+            "Draft KV cache: %d blocks × %d tokens/block = %d max tokens, %.1f GB",
+            self.num_kv_blocks,
+            self.block_size,
             self.num_kv_blocks * self.block_size,
             self.num_kv_blocks * bytes_per_block / 1e9,
         )
 
-        # Layout: (num_blocks, 2, block_size, num_kv_heads, head_dim).
-        # Matches main's FlashAttention backend after #42095, which
-        # unpacks key/value via kv_cache.unbind(1).
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+
+        kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
+            self.num_kv_blocks,
+            self.block_size,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        stride_order = FlashAttentionBackend.get_kv_cache_stride_order()
+        allocation_shape = tuple(kv_cache_shape[i] for i in stride_order)
+        inverse_order = tuple(stride_order.index(i) for i in range(len(stride_order)))
+
         self.kv_caches = []
         for _ in range(self.num_layers):
             kv = torch.zeros(
-                self.num_kv_blocks,
-                2,
-                self.block_size,
-                self.num_kv_heads,
-                self.head_dim,
+                allocation_shape,
                 dtype=self.dtype,
                 device=self.device,
-            )
+            ).permute(inverse_order)
             self.kv_caches.append(kv)
 
     def _bind_kv_cache_to_attention_layers(self) -> None:
         """Bind allocated KV tensors to the model's attention layers."""
-        forward_ctx = (
-            self._draft_vllm_config.compilation_config.static_forward_context
-        )
+        forward_ctx = self._draft_vllm_config.compilation_config.static_forward_context
         if not forward_ctx:
             logger.warning(
                 "No attention layers found in static_forward_context. "
@@ -80,7 +110,7 @@ class DraftKVCacheMixin:
         from vllm.model_executor.layers.attention import Attention
         from vllm.model_executor.models.utils import extract_layer_index
 
-        attn_layers = []
+        attn_layers: list[tuple[int, str, Attention]] = []
         for layer_name, layer in forward_ctx.items():
             if isinstance(layer, Attention):
                 try:
@@ -95,7 +125,8 @@ class DraftKVCacheMixin:
         if len(attn_layers) != len(self.kv_caches):
             logger.warning(
                 "Mismatch: %d attention layers vs %d KV cache tensors.",
-                len(attn_layers), len(self.kv_caches),
+                len(attn_layers),
+                len(self.kv_caches),
             )
 
         num_bind = min(len(attn_layers), len(self.kv_caches))
@@ -156,13 +187,11 @@ class DraftKVCacheMixin:
         if seq_id in self._block_tables:
             self._free_list.extend(self._block_tables.pop(seq_id))
 
-        num_blocks_needed = (
-            (num_tokens + self.block_size - 1) // self.block_size
-        )
+        num_blocks_needed = (num_tokens + self.block_size - 1) // self.block_size
         blocks = self._alloc_n_blocks(num_blocks_needed)
         self._block_tables[seq_id] = blocks
         self._block_table_gpu[seq_id].zero_()
-        self._block_table_gpu[seq_id, :len(blocks)] = torch.tensor(
+        self._block_table_gpu[seq_id, : len(blocks)] = torch.tensor(
             blocks, dtype=torch.int32, device=self.device
         )
         return blocks
@@ -183,9 +212,7 @@ class DraftKVCacheMixin:
             return
 
         current_blocks = len(self._block_tables[seq_id])
-        needed_blocks = (
-            (num_tokens + self.block_size - 1) // self.block_size
-        )
+        needed_blocks = (num_tokens + self.block_size - 1) // self.block_size
         if needed_blocks <= current_blocks:
             return
 
@@ -193,7 +220,7 @@ class DraftKVCacheMixin:
         new_blocks = self._alloc_n_blocks(extra)
         self._block_tables[seq_id].extend(new_blocks)
         start = current_blocks
-        self._block_table_gpu[seq_id, start:start + extra] = torch.tensor(
+        self._block_table_gpu[seq_id, start : start + extra] = torch.tensor(
             new_blocks, dtype=torch.int32, device=self.device
         )
 
@@ -243,17 +270,26 @@ class DraftKVCacheMixin:
         # That cuts the tolist payload from H×M ints to H×W ints.
         first_write_blks = torch.tensor(
             [p // bs for p in prefix_lens_list],
-            dtype=torch.int64, device=branch_block_tables.device,
+            dtype=torch.int64,
+            device=branch_block_tables.device,
         )
         col_offsets = torch.arange(
-            W, dtype=torch.int64, device=branch_block_tables.device,
+            W,
+            dtype=torch.int64,
+            device=branch_block_tables.device,
         )
-        gather_cols = (
-            first_write_blks.unsqueeze(1) + col_offsets.unsqueeze(0)
-        ).clamp_(max=M - 1)                                   # [H, W]
-        row_idx = torch.arange(
-            B, dtype=torch.int64, device=branch_block_tables.device,
-        ).unsqueeze(1).expand(B, W)
+        gather_cols = (first_write_blks.unsqueeze(1) + col_offsets.unsqueeze(0)).clamp_(
+            max=M - 1
+        )  # [H, W]
+        row_idx = (
+            torch.arange(
+                B,
+                dtype=torch.int64,
+                device=branch_block_tables.device,
+            )
+            .unsqueeze(1)
+            .expand(B, W)
+        )
         gathered = branch_block_tables[row_idx, gather_cols]  # [H, W]
         gathered_list = gathered.tolist()
 
@@ -299,30 +335,32 @@ class DraftKVCacheMixin:
 
         if write_rows:
             row_t = torch.tensor(
-                write_rows, dtype=torch.int64, device=self.device,
+                write_rows,
+                dtype=torch.int64,
+                device=self.device,
             )
             col_t = torch.tensor(
-                write_cols, dtype=torch.int64, device=self.device,
+                write_cols,
+                dtype=torch.int64,
+                device=self.device,
             )
             val_t = torch.tensor(
-                write_vals, dtype=torch.int32, device=self.device,
+                write_vals,
+                dtype=torch.int32,
+                device=self.device,
             )
             self._block_table_gpu.index_put_((row_t, col_t), val_t)
 
         return owned_blocks, displaced
 
-    def release_owned_blocks(
-        self, seq_id: int, owned_blocks: list[int]
-    ) -> None:
+    def release_owned_blocks(self, seq_id: int, owned_blocks: list[int]) -> None:
         """Recycle block IDs that were swapped into main."""
         if owned_blocks:
             self._free_list.extend(owned_blocks)
 
     # ----- Dedicated blocks per verify server -----
 
-    def recycle_dedicated_blocks(
-        self, vs_id: str = "__default__"
-    ) -> None:
+    def recycle_dedicated_blocks(self, vs_id: str = "__default__") -> None:
         """Recycle dedicated tree-decode blocks for one verify server."""
         blocks = self._dedicated_blocks_by_vs.pop(vs_id, None)
         if blocks:
@@ -341,8 +379,7 @@ class DraftKVCacheMixin:
         if not self._free_list:
             return
         free_set = set(self._free_list)
-        while (self._next_free_block > 0
-               and (self._next_free_block - 1) in free_set):
+        while self._next_free_block > 0 and (self._next_free_block - 1) in free_set:
             self._next_free_block -= 1
             free_set.discard(self._next_free_block)
         self._free_list = list(free_set)
@@ -368,17 +405,13 @@ class DraftKVCacheMixin:
         if not blocks:
             return
         owned_set = set(owned_blocks)
-        self._dedicated_blocks_by_vs[vs_id] = [
-            b for b in blocks if b not in owned_set
-        ]
+        self._dedicated_blocks_by_vs[vs_id] = [b for b in blocks if b not in owned_set]
 
     # ----- Snapshot / rollback (tree decode) -----
 
     def save_kv_snapshot(self, seq_ids: list[int]) -> None:
         """Snapshot sequence lengths so tree branching can roll back."""
-        self._kv_snapshot = {
-            sid: self._seq_lens.get(sid, 0) for sid in seq_ids
-        }
+        self._kv_snapshot = {sid: self._seq_lens.get(sid, 0) for sid in seq_ids}
 
     def rollback_kv(self, seq_ids: list[int]) -> None:
         """Restore sequence lengths from the last snapshot."""

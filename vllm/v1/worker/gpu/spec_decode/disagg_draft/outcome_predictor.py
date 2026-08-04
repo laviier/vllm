@@ -153,8 +153,9 @@ class OutcomePredictor:
         total_fan_out: int,
         acceptance_rate: float = 0.85,
         power_law_exponent: float = 1.5,
-        device: torch.device = torch.device("cuda"),
+        device: torch.device | None = None,
     ):
+        device = device or torch.device("cuda")
         self.K = num_speculative_tokens
         self.total_fan_out = total_fan_out
         self.device = device
@@ -184,16 +185,23 @@ class OutcomePredictor:
         for k, F_k in enumerate(self.fan_out_list):
             if F_k <= 0:
                 continue
-            per_seq_k_chunks.append(torch.full(
-                (F_k,), k, dtype=torch.int64, device=device,
-            ))
-            per_seq_cand_chunks.append(torch.arange(
-                F_k, dtype=torch.int64, device=device,
-            ))
+            per_seq_k_chunks.append(
+                torch.full(
+                    (F_k,),
+                    k,
+                    dtype=torch.int64,
+                    device=device,
+                )
+            )
+            per_seq_cand_chunks.append(
+                torch.arange(
+                    F_k,
+                    dtype=torch.int64,
+                    device=device,
+                )
+            )
         empty = torch.zeros(0, dtype=torch.int64, device=device)
-        self.per_seq_k_flat = (
-            torch.cat(per_seq_k_chunks) if per_seq_k_chunks else empty
-        )
+        self.per_seq_k_flat = torch.cat(per_seq_k_chunks) if per_seq_k_chunks else empty
         self.per_seq_cand_flat = (
             torch.cat(per_seq_cand_chunks) if per_seq_cand_chunks else empty
         )
@@ -205,4 +213,3 @@ class OutcomePredictor:
             total_fan_out,
             self.fan_out_list,
         )
-

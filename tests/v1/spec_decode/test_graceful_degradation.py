@@ -17,28 +17,26 @@ import importlib.util
 import pathlib
 import sys
 import types
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 import torch
-
 
 # ------------------------------------------------------------------
 # Bootstrap: make the speculator module importable without CUDA
 # ------------------------------------------------------------------
 
+
 def _bootstrap_speculator():
     """Load the speculator module with vllm.config stubbed out."""
-    mod_name = (
-        "vllm.v1.worker.gpu.spec_decode.disagg_draft.speculator"
-    )
+    mod_name = "vllm.v1.worker.gpu.spec_decode.disagg_draft.speculator"
     if mod_name in sys.modules:
         return sys.modules[mod_name]
 
     # Stub vllm.config with a mock that provides VllmConfig
     if "vllm.config" not in sys.modules:
         config_mock = types.ModuleType("vllm.config")
-        config_mock.VllmConfig = MagicMock
+        config_mock.__dict__["VllmConfig"] = MagicMock
         sys.modules["vllm.config"] = config_mock
 
     # Ensure intermediate packages exist
@@ -64,17 +62,19 @@ def _bootstrap_speculator():
         / "speculator.py"
     )
     spec = importlib.util.spec_from_file_location(mod_name, spec_path)
+    assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = mod
-    spec.loader.exec_module(mod)
+    loader = spec.loader
+    assert loader is not None
+    loader.exec_module(mod)
     return mod
 
 
 _speculator_mod = _bootstrap_speculator()
 DisaggSpeculatorProxy = _speculator_mod.DisaggSpeculatorProxy
 
-from vllm.v1.spec_decode.draft_router import DraftRouter
-
+from vllm.v1.spec_decode.draft_router import DraftRouter  # noqa: E402
 
 # ------------------------------------------------------------------
 # Helpers
@@ -100,9 +100,16 @@ def _make_router(n: int, available: list[bool] | None = None):
     return router
 
 
-def _make_proxy(router=None, num_steps=3, max_reqs=4, vocab=32):
+def _make_proxy(
+    router=None,
+    num_steps=3,
+    max_reqs=4,
+    vocab=32,
+    device: torch.device | None = None,
+):
     """Build a minimal DisaggSpeculatorProxy with mocked config."""
-    device = torch.device("cpu")
+    if device is None:
+        device = torch.device("cpu")
 
     # Minimal mock of VllmConfig / SpeculativeConfig
     spec_cfg = MagicMock()
@@ -134,7 +141,8 @@ def _make_proxy(router=None, num_steps=3, max_reqs=4, vocab=32):
 
     # get_tp_group is imported inside __init__'s try/except, so it
     # will gracefully fall back to _tp_rank=0 without patching.
-    proxy = DisaggSpeculatorProxy(vllm_cfg, device)
+    with patch.object(_speculator_mod, "DisaggDraftMetrics"):
+        proxy = DisaggSpeculatorProxy(vllm_cfg, device)
 
     if router is not None:
         proxy.set_router(router)
@@ -142,19 +150,68 @@ def _make_proxy(router=None, num_steps=3, max_reqs=4, vocab=32):
     return proxy
 
 
-def _make_input_batch(req_ids: list[str], device=torch.device("cpu")):
+def _make_input_batch(req_ids: list[str], device: torch.device | None = None):
     """Create a minimal mock input_batch."""
+    if device is None:
+        device = torch.device("cpu")
     n = len(req_ids)
     batch = MagicMock()
     batch.num_reqs = n
     batch.req_ids = req_ids
     batch.idx_mapping = torch.arange(n, dtype=torch.int64, device=device)
     # query_start_loc: simple 1-token-per-request layout
-    batch.query_start_loc = torch.arange(
-        n + 1, dtype=torch.int64, device=device
-    )
+    batch.query_start_loc = torch.arange(n + 1, dtype=torch.int64, device=device)
     batch.input_ids = torch.zeros(n, dtype=torch.int64, device=device)
     return batch
+
+
+# ------------------------------------------------------------------
+# Tests: multi-server dispatch ordering
+# ------------------------------------------------------------------
+
+
+class TestMultiServerDispatch:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_preserves_per_server_request_indices_during_async_staging(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        device = torch.device("cuda")
+        router = _make_router(2)
+        proxy = _make_proxy(router=router, max_reqs=4, device=device)
+        req_ids = ["r0", "r1", "r2", "r3"]
+        router.assignment.update({"r0": 0, "r1": 1, "r2": 0, "r3": 1})
+        proxy._disagg_prefilled_reqs.update(req_ids)
+        proxy._disagg_req_to_seq_id.update({"r0": 10, "r1": 11, "r2": 12, "r3": 13})
+
+        original_copy = torch.Tensor.copy_
+        server_index_copy_sizes = []
+
+        def track_server_index_copy(dst, src, *args, **kwargs):
+            if dst.data_ptr() == proxy._srv_idx_gpu.data_ptr():
+                server_index_copy_sizes.append(dst.numel())
+            return original_copy(dst, src, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", track_server_index_copy)
+
+        torch.cuda._sleep(50_000_000)
+        ctx = proxy._do_propose_dispatch(
+            input_batch=_make_input_batch(req_ids, device=device),
+            num_sampled=torch.full((4,), 2, dtype=torch.int64, device=device),
+            last_sampled=torch.tensor(
+                [[1, 2], [3, 4], [5, 6], [7, 8]],
+                dtype=torch.int64,
+                device=device,
+            ),
+            temperature=torch.ones(4, device=device),
+        )
+        torch.accelerator.synchronize()
+
+        assert ctx is not None
+        assert server_index_copy_sizes == [4]
+        first_call = router.connectors[0].dispatch_speculation.call_args
+        second_call = router.connectors[1].dispatch_speculation.call_args
+        assert first_call.kwargs["seq_ids"].tolist() == [10, 12]
+        assert second_call.kwargs["seq_ids"].tolist() == [11, 13]
 
 
 # ------------------------------------------------------------------
@@ -402,9 +459,7 @@ class TestReconnection:
         # Connector 0 is disconnected, _reconnect will succeed
         conn0 = router.connectors[0]
         connected_values = iter([False, True])
-        type(conn0).connected = PropertyMock(
-            side_effect=lambda: next(connected_values)
-        )
+        type(conn0).connected = PropertyMock(side_effect=lambda: next(connected_values))
         conn0._reconnect = MagicMock()
 
         proxy._attempt_reconnect_unavailable_servers()

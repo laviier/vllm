@@ -48,43 +48,26 @@ class TestEncodeDecodeRoundTrip:
             seq_ids_ref=_make_tensor_ref(),
             k_accepted_ref=_make_tensor_ref(buffer_id="buf-1"),
             bonus_tokens_ref=_make_tensor_ref(buffer_id="buf-2"),
-            temperatures_ref=_make_tensor_ref(
-                dtype="float32", buffer_id="buf-3"
-            ),
-            hidden_states_ref=_make_tensor_ref(
-                shape=(8, 4096), dtype="float16", buffer_id="buf-4",
-                nbytes=65536,
-            ),
-            aux_hidden_states_ref=_make_tensor_ref(
-                shape=(8, 1024), buffer_id="buf-5"
-            ),
-            extend_counts_ref=_make_tensor_ref(buffer_id="buf-6"),
-            extend_hidden_states_ref=_make_tensor_ref(
-                shape=(8, 5, 4096), buffer_id="buf-7"
-            ),
-            extend_token_ids_ref=_make_tensor_ref(
-                shape=(8, 5), buffer_id="buf-8"
-            ),
+            temperatures_ref=_make_tensor_ref(dtype="float32", buffer_id="buf-3"),
+            needs_logits=True,
         )
         assert decode(encode(msg), VerificationOutcome) == msg
 
     def test_speculation_response_required_only(self):
         msg = SpeculationResponse(
             cache_hits_ref=_make_tensor_ref(dtype="bool", buffer_id="ch"),
-            draft_tokens_ref=_make_tensor_ref(
-                shape=(4, 5), buffer_id="dt"
-            ),
+            draft_tokens_ref=_make_tensor_ref(shape=(4, 5), buffer_id="dt"),
         )
         assert decode(encode(msg), SpeculationResponse) == msg
 
     def test_speculation_response_with_logits(self):
         msg = SpeculationResponse(
             cache_hits_ref=_make_tensor_ref(dtype="bool", buffer_id="ch"),
-            draft_tokens_ref=_make_tensor_ref(
-                shape=(4, 5), buffer_id="dt"
-            ),
+            draft_tokens_ref=_make_tensor_ref(shape=(4, 5), buffer_id="dt"),
             draft_logits_ref=_make_tensor_ref(
-                shape=(4, 5, 32000), dtype="float16", buffer_id="dl",
+                shape=(4, 5, 32000),
+                dtype="float16",
+                buffer_id="dl",
                 nbytes=2048000,
             ),
         )
@@ -94,16 +77,11 @@ class TestEncodeDecodeRoundTrip:
         msg = PrefillRequest(
             verify_server_id="vs-1",
             seq_id=42,
-            prompt_token_ids_ref=_make_tensor_ref(
-                shape=(128,), buffer_id="prompt"
-            ),
-            hidden_states_ref=_make_tensor_ref(
-                shape=(128, 4096), buffer_id="hs"
-            ),
+            prompt_token_ids_ref=_make_tensor_ref(shape=(128,), buffer_id="prompt"),
         )
         assert decode(encode(msg), PrefillRequest) == msg
 
-    def test_prefill_request_no_hidden_states(self):
+    def test_prefill_request_short_prompt(self):
         msg = PrefillRequest(
             verify_server_id="vs-1",
             seq_id=7,
@@ -119,10 +97,12 @@ class TestEncodeDecodeRoundTrip:
         assert decode(encode(msg), FreeSeqRequest) == msg
 
     def test_draft_command(self):
-        inner = encode(FreeSeqRequest(
-            verify_server_id="vs-1",
-            seq_ids_ref=_make_tensor_ref(),
-        ))
+        inner = encode(
+            FreeSeqRequest(
+                verify_server_id="vs-1",
+                seq_ids_ref=_make_tensor_ref(),
+            )
+        )
         cmd = DraftCommand(command="FREE_SEQ", payload=inner)
         assert decode(encode(cmd), DraftCommand) == cmd
 
@@ -190,5 +170,6 @@ class TestDecodeErrors:
 
     def test_corrupted_data_raises_decode_error(self):
         import msgspec
+
         with pytest.raises(msgspec.DecodeError):
             decode(b"\xff\xff\xff", TensorRef)

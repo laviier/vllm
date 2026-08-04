@@ -18,32 +18,21 @@ import pytest
 from vllm.v1.spec_decode.draft_server import DraftServer
 
 
-def _make_vllm_config() -> MagicMock:
-    cfg = MagicMock()
-    cfg.speculative_config = MagicMock()
-    cfg.speculative_config.num_speculative_tokens = 5
-    cfg.speculative_config.disagg_fan_out = 1
-    cfg.speculative_config.disagg_saguaro_c = None
-    cfg.speculative_config.disagg_jit_fallback = True
-    cfg.scheduler_config = MagicMock()
-    cfg.scheduler_config.max_num_seqs = 32
-    cfg.model_config = MagicMock()
-    cfg.model_config.dtype = "float16"
-    cfg.model_config.get_vocab_size.return_value = 32000
-    cfg.speculative_config.draft_model_config = MagicMock()
-    cfg.speculative_config.draft_model_config.get_vocab_size.return_value = (
-        32000
-    )
-    return cfg
-
-
 @pytest.fixture
-def draft_server(tmp_path):
-    addr = f"ipc://{tmp_path}/draft_server_test"
-    server = DraftServer(
-        vllm_config=_make_vllm_config(),
-        bind_address=addr,
-    )
+def draft_server():
+    server = DraftServer.__new__(DraftServer)
+    server._request_state = {}
+    server._verify_servers = {}
+    server._next_internal_seq_id = 0
+    server._free_internal_seq_ids = []
+    server._ext_to_int_seq = {}
+    server._int_to_ext_seq = {}
+    server._verify_server_last_seen = {}
+    server._eviction_timeout_s = 30.0
+    server._socket = None
+    server._ctx = None
+    server._ipc_peers = {}
+    server.metrics = MagicMock()
     yield server
     server._cleanup()
 
@@ -59,39 +48,28 @@ class TestRequestNamespacing:
         assert key in draft_server._request_state
         assert key in draft_server._verify_servers["vs-1"]
 
-    def test_register_same_seq_id_different_servers(
-        self, draft_server: DraftServer
-    ):
+    def test_register_same_seq_id_different_servers(self, draft_server: DraftServer):
         k1 = draft_server._register_request("vs-1", 1)
         k2 = draft_server._register_request("vs-2", 1)
         assert k1 != k2
         assert k1 in draft_server._request_state
         assert k2 in draft_server._request_state
 
-    def test_unregister_request_removes_state(
-        self, draft_server: DraftServer
-    ):
+    def test_unregister_request_removes_state(self, draft_server: DraftServer):
         draft_server._register_request("vs-1", 5)
         draft_server._unregister_request("vs-1", 5)
         assert ("vs-1", 5) not in draft_server._request_state
         assert "vs-1" not in draft_server._verify_servers
 
-    def test_unregister_nonexistent_is_safe(
-        self, draft_server: DraftServer
-    ):
+    def test_unregister_nonexistent_is_safe(self, draft_server: DraftServer):
         draft_server._unregister_request("vs-99", 999)
 
-    def test_get_request_state_creates_if_absent(
-        self, draft_server: DraftServer
-    ):
-        key = ("vs-1", 7)
-        state = draft_server._get_request_state(key)
-        assert isinstance(state, dict)
-        assert key in draft_server._request_state
+    def test_maps_same_external_id_per_server(self, draft_server: DraftServer):
+        first = draft_server._map_seq_id("vs-1", 7)
+        assert draft_server._map_seq_id("vs-1", 7) == first
+        assert draft_server._map_seq_id("vs-2", 7) != first
 
-    def test_multiple_requests_per_server(
-        self, draft_server: DraftServer
-    ):
+    def test_multiple_requests_per_server(self, draft_server: DraftServer):
         draft_server._register_request("vs-1", 1)
         draft_server._register_request("vs-1", 2)
         draft_server._register_request("vs-1", 3)

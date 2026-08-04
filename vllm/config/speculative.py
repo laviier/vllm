@@ -327,6 +327,12 @@ class SpeculativeConfig:
     use this when every VS lists every draft for failover and you
     want steady-state pinning under normal operation."""
 
+    disagg_draft_primary_index: int | None = Field(default=None, ge=0)
+    """Preferred draft-server index for ``affinity`` routing. Set this on
+    each verify server to produce a balanced topology deterministically while
+    keeping every draft address configured for failover. When omitted, the
+    primary is derived from the verify-server ID."""
+
     disagg_draft_timeout_ms: int = 5000
     """Timeout in ms for waiting on Speculation_Response before falling
     back."""
@@ -1405,6 +1411,23 @@ class SpeculativeConfig:
                 "synthetic_acceptance_rates / synthetic_acceptance_length "
                 "are only valid with rejection_sample_method='synthetic'."
             )
+
+        if self.disagg_draft_primary_index is not None:
+            if self.disagg_draft_routing_policy != "affinity":
+                raise ValueError(
+                    "disagg_draft_primary_index requires "
+                    "disagg_draft_routing_policy='affinity'."
+                )
+            if not self.disagg_draft_addresses:
+                raise ValueError(
+                    "disagg_draft_primary_index requires at least one "
+                    "disagg_draft_addresses entry."
+                )
+            if self.disagg_draft_primary_index >= len(self.disagg_draft_addresses):
+                raise ValueError(
+                    "disagg_draft_primary_index must be less than the number "
+                    f"of disagg_draft_addresses ({len(self.disagg_draft_addresses)})."
+                )
 
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(

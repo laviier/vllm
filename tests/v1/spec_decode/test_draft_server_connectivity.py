@@ -37,7 +37,7 @@ def _run_mock_draft_server(addr: str, stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         events = dict(poller.poll(timeout=100))
         if sock in events:
-            msg = sock.recv()
+            sock.recv()
             # Echo back a HEALTHCHECK response
             reply = encode_command("HEALTHCHECK")
             sock.send(reply)
@@ -98,9 +98,7 @@ class TestValidateDraftServerConnectivity:
 
         try:
             # Should not raise — one server is reachable
-            validate_draft_server_connectivity(
-                [bad_addr, good_addr], timeout_ms=1000
-            )
+            validate_draft_server_connectivity([bad_addr, good_addr], timeout_ms=1000)
         finally:
             stop_event.set()
             server_thread.join(timeout=5)
@@ -113,9 +111,7 @@ class TestValidateDraftServerConnectivity:
         addr2 = f"tcp://127.0.0.1:{port2}"
 
         with pytest.raises(RuntimeError, match="2 address"):
-            validate_draft_server_connectivity(
-                [addr1, addr2], timeout_ms=500
-            )
+            validate_draft_server_connectivity([addr1, addr2], timeout_ms=500)
 
     def test_server_sends_valid_healthcheck_response(self):
         """Verify the mock server's HEALTHCHECK response is parseable."""

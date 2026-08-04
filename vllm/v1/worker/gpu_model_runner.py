@@ -4764,7 +4764,8 @@ class GPUModelRunner(
             # run the original blocking propose if _early declined
             # (returns None).
             self._disagg_propose_drafts_await(
-                disagg_early_ctx, valid_sampled_token_ids,
+                disagg_early_ctx,
+                valid_sampled_token_ids,
             )
 
         # Finalize KV connector (wait_for_save + clear metadata) after
@@ -4909,7 +4910,8 @@ class GPUModelRunner(
     # ------------------------------------------------------------------
 
     def _disagg_propose_drafts_early(
-        self, sampler_output: SamplerOutput,
+        self,
+        sampler_output: SamplerOutput,
     ) -> Any:
         """Fire SPECULATE using GPU-native num_sampled/last_sampled
         derived from ``sampler_output.sampled_token_ids`` — the same
@@ -4922,12 +4924,14 @@ class GPUModelRunner(
         if not hasattr(self, "_disagg_speculator"):
             from vllm.distributed.parallel_state import get_tp_group
             from vllm.v1.worker.gpu.spec_decode import init_speculator
+
             tp_rank = get_tp_group().rank_in_group
             self._disagg_tp_rank = tp_rank
             self._disagg_speculator = None
             if tp_rank == 0:
                 self._disagg_speculator = init_speculator(
-                    self.vllm_config, self.device,
+                    self.vllm_config,
+                    self.device,
                 )
 
         speculator = self._disagg_speculator
@@ -4952,7 +4956,8 @@ class GPUModelRunner(
             n_prompt = req.num_prompt_tokens
             req_idx = self.input_batch.req_id_to_index[rid]
             prompt_ids = self.input_batch.token_ids_cpu[
-                req_idx, :n_prompt,
+                req_idx,
+                :n_prompt,
             ].tolist()
             speculator.cache_new_request_tokens(rid, prompt_ids)
 
@@ -4977,7 +4982,9 @@ class GPUModelRunner(
         discard_np = self.discard_request_mask.np[:num_reqs]
         if discard_np.any():
             discard_gpu = torch.from_numpy(discard_np.copy()).to(
-                self.device, dtype=torch.bool, non_blocking=True,
+                self.device,
+                dtype=torch.bool,
+                non_blocking=True,
             )
             num_sampled_t = torch.where(
                 discard_gpu,
@@ -4993,7 +5000,9 @@ class GPUModelRunner(
         # rows, poisoning the drafter's cache with an invalid seed
         # token (observed at c=8: AL 2.43 → 2.30).
         last_sampled_t = torch.where(
-            sti >= 0, sti, torch.zeros_like(sti),
+            sti >= 0,
+            sti,
+            torch.zeros_like(sti),
         )
 
         # Temperature is 1.0 for all — matches the current fast-path
@@ -5047,6 +5056,7 @@ class GPUModelRunner(
         if self.parallel_config.tensor_parallel_size > 1:
             with record_function_or_nullcontext("disagg_dpd: tp_broadcast"):
                 from vllm.distributed.parallel_state import get_tp_group
+
                 tp_group = get_tp_group()
                 draft_buf = torch.tensor(
                     self._draft_token_ids,
@@ -5054,7 +5064,8 @@ class GPUModelRunner(
                     device=self.device,
                 )
                 torch.distributed.broadcast(
-                    draft_buf, src=tp_group.first_rank,
+                    draft_buf,
+                    src=tp_group.first_rank,
                     group=tp_group.device_group,
                 )
                 self._draft_token_ids = draft_buf.tolist()
@@ -5078,12 +5089,14 @@ class GPUModelRunner(
         if not hasattr(self, "_disagg_speculator"):
             from vllm.distributed.parallel_state import get_tp_group
             from vllm.v1.worker.gpu.spec_decode import init_speculator
+
             tp_rank = get_tp_group().rank_in_group
             self._disagg_tp_rank = tp_rank
             self._disagg_speculator = None
             if tp_rank == 0:
                 self._disagg_speculator = init_speculator(
-                    self.vllm_config, self.device,
+                    self.vllm_config,
+                    self.device,
                 )
 
         speculator = self._disagg_speculator
@@ -5101,61 +5114,52 @@ class GPUModelRunner(
                     continue
                 n_prompt = req.num_prompt_tokens
                 req_idx = self.input_batch.req_id_to_index[rid]
-                prompt_ids = self.input_batch.token_ids_cpu[
-                    req_idx, :n_prompt
-                ].tolist()
+                prompt_ids = self.input_batch.token_ids_cpu[req_idx, :n_prompt].tolist()
                 speculator.cache_new_request_tokens(rid, prompt_ids)
 
             # Build num_sampled + last_sampled tensors from the list-of-lists
             # returned by _bookkeeping_sync. valid_sampled_token_ids[i] is
             # [accepted_0, ..., bonus_token] so len-1 is k_accepted and
             # the last element is the bonus token.
-            with record_function_or_nullcontext(
-                "disagg_dpd: build_num_sampled_padded"
-            ):
+            with record_function_or_nullcontext("disagg_dpd: build_num_sampled_padded"):
                 max_sampled = (
                     max(len(ids) for ids in valid_sampled_token_ids)
-                    if valid_sampled_token_ids else 1
+                    if valid_sampled_token_ids
+                    else 1
                 )
                 padded = [
                     ids + [0] * (max_sampled - len(ids))
                     for ids in valid_sampled_token_ids
                 ]
-            with record_function_or_nullcontext(
-                "disagg_dpd: h2d_num_sampled_t"
-            ):
+            with record_function_or_nullcontext("disagg_dpd: h2d_num_sampled_t"):
                 num_sampled_t = torch.tensor(
                     [len(ids) for ids in valid_sampled_token_ids],
-                    dtype=torch.int64, device=self.device,
+                    dtype=torch.int64,
+                    device=self.device,
                 )
-            with record_function_or_nullcontext(
-                "disagg_dpd: h2d_last_sampled_t"
-            ):
+            with record_function_or_nullcontext("disagg_dpd: h2d_last_sampled_t"):
                 last_sampled_t = torch.tensor(
-                    padded, dtype=torch.int64, device=self.device,
+                    padded,
+                    dtype=torch.int64,
+                    device=self.device,
                 ).unsqueeze(-1)
-            with record_function_or_nullcontext(
-                "disagg_dpd: h2d_temperature"
-            ):
+            with record_function_or_nullcontext("disagg_dpd: h2d_temperature"):
                 _temperature = torch.ones(num_reqs, device=self.device)
 
             try:
-                with record_function_or_nullcontext(
-                    "disagg_dpd: speculator.propose"
-                ):
+                with record_function_or_nullcontext("disagg_dpd: speculator.propose"):
                     draft_tensor = speculator.propose(
                         input_batch=self.input_batch,
                         num_sampled=num_sampled_t,
                         last_sampled=last_sampled_t,
                         temperature=_temperature,
                     )
-                with record_function_or_nullcontext(
-                    "disagg_dpd: draft_tensor.tolist"
-                ):
+                with record_function_or_nullcontext("disagg_dpd: draft_tensor.tolist"):
                     self._draft_token_ids = draft_tensor.tolist()
             except Exception as e:
                 logger.warning(
-                    "Disagg propose failed: %s. Returning zero drafts.", e,
+                    "Disagg propose failed: %s. Returning zero drafts.",
+                    e,
                 )
                 self._draft_token_ids = [
                     [0] * self.num_spec_tokens for _ in range(num_reqs)
@@ -5173,6 +5177,7 @@ class GPUModelRunner(
         if self.parallel_config.tensor_parallel_size > 1:
             with record_function_or_nullcontext("disagg_dpd: tp_broadcast"):
                 from vllm.distributed.parallel_state import get_tp_group
+
                 tp_group = get_tp_group()
                 draft_buf = torch.tensor(
                     self._draft_token_ids,
@@ -5180,13 +5185,13 @@ class GPUModelRunner(
                     device=self.device,
                 )
                 torch.distributed.broadcast(
-                    draft_buf, src=tp_group.first_rank,
+                    draft_buf,
+                    src=tp_group.first_rank,
                     group=tp_group.device_group,
                 )
                 self._draft_token_ids = draft_buf.tolist()
 
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
-
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:

@@ -902,11 +902,15 @@ def test_draft_server_cli_flag_set():
     """--draft-server flag sets draft_server to True."""
     parser = FlexibleArgumentParser()
     parser = EngineArgs.add_cli_args(parser)
-    args = parser.parse_args([
-        "--model", "dummy-model",
-        "--draft-server",
-        "--draft-server-port", "60000",
-    ])
+    args = parser.parse_args(
+        [
+            "--model",
+            "dummy-model",
+            "--draft-server",
+            "--draft-server-port",
+            "60000",
+        ]
+    )
     assert args.draft_server is True
     assert args.draft_server_port == 60000
 

@@ -34,9 +34,7 @@ class DraftServerSeqIdMixin:
         """Create a composite key for per-request state."""
         return (verify_server_id, seq_id)
 
-    def _register_request(
-        self, verify_server_id: str, seq_id: int
-    ) -> RequestKey:
+    def _register_request(self, verify_server_id: str, seq_id: int) -> RequestKey:
         """Register a new request and return its composite key."""
         key = self._make_key(verify_server_id, seq_id)
         if key not in self._request_state:
@@ -49,9 +47,7 @@ class DraftServerSeqIdMixin:
         self.metrics.draft_active_requests.set(len(self._request_state))
         return key
 
-    def _unregister_request(
-        self, verify_server_id: str, seq_id: int
-    ) -> None:
+    def _unregister_request(self, verify_server_id: str, seq_id: int) -> None:
         """Remove a request's state and tracking."""
         key = self._make_key(verify_server_id, seq_id)
         self._request_state.pop(key, None)
@@ -92,13 +88,9 @@ class DraftServerSeqIdMixin:
             self._free_internal_seq_ids.append(internal)
         return internal
 
-    def _remap_seq_ids(
-        self, vs_id: str, seq_ids: torch.Tensor
-    ) -> torch.Tensor:
+    def _remap_seq_ids(self, vs_id: str, seq_ids: torch.Tensor) -> torch.Tensor:
         """Remap a tensor of external seq_ids to internal seq_ids."""
         internal_ids = []
         for ext_id in seq_ids.tolist():
             internal_ids.append(self._map_seq_id(vs_id, int(ext_id)))
-        return torch.tensor(
-            internal_ids, dtype=seq_ids.dtype, device=seq_ids.device
-        )
+        return torch.tensor(internal_ids, dtype=seq_ids.dtype, device=seq_ids.device)

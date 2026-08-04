@@ -7,7 +7,6 @@ that occurs with torch < 2.12 in the current vllm env_override.py.
 This allows tests that only depend on lightweight modules (data models,
 draft_server skeleton, draft_router) to run without a full vllm build.
 """
-import sys
 
 # Patch before any vllm import triggers env_override.py
 try:

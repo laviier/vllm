@@ -25,14 +25,13 @@ similarly small. Round-trip latency on localhost is ~1 ms.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import itertools
 import logging
 import mmap
 import os
 import pickle
-import socket
-import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -41,6 +40,8 @@ import torch
 
 if TYPE_CHECKING:
     import torch.multiprocessing.reductions  # noqa: F401
+
+    from vllm.v1.spec_decode.draft_data_models import TensorRef
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ class PendingSpeculation:
     """Opaque handle returned by dispatch_speculation, consumed by
     await_speculation. Contents are connector-specific."""
 
-    connector: "DraftConnector"
+    connector: DraftConnector
     state: Any  # connector-specific payload
 
 
@@ -104,8 +105,7 @@ class DraftConnector(ABC):
         bonus_tokens: torch.Tensor,
         temperatures: torch.Tensor | None,
         needs_logits: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        ...
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]: ...
 
     def dispatch_speculation(
         self,
@@ -138,7 +138,8 @@ class DraftConnector(ABC):
         )
 
     async def await_speculation(
-        self, handle: PendingSpeculation,
+        self,
+        handle: PendingSpeculation,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Wait for the reply to a previously-dispatched SPECULATE.
 
@@ -161,16 +162,13 @@ class DraftConnector(ABC):
         self,
         seq_id: int,
         prompt_token_ids: torch.Tensor,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
-    async def send_free_seq(self, seq_ids: torch.Tensor) -> None:
-        ...
+    async def send_free_seq(self, seq_ids: torch.Tensor) -> None: ...
 
     @abstractmethod
-    def close(self) -> None:
-        ...
+    def close(self) -> None: ...
 
 
 class ZmqDraftConnector(DraftConnector):
@@ -214,13 +212,12 @@ class ZmqDraftConnector(DraftConnector):
         from vllm.utils.network_utils import make_zmq_socket
 
         if self._socket is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._socket.close(linger=0)
-            except Exception:
-                pass
 
         if self._zmq_ctx is None:
             import zmq.asyncio
+
             self._zmq_ctx = zmq.asyncio.Context()
 
         self._socket = make_zmq_socket(
@@ -244,9 +241,7 @@ class ZmqDraftConnector(DraftConnector):
         )
 
     def _reconnect(self) -> None:
-        logger.warning(
-            "ZmqDraftConnector reconnecting to %s", self._address
-        )
+        logger.warning("ZmqDraftConnector reconnecting to %s", self._address)
         self._connected = False
         try:
             self._connect()
@@ -277,14 +272,10 @@ class ZmqDraftConnector(DraftConnector):
             await self._socket.send_multipart(frames)
         except zmq.Again:
             self._connected = False
-            raise ConnectionError(
-                f"ZMQ send timeout to {self._address}"
-            )
+            raise ConnectionError(f"ZMQ send timeout to {self._address}") from None
         except zmq.ZMQError as exc:
             self._connected = False
-            raise ConnectionError(
-                f"ZMQ send error to {self._address}: {exc}"
-            ) from exc
+            raise ConnectionError(f"ZMQ send error to {self._address}: {exc}") from exc
 
     async def _recv_multipart(self) -> tuple[bytes, list[bytes]]:
         """Receive a multipart ZMQ message → (metadata_bytes, tensor_frames)."""
@@ -295,9 +286,7 @@ class ZmqDraftConnector(DraftConnector):
             frames = await self._socket.recv_multipart()
         except zmq.Again:
             self._connected = False
-            raise ConnectionError(
-                f"ZMQ recv timeout from {self._address}"
-            )
+            raise ConnectionError(f"ZMQ recv timeout from {self._address}") from None
         except zmq.ZMQError as exc:
             self._connected = False
             raise ConnectionError(
@@ -307,7 +296,7 @@ class ZmqDraftConnector(DraftConnector):
             raise ConnectionError("Empty ZMQ response")
         return frames[0], frames[1:]
 
-    def _make_tensor_ref(self, tensor: torch.Tensor) -> "TensorRef":
+    def _make_tensor_ref(self, tensor: torch.Tensor) -> TensorRef:
         from vllm.v1.spec_decode.draft_data_models import TensorRef
 
         return TensorRef(
@@ -339,6 +328,7 @@ class ZmqDraftConnector(DraftConnector):
         needs_logits: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         from torch.profiler import record_function
+
         from vllm.v1.spec_decode.draft_data_models import (
             SpeculationResponse,
             VerificationOutcome,
@@ -354,7 +344,9 @@ class ZmqDraftConnector(DraftConnector):
             _bonus_tokens = bonus_tokens[:batch_size].to(torch.int64).reshape(-1)
 
             tensor_list: list[torch.Tensor] = [
-                _seq_ids, _k_accepted, _bonus_tokens,
+                _seq_ids,
+                _k_accepted,
+                _bonus_tokens,
             ]
 
             temps_ref = None
@@ -444,20 +436,14 @@ class ZmqDraftConnector(DraftConnector):
     def close(self) -> None:
         self._connected = False
         if self._socket is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._socket.close(linger=0)
-            except Exception:
-                pass
             self._socket = None
         if self._zmq_ctx is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._zmq_ctx.term()
-            except Exception:
-                pass
             self._zmq_ctx = None
-        logger.info(
-            "ZmqDraftConnector closed for %s", self._verify_server_id
-        )
+        logger.info("ZmqDraftConnector closed for %s", self._verify_server_id)
 
 
 # ---------------------------------------------------------------------------
@@ -488,37 +474,65 @@ class _IpcSharedBuffer:
         self.max_batch = max_batch
         self.K = K
         B = max_batch
-        with torch.cuda.device(device):
+        with torch.accelerator.device_index(device.index):
             self.req_seq_ids = torch.zeros(
-                IPC_N_SLOTS, B, dtype=torch.int64, device=device,
+                IPC_N_SLOTS,
+                B,
+                dtype=torch.int64,
+                device=device,
             )
             self.req_k_accepted = torch.zeros(
-                IPC_N_SLOTS, B, dtype=torch.int64, device=device,
+                IPC_N_SLOTS,
+                B,
+                dtype=torch.int64,
+                device=device,
             )
             self.req_bonus_tokens = torch.zeros(
-                IPC_N_SLOTS, B, dtype=torch.int64, device=device,
+                IPC_N_SLOTS,
+                B,
+                dtype=torch.int64,
+                device=device,
             )
             self.req_temperatures = torch.ones(
-                IPC_N_SLOTS, B, dtype=torch.float32, device=device,
+                IPC_N_SLOTS,
+                B,
+                dtype=torch.float32,
+                device=device,
             )
             self.resp_cache_hits = torch.zeros(
-                IPC_N_SLOTS, B, dtype=torch.int64, device=device,
+                IPC_N_SLOTS,
+                B,
+                dtype=torch.int64,
+                device=device,
             )
             self.resp_draft_tokens = torch.zeros(
-                IPC_N_SLOTS, B, K, dtype=torch.int64, device=device,
+                IPC_N_SLOTS,
+                B,
+                K,
+                dtype=torch.int64,
+                device=device,
             )
             # GPU-side doorbells. int32 per slot per direction.
             self.dbell_req_gpu = torch.zeros(
-                IPC_N_SLOTS, dtype=torch.int32, device=device,
+                IPC_N_SLOTS,
+                dtype=torch.int32,
+                device=device,
             )
             self.dbell_resp_gpu = torch.zeros(
-                IPC_N_SLOTS, dtype=torch.int32, device=device,
+                IPC_N_SLOTS,
+                dtype=torch.int32,
+                device=device,
             )
 
     _TENSOR_NAMES = (
-        "req_seq_ids", "req_k_accepted", "req_bonus_tokens",
-        "req_temperatures", "resp_cache_hits", "resp_draft_tokens",
-        "dbell_req_gpu", "dbell_resp_gpu",
+        "req_seq_ids",
+        "req_k_accepted",
+        "req_bonus_tokens",
+        "req_temperatures",
+        "resp_cache_hits",
+        "resp_draft_tokens",
+        "dbell_req_gpu",
+        "dbell_resp_gpu",
     )
 
     def as_handle_dict(self) -> dict:
@@ -526,12 +540,16 @@ class _IpcSharedBuffer:
         ``torch.multiprocessing.reductions.reduce_tensor`` which calls
         ``cudaIpcGetMemHandle`` internally."""
         import torch.multiprocessing.reductions as tmr
+
         return {n: tmr.reduce_tensor(getattr(self, n)) for n in self._TENSOR_NAMES}
 
     @classmethod
     def from_handle_dict(
-        cls, hdict: dict, max_batch: int, K: int,
-    ) -> "_IpcSharedBuffer":
+        cls,
+        hdict: dict,
+        max_batch: int,
+        K: int,
+    ) -> _IpcSharedBuffer:
         """Reconstruct on the drafter side. Each rebuild call ends up in
         ``cudaIpcOpenMemHandle``."""
         obj = cls.__new__(cls)
@@ -563,7 +581,9 @@ class _IpcDoorbells:
                 f.write(b"\0" * self._NBYTES)
         fd = os.open(shm_path, os.O_RDWR)
         self._mm = mmap.mmap(
-            fd, self._NBYTES, mmap.MAP_SHARED,
+            fd,
+            self._NBYTES,
+            mmap.MAP_SHARED,
             mmap.PROT_READ | mmap.PROT_WRITE,
         )
         os.close(fd)
@@ -586,10 +606,8 @@ class _IpcDoorbells:
         return self._resp[slot]
 
     def close(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self._mm.close()
-        except Exception:
-            pass
 
 
 class CudaIpcDraftConnector(ZmqDraftConnector):
@@ -660,6 +678,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         """Synchronous version — creates a temporary event loop for the
         handshake. Convenience for callers that don't own a loop yet."""
         import asyncio
+
         if self._force_zmq or self._ipc_ready:
             return
         # We can't just call ``asyncio.get_event_loop`` here because the
@@ -686,7 +705,9 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         )
 
         self._buf = _IpcSharedBuffer(
-            self._device, self._ipc_max_batch, self._ipc_K,
+            self._device,
+            self._ipc_max_batch,
+            self._ipc_K,
         )
         # GPU-side doorbells live inside self._buf. The shm_path field
         # in the handshake is retained for wire-format compatibility
@@ -735,17 +756,26 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         if not self._ipc_ready or needs_logits:
             # Fall back to the base default (deferred ZMQ round-trip)
             return super().dispatch_speculation(
-                batch_size, seq_ids, k_accepted, bonus_tokens,
-                temperatures, needs_logits,
+                batch_size,
+                seq_ids,
+                k_accepted,
+                bonus_tokens,
+                temperatures,
+                needs_logits,
             )
         if batch_size > self._ipc_max_batch:
             logger.warning(
                 "batch_size %d > ipc_max_batch %d; using ZMQ fallback",
-                batch_size, self._ipc_max_batch,
+                batch_size,
+                self._ipc_max_batch,
             )
             return super().dispatch_speculation(
-                batch_size, seq_ids, k_accepted, bonus_tokens,
-                temperatures, needs_logits,
+                batch_size,
+                seq_ids,
+                k_accepted,
+                bonus_tokens,
+                temperatures,
+                needs_logits,
             )
 
         slot = self._next_slot
@@ -756,17 +786,21 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         buf = self._buf
         assert buf is not None
         buf.req_seq_ids[slot, :batch_size].copy_(
-            seq_ids[:batch_size], non_blocking=True,
+            seq_ids[:batch_size],
+            non_blocking=True,
         )
         buf.req_k_accepted[slot, :batch_size].copy_(
-            k_accepted[:batch_size], non_blocking=True,
+            k_accepted[:batch_size],
+            non_blocking=True,
         )
         buf.req_bonus_tokens[slot, :batch_size].copy_(
-            bonus_tokens[:batch_size], non_blocking=True,
+            bonus_tokens[:batch_size],
+            non_blocking=True,
         )
         if temperatures is not None:
             buf.req_temperatures[slot, :batch_size].copy_(
-                temperatures[:batch_size], non_blocking=True,
+                temperatures[:batch_size],
+                non_blocking=True,
             )
         else:
             buf.req_temperatures[slot, :batch_size].fill_(1.0)
@@ -795,7 +829,8 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         )
 
     async def await_speculation(
-        self, handle: PendingSpeculation,
+        self,
+        handle: PendingSpeculation,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if not self._ipc_ready or handle.state.get("seq16") is None:
             return await super().await_speculation(handle)
@@ -825,7 +860,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         poll_us = int(os.environ.get("VLLM_DISAGG_IPC_POLL_US", "0"))
         poll_delay = poll_us / 1_000_000.0 if poll_us > 0 else 0
         deadline = asyncio.get_event_loop().time() + self._timeout_ms / 1000.0
-        dbell_slice = buf.dbell_resp_gpu[slot:slot + 1]
+        dbell_slice = buf.dbell_resp_gpu[slot : slot + 1]
         while int(dbell_slice.item()) != seq16:
             if asyncio.get_event_loop().time() > deadline:
                 self._connected = False
@@ -834,9 +869,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
                 )
             await asyncio.sleep(poll_delay)
 
-        cache_hits = (
-            buf.resp_cache_hits[slot, :batch_size].clone().to(torch.bool)
-        )
+        cache_hits = buf.resp_cache_hits[slot, :batch_size].clone().to(torch.bool)
         draft_tokens = buf.resp_draft_tokens[slot, :batch_size].clone()
         return cache_hits, draft_tokens, None
 
@@ -853,12 +886,20 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         haven't been split-aware still work."""
         if not self._ipc_ready or needs_logits:
             return await super().send_and_recv_speculation(
-                batch_size, seq_ids, k_accepted, bonus_tokens,
-                temperatures, needs_logits,
+                batch_size,
+                seq_ids,
+                k_accepted,
+                bonus_tokens,
+                temperatures,
+                needs_logits,
             )
         handle = self.dispatch_speculation(
-            batch_size, seq_ids, k_accepted, bonus_tokens,
-            temperatures, needs_logits,
+            batch_size,
+            seq_ids,
+            k_accepted,
+            bonus_tokens,
+            temperatures,
+            needs_logits,
         )
         return await self.await_speculation(handle)
 
@@ -901,14 +942,10 @@ def validate_draft_server_connectivity(
             sock.settimeout(timeout_ms / 1000.0)
             sock.connect((host, port))
             sock.close()
-            logger.info(
-                "Draft server %s is reachable (TCP connect OK).", addr
-            )
+            logger.info("Draft server %s is reachable (TCP connect OK).", addr)
             reachable.append(addr)
         except Exception as exc:
-            logger.warning(
-                "Draft server %s not reachable: %s", addr, exc
-            )
+            logger.warning("Draft server %s not reachable: %s", addr, exc)
             unreachable.append(addr)
 
     if not reachable:

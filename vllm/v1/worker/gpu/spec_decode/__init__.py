@@ -14,7 +14,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
 
         from vllm.v1.spec_decode.draft_connector import (
             CudaIpcDraftConnector,
-            ZmqDraftConnector,
+            DraftConnector,
             validate_draft_server_connectivity,
         )
         from vllm.v1.spec_decode.draft_router import DraftRouter
@@ -23,6 +23,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         )
 
         addresses = speculative_config.disagg_draft_addresses
+        assert addresses is not None
         validate_draft_server_connectivity(addresses)
 
         verify_server_id = f"vs-{uuid.uuid4().hex[:8]}"
@@ -42,7 +43,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         ipc_K = speculative_config.num_speculative_tokens
         ipc_max_batch = vllm_config.scheduler_config.max_num_seqs
 
-        connectors = [
+        connectors: list[DraftConnector] = [
             CudaIpcDraftConnector(
                 address=addr,
                 verify_server_id=verify_server_id,
@@ -59,6 +60,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
             draft_server_addresses=addresses,
             policy=speculative_config.disagg_draft_routing_policy,
             verify_server_id=verify_server_id,
+            primary_index=speculative_config.disagg_draft_primary_index,
         )
         proxy = DisaggSpeculatorProxy(vllm_config, device)
         proxy.set_router(router)

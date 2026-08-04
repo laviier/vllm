@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """
 Test parallel fanout implementation for disaggregated speculative decoding.
 
@@ -22,9 +25,9 @@ import textwrap
 
 def run_in_subprocess(test_code: str, test_name: str) -> bool:
     """Run test code in a fresh subprocess to isolate state."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {test_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     full_code = textwrap.dedent(test_code)
     result = subprocess.run(
@@ -32,7 +35,7 @@ def run_in_subprocess(test_code: str, test_name: str) -> bool:
         capture_output=False,
         text=True,
         timeout=180,
-        env={**__import__('os').environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        env={**__import__("os").environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
     if result.returncode != 0:
         print(f"  ✗ FAILED (exit code {result.returncode})")
@@ -111,12 +114,14 @@ all_tokens_par, all_logits_par = server._run_parallel_fanout(
     branch_block_tables=branch_block_tables,
     bonus_candidates=bonus_candidates,
 )
-torch.cuda.synchronize()
+torch.accelerator.synchronize()
 t_parallel = (time.perf_counter() - t0) * 1000
 print(f"  Parallel fanout time: {t_parallel:.2f} ms")
 
 # Validate shapes
-assert all_tokens_par.shape == (N, K), f"Expected ({N}, {K}), got {all_tokens_par.shape}"
+assert all_tokens_par.shape == (N, K), (
+    f"Expected ({N}, {K}), got {all_tokens_par.shape}"
+)
 assert all_logits_par.shape == (N, K, server.vocab_size), \\
     f"Expected ({N}, {K}, {server.vocab_size}), got {all_logits_par.shape}"
 print("  ✓ Shape validation passed")
@@ -139,7 +144,7 @@ all_tokens_seq, all_logits_seq = server._run_tree_decode(
     branch_block_tables=branch_block_tables,
     bonus_candidates=bonus_candidates,
 )
-torch.cuda.synchronize()
+torch.accelerator.synchronize()
 t_sequential = (time.perf_counter() - t0) * 1000
 
 assert all_tokens_seq.shape == (N, K)
@@ -234,7 +239,7 @@ for _ in range(3):
         branch_block_tables=branch_block_tables,
         bonus_candidates=bonus_candidates,
     )
-torch.cuda.synchronize()
+torch.accelerator.synchronize()
 
 # Benchmark parallel
 times_par = []
@@ -246,7 +251,7 @@ for _ in range(10):
         branch_block_tables=branch_block_tables,
         bonus_candidates=bonus_candidates,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     times_par.append((time.perf_counter() - t0) * 1000)
 
 # Benchmark sequential
@@ -259,7 +264,7 @@ for _ in range(10):
         branch_block_tables=branch_block_tables,
         bonus_candidates=bonus_candidates,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     times_seq.append((time.perf_counter() - t0) * 1000)
 
 par_avg = statistics.mean(times_par)
@@ -329,8 +334,12 @@ if __name__ == "__main__":
 
     all_passed = True
     all_passed &= run_in_subprocess(TEST_SHAPES, "TEST: Parallel Fanout Output Shapes")
-    all_passed &= run_in_subprocess(TEST_BENCHMARK, "TEST: Parallel Fanout Benchmark (N=8)")
-    all_passed &= run_in_subprocess(TEST_CONFIG_DISABLED, "TEST: Config Default (disabled)")
+    all_passed &= run_in_subprocess(
+        TEST_BENCHMARK, "TEST: Parallel Fanout Benchmark (N=8)"
+    )
+    all_passed &= run_in_subprocess(
+        TEST_CONFIG_DISABLED, "TEST: Config Default (disabled)"
+    )
 
     print("\n" + "=" * 60)
     if all_passed:

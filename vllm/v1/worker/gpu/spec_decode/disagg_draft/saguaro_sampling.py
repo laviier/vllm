@@ -80,9 +80,7 @@ def apply_saguaro_rescaling(
 
     if cached_token_indices is None:
         # Use top-F tokens from the logits as the cached set
-        _, cached_token_indices = torch.topk(
-            logits, num_cached_tokens + 1, dim=-1
-        )
+        _, cached_token_indices = torch.topk(logits, num_cached_tokens + 1, dim=-1)
 
     # Create mask for cached positions
     cache_mask = torch.zeros(B, V, dtype=torch.bool, device=logits.device)
@@ -153,8 +151,9 @@ class SaguaroSampler:
         self,
         saguaro_c: float | None = None,
         fan_out: int = 3,
-        device: torch.device = torch.device("cuda"),
+        device: torch.device | None = None,
     ):
+        device = device or torch.device("cuda")
         self.saguaro_c = saguaro_c
         self.fan_out = fan_out
         self.device = device

@@ -8,7 +8,7 @@ payloads are transferred inline in the same ZMQ multipart message and
 referenced by TensorRef.
 """
 
-from typing import TypeVar, Union
+from typing import TypeVar
 
 import msgspec
 
@@ -97,7 +97,7 @@ class DraftCommand(msgspec.Struct):
     """Envelope for all draft service messages over ZMQ."""
 
     command: str  # "SPECULATE", "PREFILL", "FREE_SEQ", "EXIT",
-                  # "HEALTHCHECK", "IPC_HANDSHAKE"
+    # "HEALTHCHECK", "IPC_HANDSHAKE"
     payload: bytes  # msgspec-encoded inner message
 
 
@@ -116,16 +116,16 @@ _decoders: dict[type, msgspec.msgpack.Decoder] = {
     DraftCommand: msgspec.msgpack.Decoder(DraftCommand),
 }
 
-DraftMessage = Union[
-    TensorRef,
-    VerificationOutcome,
-    SpeculationResponse,
-    PrefillRequest,
-    FreeSeqRequest,
-    IpcHandshake,
-    IpcHandshakeAck,
-    DraftCommand,
-]
+DraftMessage = (
+    TensorRef
+    | VerificationOutcome
+    | SpeculationResponse
+    | PrefillRequest
+    | FreeSeqRequest
+    | IpcHandshake
+    | IpcHandshakeAck
+    | DraftCommand
+)
 
 
 def encode(msg: DraftMessage) -> bytes:
@@ -140,15 +140,15 @@ def decode(data: bytes, msg_type: type[_T]) -> _T:
 
 def encode_command(
     command: str,
-    payload_msg: Union[
-        VerificationOutcome,
-        SpeculationResponse,
-        PrefillRequest,
-        FreeSeqRequest,
-        IpcHandshake,
-        IpcHandshakeAck,
-        None,
-    ] = None,
+    payload_msg: (
+        VerificationOutcome
+        | SpeculationResponse
+        | PrefillRequest
+        | FreeSeqRequest
+        | IpcHandshake
+        | IpcHandshakeAck
+        | None
+    ) = None,
 ) -> bytes:
     """Build and serialize a :class:`DraftCommand` envelope."""
     payload = _encoder.encode(payload_msg) if payload_msg is not None else b""
