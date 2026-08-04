@@ -95,7 +95,7 @@ class LlamaModel(nn.Module):
         self.fc = ReplicatedLinear(
             input_size=self.config.hidden_size * 2,
             output_size=self.config.hidden_size,
-            bias=False,
+            bias=True,
             params_dtype=vllm_config.model_config.dtype,
             quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "fc"),
@@ -179,4 +179,9 @@ class EagleLlamaForCausalLM(LlamaForCausalLM):
             self,
             skip_prefixes=None,
         )
-        loader.load_weights(map(transform, weights))
+        loaded_weights = loader.load_weights(map(transform, weights))
+        if "model.fc.bias" not in loaded_weights:
+            assert self.model.fc.bias is not None
+            with torch.no_grad():
+                self.model.fc.bias.zero_()
+        return loaded_weights

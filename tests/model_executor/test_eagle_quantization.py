@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.config import LoadConfig, ModelConfig, SpeculativeConfig, VllmConfig
+from vllm.config.compilation import CompilationMode
 from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.platforms import current_platform
 
@@ -157,3 +158,56 @@ def test_eagle3_lm_head_receives_quant_config():
         assert call_kwargs["quant_config"] is mock_quant_config, (
             "ParallelLMHead must receive the draft model's quant_config"
         )
+
+
+def test_eagle_fusion_layer_loads_bias():
+    """EAGLE checkpoints train and store a bias for the fusion projection."""
+    from vllm.model_executor.models.llama_eagle import LlamaModel
+
+    mock_hf_config = Mock()
+    mock_hf_config.vocab_size = 128
+    mock_hf_config.hidden_size = 16
+    mock_hf_config.num_hidden_layers = 1
+
+    mock_vllm_config = Mock()
+    mock_vllm_config.speculative_config.draft_model_config.hf_config = mock_hf_config
+    mock_vllm_config.model_config.dtype = torch.bfloat16
+    mock_vllm_config.compilation_config.mode = CompilationMode.NONE
+
+    with (
+        patch(
+            "vllm.model_executor.models.llama_eagle.VocabParallelEmbedding",
+            return_value=torch.nn.Identity(),
+        ),
+        patch(
+            "vllm.model_executor.models.llama_eagle.LlamaDecoderLayer",
+            return_value=torch.nn.Identity(),
+        ),
+        patch(
+            "vllm.model_executor.models.llama_eagle.ReplicatedLinear",
+            return_value=torch.nn.Identity(),
+        ) as mock_linear,
+        patch(
+            "vllm.model_executor.models.llama_eagle.get_draft_quant_config",
+            return_value=None,
+        ),
+    ):
+        LlamaModel(vllm_config=mock_vllm_config)
+
+    assert mock_linear.call_args.kwargs["bias"] is True
+
+
+def test_eagle_missing_fusion_bias_is_zeroed():
+    from vllm.model_executor.models.llama_eagle import EagleLlamaForCausalLM
+
+    model = Mock()
+    model.model.fc.bias = torch.nn.Parameter(torch.ones(16))
+
+    with patch(
+        "vllm.model_executor.models.llama_eagle.AutoWeightsLoader"
+    ) as mock_loader:
+        mock_loader.return_value.load_weights.return_value = {"model.fc.weight"}
+        loaded = EagleLlamaForCausalLM.load_weights(model, ())
+
+    assert loaded == {"model.fc.weight"}
+    assert torch.count_nonzero(model.model.fc.bias) == 0
