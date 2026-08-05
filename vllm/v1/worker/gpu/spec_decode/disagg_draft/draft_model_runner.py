@@ -719,7 +719,13 @@ class DraftModelRunner(
         query_lens: torch.Tensor,
         next_token_ids: torch.Tensor,
         seq_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        return_trace: bool = False,
+    ) -> torch.Tensor | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Generate K EAGLE tokens from one packed target-model query."""
         assert self._is_eagle and self._model_loaded
         assert self.model is not None
@@ -802,7 +808,8 @@ class DraftModelRunner(
         first_logits_hidden, feedback_hidden = first_output
         logits_hidden = first_logits_hidden[last_indices_t]
         feedback_hidden = feedback_hidden[last_indices_t]
-        token = self._eagle_logits(logits_hidden).argmax(dim=-1)
+        token_logits = self._eagle_logits(logits_hidden)
+        token = token_logits.argmax(dim=-1)
         draft_tokens = torch.empty(
             B,
             self._num_spec_tokens,
@@ -810,6 +817,25 @@ class DraftModelRunner(
             device=self.device,
         )
         draft_tokens[:, 0].copy_(token)
+        outcome_logits = None
+        feedback_trace = None
+        if return_trace:
+            outcome_logits = torch.empty(
+                B,
+                self._num_spec_tokens + 1,
+                self.vocab_size,
+                dtype=token_logits.dtype,
+                device=self.device,
+            )
+            feedback_trace = torch.empty(
+                B,
+                self._num_spec_tokens + 1,
+                feedback_hidden.shape[-1],
+                dtype=feedback_hidden.dtype,
+                device=self.device,
+            )
+            outcome_logits[:, 0].copy_(token_logits)
+            feedback_trace[:, 0].copy_(feedback_hidden)
         current_positions = last_positions
         decode_slot_mapping = torch.empty(
             B,
@@ -855,12 +881,140 @@ class DraftModelRunner(
                     hidden_states=feedback_hidden,
                 )
             logits_hidden, feedback_hidden = step_output
-            token = self._eagle_logits(logits_hidden).argmax(dim=-1)
+            token_logits = self._eagle_logits(logits_hidden)
+            token = token_logits.argmax(dim=-1)
             draft_tokens[:, step].copy_(token)
+            if return_trace:
+                assert outcome_logits is not None
+                assert feedback_trace is not None
+                outcome_logits[:, step].copy_(token_logits)
+                feedback_trace[:, step].copy_(feedback_hidden)
 
+        if return_trace:
+            # Feed the final drafted token once to obtain the all-K-accepted
+            # outcome distribution and the feedback state needed to start the
+            # following speculative round.
+            eagle_step_update_slot_mapping_and_metadata(
+                positions_1d=current_positions,
+                block_table_tensor=block_tables,
+                seq_lens=seq_lens,
+                block_size=self.block_size,
+                max_model_len=self.max_model_len,
+                out_clamped_positions=current_positions,
+                out_slot_mapping=decode_slot_mapping,
+            )
+            attn_metadata = self._build_flash_attn_metadata(
+                num_tokens=B,
+                seq_lens_tensor=seq_lens,
+                max_seq_len=max(last_positions_list)
+                + self._num_spec_tokens
+                + 1,
+                max_query_len=1,
+                query_start_loc=decode_query_start,
+                block_table=block_tables,
+                slot_mapping=decode_slot_mapping,
+            )
+            with (
+                set_forward_context(
+                    attn_metadata=attn_metadata,
+                    vllm_config=self._draft_vllm_config,
+                    num_tokens=B,
+                    slot_mapping=self._build_slot_mapping_dict(
+                        decode_slot_mapping
+                    ),
+                    batch_descriptor=BatchDescriptor(num_tokens=B),
+                ),
+                self._ir_priority_ctx(),
+            ):
+                final_output = self.model(
+                    input_ids=token.to(torch.int32),
+                    positions=current_positions,
+                    hidden_states=feedback_hidden,
+            )
+            final_logits_hidden, final_feedback = final_output
+            assert outcome_logits is not None
+            assert feedback_trace is not None
+            outcome_logits[:, self._num_spec_tokens].copy_(
+                self._eagle_logits(final_logits_hidden)
+            )
+            feedback_trace[:, self._num_spec_tokens].copy_(final_feedback)
+
+        tracked_extra = 1 if return_trace else 0
         for sid, last_position in zip(seq_ids_list, last_positions_list):
-            self._seq_lens[sid] = last_position + self._num_spec_tokens
+            self._seq_lens[sid] = (
+                last_position + self._num_spec_tokens + tracked_extra
+            )
+        if return_trace:
+            assert outcome_logits is not None
+            assert feedback_trace is not None
+            return draft_tokens, outcome_logits, feedback_trace, last_positions
         return draft_tokens
+
+    def eagle_shadow_tree_decode(
+        self,
+        bonus_tokens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        initial_hidden_states: torch.Tensor,
+        branch_block_tables: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generate one future EAGLE chain for each predicted outcome.
+
+        ``prefix_lens`` is the absolute position at which the predicted
+        recovery token is written. The parent KV prefix has already been
+        copied into each branch block table.
+        """
+        assert self._is_eagle and self._model_loaded
+        assert self.model is not None
+        N = bonus_tokens.shape[0]
+        K = self._num_spec_tokens
+        tokens = torch.empty(N, K, dtype=torch.int64, device=self.device)
+        input_ids = bonus_tokens.to(torch.int32)
+        hidden_states = initial_hidden_states
+        query_start_loc = torch.arange(
+            N + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        for depth in range(K):
+            positions = prefix_lens + depth
+            logical_blocks = (positions // self.block_size).to(torch.int64)
+            offsets = (positions % self.block_size).to(torch.int64)
+            rows = torch.arange(N, dtype=torch.int64, device=self.device)
+            physical_blocks = branch_block_tables[rows, logical_blocks].to(
+                torch.int64
+            )
+            slot_mapping = physical_blocks * self.block_size + offsets
+            seq_lens = (positions + 1).to(torch.int32)
+            attn_metadata = self._build_flash_attn_metadata(
+                num_tokens=N,
+                seq_lens_tensor=seq_lens,
+                max_seq_len=int(seq_lens.max().item()),
+                max_query_len=1,
+                query_start_loc=query_start_loc,
+                block_table=branch_block_tables,
+                slot_mapping=slot_mapping,
+            )
+            with (
+                set_forward_context(
+                    attn_metadata=attn_metadata,
+                    vllm_config=self._draft_vllm_config,
+                    num_tokens=N,
+                    slot_mapping=self._build_slot_mapping_dict(slot_mapping),
+                    batch_descriptor=BatchDescriptor(num_tokens=N),
+                ),
+                self._ir_priority_ctx(),
+            ):
+                step_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+            logits_hidden, hidden_states = step_output
+            input_ids = self._eagle_logits(logits_hidden).argmax(dim=-1)
+            tokens[:, depth].copy_(input_ids)
+
+        return tokens
 
     @torch.inference_mode()
     def prefill(

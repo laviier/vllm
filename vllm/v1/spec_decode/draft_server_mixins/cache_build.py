@@ -885,6 +885,7 @@ class DraftServerCacheBuildMixin:
         entry_batch_ids: torch.Tensor,
         k_positions: torch.Tensor,
         seq_ids_list: list[int] | None = None,
+        prefix_lens_override: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Reserve dedicated blocks for N branches and copy parent KV in.
 
@@ -925,7 +926,10 @@ class DraftServerCacheBuildMixin:
             base_lens_view[i] = self._round_base_lens.get(sid, 0)
         base_lens_t = self._cb_base_lens_gpu[:B]
         base_lens_t.copy_(base_lens_view, non_blocking=True)
-        prefix_lens = base_lens_t[entry_batch_ids] + 1 + k_positions
+        if prefix_lens_override is None:
+            prefix_lens = base_lens_t[entry_batch_ids] + 1 + k_positions
+        else:
+            prefix_lens = prefix_lens_override
 
         seq_ids_for_branches = seq_ids[entry_batch_ids].to(torch.int64)
         branch_block_tables = runner._block_table_gpu[seq_ids_for_branches].contiguous()

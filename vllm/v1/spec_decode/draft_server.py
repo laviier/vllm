@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 import prometheus_client
 import torch
 
+from vllm import envs
 from vllm.v1.spec_decode.draft_connector import (
     _str_to_dtype,
 )
@@ -132,6 +133,39 @@ class DraftServerMetrics:
                 "batch (counts each VS individually, so a successful "
                 "2-VS merge increments by 2)."
             ),
+        )
+        self.eagle_shadow_lookups = prometheus_client.Counter(
+            name="vllm:draft_server_eagle_shadow_lookups_total",
+            documentation=("EAGLE sequences checked against the shadow SSD cache."),
+        )
+        self.eagle_shadow_hits = prometheus_client.Counter(
+            name="vllm:draft_server_eagle_shadow_hits_total",
+            documentation=("EAGLE shadow SSD outcome-cache hits."),
+        )
+        self.eagle_shadow_agreement_tokens = prometheus_client.Counter(
+            name="vllm:draft_server_eagle_shadow_agreement_tokens_total",
+            documentation=(
+                "Leading tokens on shadow-cache hits that agree with the "
+                "target-conditioned EAGLE proposal."
+            ),
+        )
+        self.eagle_shadow_hit_sequences = prometheus_client.Counter(
+            name="vllm:draft_server_eagle_shadow_hit_sequences_total",
+            documentation=(
+                "Shadow-cache hit sequences included in agreement statistics."
+            ),
+        )
+        self.eagle_shadow_build_latency = prometheus_client.Histogram(
+            name="vllm:draft_server_eagle_shadow_build_latency_seconds",
+            documentation=("Time to build one fan-out-1 SSD-EAGLE shadow cache."),
+            buckets=(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0),
+        )
+        self.eagle_shadow_response_interval = prometheus_client.Histogram(
+            name="vllm:draft_server_eagle_shadow_response_interval_seconds",
+            documentation=(
+                "Time from an EAGLE response until the next EAGLE request."
+            ),
+            buckets=(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0),
         )
 
 
@@ -298,6 +332,14 @@ class DraftServer(
         # cache_build's glue_decode to decide which input token
         # (bonus vs draft_tokens[:, -1]) to feed each row.
         self._last_miss_mask: torch.Tensor | None = None
+        self._eagle_shadow_enabled = envs.VLLM_DISAGG_EAGLE_SHADOW
+        self._eagle_shadow_keys: torch.Tensor | None = None
+        self._eagle_shadow_tokens: torch.Tensor | None = None
+        self._eagle_shadow_last_response_time: float | None = None
+        self._eagle_shadow_round = 0
+        self._eagle_shadow_lookup_count = 0
+        self._eagle_shadow_hit_count = 0
+        self._eagle_shadow_agreement_count = 0
 
         # Determine device (use current CUDA device, set by entrypoint)
         self.device = torch.device(f"cuda:{torch.accelerator.current_device_index()}")
@@ -475,11 +517,12 @@ class DraftServer(
 
         logger.info(
             "DraftServer initialized, bind_address=%s, K=%d, "
-            "fan_out=%d, max_batch_size=%d",
+            "fan_out=%d, max_batch_size=%d, eagle_shadow=%s",
             self.bind_address,
             self.K,
             self.fan_out,
             self._max_batch_size,
+            self._eagle_shadow_enabled,
         )
 
     # ------------------------------------------------------------------
@@ -1608,6 +1651,112 @@ class DraftServer(
                     "DraftServer IPC fallback response failed",
                 )
 
+    def _lookup_eagle_shadow(
+        self,
+        seq_ids: torch.Tensor,
+        k_accepted: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Look up actual outcomes in the previous shadow cache."""
+        B = seq_ids.shape[0]
+        empty_tokens = torch.zeros(
+            B,
+            self.K,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        empty_hits = torch.zeros(B, dtype=torch.bool, device=self.device)
+        keys = self._eagle_shadow_keys
+        cached = self._eagle_shadow_tokens
+        if keys is None or cached is None or keys.shape[0] == 0:
+            return empty_tokens, empty_hits
+
+        query = torch.stack([seq_ids, k_accepted, bonus_tokens], dim=1)
+        match = (query.unsqueeze(1) == keys.unsqueeze(0)).all(dim=2)
+        hits = match.any(dim=1)
+        indices = match.to(torch.int64).argmax(dim=1)
+        gathered = cached[indices]
+        tokens = torch.where(hits.unsqueeze(1), gathered, empty_tokens)
+        return tokens, hits
+
+    def _build_eagle_shadow(
+        self,
+        runner: Any,
+        seq_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        outcome_logits: torch.Tensor,
+        feedback_trace: torch.Tensor,
+        last_positions: torch.Tensor,
+    ) -> None:
+        """Build fan-out-1 future branches without changing live responses."""
+        B = seq_ids.shape[0]
+        K = self.K
+        branch_owner = "__eagle_shadow__"
+        runner.recycle_dedicated_blocks(branch_owner)
+
+        k_positions = (
+            torch.arange(K + 1, dtype=torch.int64, device=self.device)
+            .unsqueeze(0)
+            .expand(B, K + 1)
+            .reshape(-1)
+        )
+        entry_batch_ids = (
+            torch.arange(B, dtype=torch.int64, device=self.device)
+            .unsqueeze(1)
+            .expand(B, K + 1)
+            .reshape(-1)
+        )
+
+        # At rejected positions, the recovery token differs from the drafted
+        # token. At the all-accepted position there is no token to exclude.
+        candidate_logits = outcome_logits.clone()
+        candidate_logits[:, :K].scatter_(
+            2,
+            draft_tokens.unsqueeze(2),
+            float("-inf"),
+        )
+        bonus_candidates = candidate_logits.argmax(dim=-1).reshape(-1)
+        prefix_lens = (
+            last_positions[entry_batch_ids] + k_positions + 1
+        ).to(torch.int64)
+        initial_hidden = feedback_trace[
+            entry_batch_ids,
+            k_positions,
+        ]
+
+        alloc = self._allocate_branch_blocks_and_copy_kv(
+            runner=runner,
+            vs_id=branch_owner,
+            N=entry_batch_ids.shape[0],
+            K=K,
+            seq_ids=seq_ids,
+            entry_batch_ids=entry_batch_ids,
+            k_positions=k_positions,
+            seq_ids_list=seq_ids.tolist(),
+            prefix_lens_override=prefix_lens,
+        )
+        if alloc is None:
+            self._eagle_shadow_keys = None
+            self._eagle_shadow_tokens = None
+            logger.warning("Skipping EAGLE shadow cache build: KV pool exhausted.")
+            return
+        branch_block_tables, _ = alloc
+        future_tokens = runner.eagle_shadow_tree_decode(
+            bonus_tokens=bonus_candidates,
+            prefix_lens=prefix_lens,
+            initial_hidden_states=initial_hidden,
+            branch_block_tables=branch_block_tables,
+        )
+        self._eagle_shadow_keys = torch.stack(
+            [
+                seq_ids[entry_batch_ids],
+                k_positions,
+                bonus_candidates,
+            ],
+            dim=1,
+        ).contiguous()
+        self._eagle_shadow_tokens = future_tokens
+
     async def _handle_ipc_eagle_speculation_merged(
         self,
         pending: list[tuple[str, int, int, int]],
@@ -1616,6 +1765,13 @@ class DraftServer(
         if not pending:
             return
         now = time.monotonic()
+        if (
+            self._eagle_shadow_enabled
+            and self._eagle_shadow_last_response_time is not None
+        ):
+            self.metrics.eagle_shadow_response_interval.observe(
+                now - self._eagle_shadow_last_response_time
+            )
         prefetch: list[tuple[str, int, int, int, Any]] = []
         for vs_id, slot, batch_size, seq16 in pending:
             peer = self._ipc_peers.get(vs_id)
@@ -1661,6 +1817,9 @@ class DraftServer(
                         "next_token_ids": buf["req_bonus_tokens"][
                             slot, :batch_size
                         ].to(device=self.device, non_blocking=True, copy=True),
+                        "k_accepted": buf["req_k_accepted"][
+                            slot, :batch_size
+                        ].to(device=self.device, non_blocking=True, copy=True),
                         "token_ids": buf["req_eagle_token_ids"][:num_tokens].to(
                             device=self.device,
                             non_blocking=True,
@@ -1692,6 +1851,7 @@ class DraftServer(
                 hidden_states = combined["hidden_states"]
                 query_lens = combined["query_lens"]
                 next_token_ids = combined["next_token_ids"]
+                k_accepted = combined["k_accepted"]
                 seq_ids = combined["seq_ids"]
             else:
                 token_ids = torch.cat([batch["token_ids"] for batch in batches])
@@ -1703,15 +1863,51 @@ class DraftServer(
                 next_token_ids = torch.cat(
                     [batch["next_token_ids"] for batch in batches]
                 )
+                k_accepted = torch.cat(
+                    [batch["k_accepted"] for batch in batches]
+                )
                 seq_ids = torch.cat([batch["seq_ids"] for batch in batches])
-            draft_tokens = runner.eagle_propose(
+            shadow_tokens = None
+            shadow_hits = None
+            if self._eagle_shadow_enabled:
+                shadow_tokens, shadow_hits = self._lookup_eagle_shadow(
+                    seq_ids=seq_ids,
+                    k_accepted=k_accepted,
+                    bonus_tokens=next_token_ids,
+                )
+
+            proposal = runner.eagle_propose(
                 target_token_ids=token_ids,
                 target_positions=positions,
                 target_hidden_states=hidden_states,
                 query_lens=query_lens,
                 next_token_ids=next_token_ids,
                 seq_ids=seq_ids,
+                return_trace=self._eagle_shadow_enabled,
             )
+            if self._eagle_shadow_enabled:
+                (
+                    draft_tokens,
+                    outcome_logits,
+                    feedback_trace,
+                    last_positions,
+                ) = proposal
+                assert shadow_tokens is not None
+                assert shadow_hits is not None
+                hit_count = int(shadow_hits.sum().item())
+                self.metrics.eagle_shadow_lookups.inc(seq_ids.shape[0])
+                self.metrics.eagle_shadow_hits.inc(hit_count)
+                self._eagle_shadow_lookup_count += seq_ids.shape[0]
+                self._eagle_shadow_hit_count += hit_count
+                if hit_count:
+                    equal = shadow_tokens == draft_tokens
+                    prefix_agreement = equal.to(torch.int64).cumprod(dim=1).sum(dim=1)
+                    agreed = int(prefix_agreement[shadow_hits].sum().item())
+                    self.metrics.eagle_shadow_agreement_tokens.inc(agreed)
+                    self.metrics.eagle_shadow_hit_sequences.inc(hit_count)
+                    self._eagle_shadow_agreement_count += agreed
+            else:
+                draft_tokens = proposal
 
             offset = 0
             for batch in batches:
@@ -1727,6 +1923,34 @@ class DraftServer(
                 peer.set_resp(slot, batch["seq16"])
                 offset += batch_size
                 self.metrics.draft_speculate_total.inc()
+            if self._eagle_shadow_enabled:
+                self._eagle_shadow_last_response_time = time.monotonic()
+                torch.cuda.synchronize(self.device)
+                build_start = time.perf_counter()
+                self._build_eagle_shadow(
+                    runner=runner,
+                    seq_ids=seq_ids,
+                    draft_tokens=draft_tokens,
+                    outcome_logits=outcome_logits,
+                    feedback_trace=feedback_trace,
+                    last_positions=last_positions,
+                )
+                torch.cuda.synchronize(self.device)
+                build_s = time.perf_counter() - build_start
+                self.metrics.eagle_shadow_build_latency.observe(build_s)
+                self._eagle_shadow_round += 1
+                if self._eagle_shadow_round % 64 == 0:
+                    lookups = self._eagle_shadow_lookup_count
+                    hits = self._eagle_shadow_hit_count
+                    agreed = self._eagle_shadow_agreement_count
+                    logger.info(
+                        "EAGLE shadow round=%d hit_rate=%.3f "
+                        "prefix_agreement=%.2f build_ms=%.2f",
+                        self._eagle_shadow_round,
+                        hits / lookups if lookups else 0.0,
+                        agreed / hits if hits else 0.0,
+                        build_s * 1000.0,
+                    )
             if len(batches) > 1:
                 self.metrics.draft_speculate_merged.inc(len(batches))
         except Exception:
