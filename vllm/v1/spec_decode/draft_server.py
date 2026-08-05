@@ -691,16 +691,27 @@ class DraftServer(
                     # against entries that no longer exist. Skip such
                     # VSes here so we don't scramble the merged
                     # cache.lookup.
-                    live_ipc = [
-                        item for item in pending_ipc if item[0] in self._verify_servers
-                    ]
+                    if getattr(self.draft_model_runner, "_is_eagle", False):
+                        # EAGLE has no preceding ZMQ PREFILL; its first IPC
+                        # request performs request registration itself.
+                        live_ipc = pending_ipc
+                    else:
+                        live_ipc = [
+                            item
+                            for item in pending_ipc
+                            if item[0] in self._verify_servers
+                        ]
                     if not live_ipc:
                         self._check_evictions()
                         continue
                     # Multi-VS: merge into ONE drafter forward when we
                     # have multiple pending IPC SPECULATEs. Fall back to
                     # single-VS for len==1.
-                    if len(live_ipc) == 1:
+                    if getattr(self.draft_model_runner, "_is_eagle", False):
+                        await self._handle_ipc_eagle_speculation_merged(
+                            live_ipc,
+                        )
+                    elif len(live_ipc) == 1:
                         vs_id, slot, batch_size, seq16 = live_ipc[0]
                         await self._handle_ipc_speculation(
                             vs_id,
@@ -751,8 +762,13 @@ class DraftServer(
             # regress single-VS latency for no benefit.
             vs_id, identity, command, frames = msg
             merged: list[tuple[str, bytes, DraftCommand, list[bytes]]] | None = None
+            is_eagle_speculation = False
+            if command.command.upper() == "SPECULATE":
+                outcome = decode(command.payload, VerificationOutcome)
+                is_eagle_speculation = outcome.eagle_hidden_states_ref is not None
             if (
                 command.command.upper() == "SPECULATE"
+                and not is_eagle_speculation
                 and len(self._verify_servers) >= 2
             ):
                 extras = await self._drain_pending_speculates(
@@ -1591,6 +1607,147 @@ class DraftServer(
                 logger.exception(
                     "DraftServer IPC fallback response failed",
                 )
+
+    async def _handle_ipc_eagle_speculation_merged(
+        self,
+        pending: list[tuple[str, int, int, int]],
+    ) -> None:
+        """Run one EAGLE batch from one or more verifier IPC payloads."""
+        if not pending:
+            return
+        now = time.monotonic()
+        prefetch: list[tuple[str, int, int, int, Any]] = []
+        for vs_id, slot, batch_size, seq16 in pending:
+            peer = self._ipc_peers.get(vs_id)
+            if peer is None:
+                continue
+            self._verify_server_last_seen[vs_id] = now
+            with torch.cuda.stream(peer._poll_stream):
+                peer._seq_ids_cpu[:batch_size].copy_(
+                    peer.gpu_bufs["req_seq_ids"][slot, :batch_size],
+                    non_blocking=True,
+                )
+            prefetch.append((vs_id, slot, batch_size, seq16, peer))
+        for _, _, _, _, peer in prefetch:
+            peer._poll_stream.synchronize()
+
+        batches: list[dict[str, Any]] = []
+        try:
+            for vs_id, slot, batch_size, seq16, peer in prefetch:
+                buf = peer.gpu_bufs
+                ext_ids = peer._seq_ids_cpu[:batch_size].tolist()
+                internal_ids = [
+                    self._map_seq_id(vs_id, int(ext_id)) for ext_id in ext_ids
+                ]
+                for ext_id in ext_ids:
+                    self._register_request(vs_id, int(ext_id))
+                num_tokens = int(buf["req_eagle_num_tokens"][slot].item())
+                if num_tokens <= 0:
+                    raise ValueError(
+                        f"Missing EAGLE IPC payload from {vs_id} slot {slot}"
+                    )
+                batches.append(
+                    {
+                        "vs_id": vs_id,
+                        "slot": slot,
+                        "seq16": seq16,
+                        "peer": peer,
+                        "batch_size": batch_size,
+                        "seq_ids": torch.tensor(
+                            internal_ids,
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),
+                        "next_token_ids": buf["req_bonus_tokens"][
+                            slot, :batch_size
+                        ].to(device=self.device, non_blocking=True, copy=True),
+                        "token_ids": buf["req_eagle_token_ids"][:num_tokens].to(
+                            device=self.device,
+                            non_blocking=True,
+                            copy=True,
+                        ),
+                        "positions": buf["req_eagle_positions"][:num_tokens].to(
+                            device=self.device,
+                            non_blocking=True,
+                            copy=True,
+                        ),
+                        "query_lens": buf["req_eagle_query_lens"][
+                            :batch_size
+                        ].to(device=self.device, non_blocking=True, copy=True),
+                        "hidden_states": buf["req_eagle_hidden_states"][
+                            :num_tokens
+                        ].to(device=self.device, non_blocking=True, copy=True),
+                    }
+                )
+
+            if not batches:
+                return
+            runner = self.draft_model_runner
+            if runner is None:
+                raise RuntimeError("Draft model runner is not loaded")
+            if len(batches) == 1:
+                combined = batches[0]
+                token_ids = combined["token_ids"]
+                positions = combined["positions"]
+                hidden_states = combined["hidden_states"]
+                query_lens = combined["query_lens"]
+                next_token_ids = combined["next_token_ids"]
+                seq_ids = combined["seq_ids"]
+            else:
+                token_ids = torch.cat([batch["token_ids"] for batch in batches])
+                positions = torch.cat([batch["positions"] for batch in batches])
+                hidden_states = torch.cat(
+                    [batch["hidden_states"] for batch in batches]
+                )
+                query_lens = torch.cat([batch["query_lens"] for batch in batches])
+                next_token_ids = torch.cat(
+                    [batch["next_token_ids"] for batch in batches]
+                )
+                seq_ids = torch.cat([batch["seq_ids"] for batch in batches])
+            draft_tokens = runner.eagle_propose(
+                target_token_ids=token_ids,
+                target_positions=positions,
+                target_hidden_states=hidden_states,
+                query_lens=query_lens,
+                next_token_ids=next_token_ids,
+                seq_ids=seq_ids,
+            )
+
+            offset = 0
+            for batch in batches:
+                batch_size = batch["batch_size"]
+                peer = batch["peer"]
+                slot = batch["slot"]
+                buf = peer.gpu_bufs
+                buf["resp_cache_hits"][slot, :batch_size].fill_(1)
+                buf["resp_draft_tokens"][slot, :batch_size].copy_(
+                    draft_tokens[offset : offset + batch_size],
+                    non_blocking=True,
+                )
+                peer.set_resp(slot, batch["seq16"])
+                offset += batch_size
+                self.metrics.draft_speculate_total.inc()
+            if len(batches) > 1:
+                self.metrics.draft_speculate_merged.inc(len(batches))
+        except Exception:
+            logger.exception(
+                "DraftServer IPC EAGLE speculation failed for %s",
+                [item[0] for item in pending],
+            )
+            for vs_id, slot, batch_size, seq16 in pending:
+                peer = self._ipc_peers.get(vs_id)
+                if peer is None:
+                    continue
+                try:
+                    buf = peer.gpu_bufs
+                    buf["resp_cache_hits"][slot, :batch_size].zero_()
+                    buf["resp_draft_tokens"][slot, :batch_size].zero_()
+                    peer.set_resp(slot, seq16)
+                except Exception:
+                    logger.exception(
+                        "DraftServer IPC EAGLE fallback failed for %s",
+                        vs_id,
+                    )
 
     async def _handle_ipc_speculation_merged(
         self,

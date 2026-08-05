@@ -1061,6 +1061,20 @@ class VllmConfig:
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
 
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_disagg()
+            and self.speculative_config.method == "eagle"
+            and self.cache_config.enable_prefix_caching
+        ):
+            logger.warning_once(
+                "Prefix caching is not yet compatible with disaggregated EAGLE "
+                "because the standalone draft server cannot reconstruct target "
+                "hidden states for cached prompt tokens. Prefix caching will be "
+                "disabled."
+            )
+            self.cache_config.enable_prefix_caching = False
+
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
@@ -1072,6 +1086,11 @@ class VllmConfig:
                     "select a different all2all backend."
                 )
             if self.speculative_config is not None:
+                if self.speculative_config.use_disagg():
+                    raise ValueError(
+                        "Async scheduling is not yet compatible with "
+                        "disaggregated speculative decoding."
+                    )
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
@@ -1102,6 +1121,15 @@ class VllmConfig:
                 # impacts performance of pooling models, so we disable by default.
                 logger.debug(
                     "Disabling asynchronous scheduling by default for pooling model."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.use_disagg()
+            ):
+                logger.warning_once(
+                    "Async scheduling is not yet compatible with "
+                    "disaggregated speculative decoding and will be disabled."
                 )
                 self.scheduler_config.async_scheduling = False
             elif (

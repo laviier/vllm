@@ -4720,6 +4720,8 @@ class GPUModelRunner(
         if spec_config is not None and spec_config.use_disagg():
             disagg_early_ctx = self._disagg_propose_drafts_early(
                 sampler_output,
+                scheduler_output,
+                hidden_states,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
@@ -4767,6 +4769,7 @@ class GPUModelRunner(
                 disagg_early_ctx,
                 valid_sampled_token_ids,
             )
+            self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -4912,6 +4915,8 @@ class GPUModelRunner(
     def _disagg_propose_drafts_early(
         self,
         sampler_output: SamplerOutput,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
     ) -> Any:
         """Fire SPECULATE using GPU-native num_sampled/last_sampled
         derived from ``sampler_output.sampled_token_ids`` — the same
@@ -4943,23 +4948,23 @@ class GPUModelRunner(
         if not hasattr(speculator, "propose_dispatch"):
             return None
 
-        # Cache prompt tokens for any new requests (same as the sync
-        # path). Cheap CPU-only bookkeeping.
-        for rid in self.input_batch.req_ids:
-            if rid in speculator._disagg_prefilled_reqs:
-                continue
-            if rid in speculator._pending_prompt_tokens:
-                continue
-            req = self.requests.get(rid)
-            if req is None:
-                continue
-            n_prompt = req.num_prompt_tokens
-            req_idx = self.input_batch.req_id_to_index[rid]
-            prompt_ids = self.input_batch.token_ids_cpu[
-                req_idx,
-                :n_prompt,
-            ].tolist()
-            speculator.cache_new_request_tokens(rid, prompt_ids)
+        if not speculator._is_eagle:
+            # Independent draft models need a one-time raw-token PREFILL.
+            for rid in self.input_batch.req_ids:
+                if rid in speculator._disagg_prefilled_reqs:
+                    continue
+                if rid in speculator._pending_prompt_tokens:
+                    continue
+                req = self.requests.get(rid)
+                if req is None:
+                    continue
+                n_prompt = req.num_prompt_tokens
+                req_idx = self.input_batch.req_id_to_index[rid]
+                prompt_ids = self.input_batch.token_ids_cpu[
+                    req_idx,
+                    :n_prompt,
+                ].tolist()
+                speculator.cache_new_request_tokens(rid, prompt_ids)
 
         # Build GPU-native num_sampled / last_sampled from the sampler
         # output tensor. sampled_token_ids is [num_reqs, max_gen_len]
@@ -5005,6 +5010,73 @@ class GPUModelRunner(
             torch.zeros_like(sti),
         )
 
+        eagle_kwargs: dict[str, torch.Tensor] = {}
+        if speculator._is_eagle:
+            req_ids = self.input_batch.req_ids
+            scheduled_lens = [
+                scheduler_output.num_scheduled_tokens[rid] for rid in req_ids
+            ]
+            sampled_counts = num_sampled_t[:num_reqs].tolist()
+            query_lens = [
+                (
+                    min(scheduled_lens[i], int(sampled_counts[i]))
+                    if rid in scheduler_output.scheduled_spec_decode_tokens
+                    else scheduled_lens[i]
+                )
+                for i, rid in enumerate(req_ids)
+            ]
+            if any(n <= 0 for n in query_lens):
+                return None
+
+            # Gather the valid prefix from each packed target query. Rejected
+            # speculative positions are omitted so the remote EAGLE KV cache
+            # is overwritten only through the accepted endpoint.
+            gather_indices: list[int] = []
+            offset = 0
+            for scheduled, valid in zip(scheduled_lens, query_lens):
+                gather_indices.extend(range(offset, offset + valid))
+                offset += scheduled
+            total_scheduled = scheduler_output.total_num_scheduled_tokens
+            if gather_indices == list(range(total_scheduled)):
+                token_ids = self.input_ids.gpu[:total_scheduled]
+                positions = self._get_positions(total_scheduled)
+                target_hidden_states = hidden_states[:total_scheduled]
+            else:
+                indices = torch.tensor(
+                    gather_indices,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                token_ids = self.input_ids.gpu[indices]
+                positions = self._get_positions(indices)
+                target_hidden_states = hidden_states[indices]
+
+            # The final valid sampled token is EAGLE's endpoint token. For a
+            # discarded partial prefill, use the request's known backup token.
+            row_indices = torch.arange(num_reqs, device=self.device)
+            last_indices = (num_sampled_t[:num_reqs] - 1).clamp(min=0).long()
+            next_token_ids = last_sampled_t[row_indices, last_indices].to(torch.int64)
+            discarded = self.discard_request_mask.np[:num_reqs]
+            if discarded.any():
+                next_tokens_cpu = next_token_ids.cpu()
+                for i in discarded.nonzero()[0].tolist():
+                    req = self.requests[req_ids[i]]
+                    token_pos = int(self.input_batch.num_tokens_no_spec[i]) - 1
+                    next_tokens_cpu[i] = req.get_token_id(token_pos)
+                next_token_ids = next_tokens_cpu.to(self.device)
+
+            eagle_kwargs = {
+                "eagle_token_ids": token_ids,
+                "eagle_positions": positions,
+                "eagle_query_lens": torch.tensor(
+                    query_lens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "eagle_hidden_states": target_hidden_states,
+                "eagle_next_token_ids": next_token_ids,
+            }
+
         # Temperature is 1.0 for all — matches the current fast-path
         # behavior (see the original _disagg_propose_drafts).
         _temperature = torch.ones(num_reqs, device=self.device)
@@ -5015,6 +5087,7 @@ class GPUModelRunner(
                 num_sampled=num_sampled_t,
                 last_sampled=last_sampled_t,
                 temperature=_temperature,
+                **eagle_kwargs,
             )
         except Exception:
             logger.exception("disagg propose_dispatch failed")
@@ -5035,6 +5108,16 @@ class GPUModelRunner(
         is identical to pre-Path-C."""
         num_reqs = self.input_batch.num_reqs
         if early_ctx is None:
+            speculator = getattr(self, "_disagg_speculator", None)
+            if speculator is not None and speculator._is_eagle:
+                self._draft_token_ids = torch.zeros(
+                    num_reqs,
+                    self.num_spec_tokens,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self._draft_token_req_ids = self.input_batch.req_ids.copy()
+                return
             # Slow path — run the original synchronous propose.
             return self._disagg_propose_drafts(valid_sampled_token_ids)
 
@@ -5043,14 +5126,17 @@ class GPUModelRunner(
 
         try:
             draft_tensor = speculator.propose_await(ctx, num_reqs)
-            self._draft_token_ids = draft_tensor.tolist()
+            self._draft_token_ids = draft_tensor
         except Exception:
             logger.exception(
                 "disagg propose_await failed; falling back to zero drafts",
             )
-            self._draft_token_ids = [
-                [0] * self.num_spec_tokens for _ in range(num_reqs)
-            ]
+            self._draft_token_ids = torch.zeros(
+                num_reqs,
+                self.num_spec_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
 
         # TP broadcast (same as sync path)
         if self.parallel_config.tensor_parallel_size > 1:
@@ -5058,17 +5144,14 @@ class GPUModelRunner(
                 from vllm.distributed.parallel_state import get_tp_group
 
                 tp_group = get_tp_group()
-                draft_buf = torch.tensor(
-                    self._draft_token_ids,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+                assert isinstance(self._draft_token_ids, torch.Tensor)
+                draft_buf = self._draft_token_ids
                 torch.distributed.broadcast(
                     draft_buf,
                     src=tp_group.first_rank,
                     group=tp_group.device_group,
                 )
-                self._draft_token_ids = draft_buf.tolist()
+                self._draft_token_ids = draft_buf
 
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
@@ -5154,22 +5237,27 @@ class GPUModelRunner(
                         last_sampled=last_sampled_t,
                         temperature=_temperature,
                     )
-                with record_function_or_nullcontext("disagg_dpd: draft_tensor.tolist"):
-                    self._draft_token_ids = draft_tensor.tolist()
+                self._draft_token_ids = draft_tensor
             except Exception as e:
                 logger.warning(
                     "Disagg propose failed: %s. Returning zero drafts.",
                     e,
                 )
-                self._draft_token_ids = [
-                    [0] * self.num_spec_tokens for _ in range(num_reqs)
-                ]
+                self._draft_token_ids = torch.zeros(
+                    num_reqs,
+                    self.num_spec_tokens,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
         else:
             # Non-rank-0 TP workers initialise with zeros; the real
             # tokens arrive via the TP broadcast below.
-            self._draft_token_ids = [
-                [0] * self.num_spec_tokens for _ in range(num_reqs)
-            ]
+            self._draft_token_ids = torch.zeros(
+                num_reqs,
+                self.num_spec_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
 
         # Broadcast draft tokens from TP rank 0 to all ranks. The next
         # target forward pass writes these into input_ids, and TP
@@ -5179,17 +5267,14 @@ class GPUModelRunner(
                 from vllm.distributed.parallel_state import get_tp_group
 
                 tp_group = get_tp_group()
-                draft_buf = torch.tensor(
-                    self._draft_token_ids,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+                assert isinstance(self._draft_token_ids, torch.Tensor)
+                draft_buf = self._draft_token_ids
                 torch.distributed.broadcast(
                     draft_buf,
                     src=tp_group.first_rank,
                     group=tp_group.device_group,
                 )
-                self._draft_token_ids = draft_buf.tolist()
+                self._draft_token_ids = draft_buf
 
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 

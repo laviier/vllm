@@ -10,9 +10,13 @@ import pytest
 import torch
 
 from vllm.v1.spec_decode.draft_connector import (
+    CudaIpcDraftConnector,
+    EagleTargetInputs,
     ZmqDraftConnector,
     _dtype_to_str,
+    _IpcSharedBuffer,
     _str_to_dtype,
+    _tensor_to_bytes,
 )
 from vllm.v1.spec_decode.draft_data_models import (
     FreeSeqRequest,
@@ -46,6 +50,14 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
 def test_dtype_helpers():
     assert _dtype_to_str(torch.float32) == "float32"
     assert _str_to_dtype("int64") == torch.int64
+
+
+def test_bfloat16_wire_bytes_preserve_dtype_and_size():
+    tensor = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+    data = _tensor_to_bytes(tensor)
+    assert len(data) == tensor.numel() * tensor.element_size()
+    decoded = torch.frombuffer(bytearray(data), dtype=torch.bfloat16)
+    assert torch.equal(decoded, tensor)
 
 
 def test_tensor_refs_are_unique(connector: ZmqDraftConnector):
@@ -128,6 +140,54 @@ async def test_send_and_recv_speculation(connector: ZmqDraftConnector):
 
 
 @pytest.mark.anyio
+async def test_send_and_recv_eagle_speculation(connector: ZmqDraftConnector):
+    cache_hits = torch.tensor([True])
+    draft_tokens = torch.tensor([[1, 2, 3]], dtype=torch.int64)
+    response = SpeculationResponse(
+        cache_hits_ref=connector._make_tensor_ref(cache_hits),
+        draft_tokens_ref=connector._make_tensor_ref(draft_tokens),
+    )
+    connector._send_multipart = AsyncMock()
+    connector._recv_multipart = AsyncMock(
+        return_value=(
+            encode(response),
+            [_tensor_bytes(cache_hits), _tensor_bytes(draft_tokens)],
+        )
+    )
+    eagle_inputs = EagleTargetInputs(
+        token_ids=torch.tensor([10, 11], dtype=torch.int32),
+        positions=torch.tensor([0, 1], dtype=torch.int64),
+        query_lens=torch.tensor([2], dtype=torch.int32),
+        hidden_states=torch.ones((2, 4), dtype=torch.bfloat16),
+    )
+
+    await connector.send_and_recv_speculation(
+        batch_size=1,
+        seq_ids=torch.tensor([7]),
+        k_accepted=torch.tensor([0]),
+        bonus_tokens=torch.tensor([12]),
+        temperatures=None,
+        eagle_inputs=eagle_inputs,
+    )
+
+    sent_metadata, sent_tensors = connector._send_multipart.await_args.args
+    outcome = decode(
+        decode_command(sent_metadata).payload,
+        VerificationOutcome,
+    )
+    assert outcome.eagle_token_ids_ref is not None
+    assert outcome.eagle_positions_ref is not None
+    assert outcome.eagle_query_lens_ref is not None
+    assert outcome.eagle_hidden_states_ref is not None
+    assert [tensor.shape for tensor in sent_tensors[3:]] == [
+        torch.Size([2]),
+        torch.Size([2]),
+        torch.Size([1]),
+        torch.Size([2, 4]),
+    ]
+
+
+@pytest.mark.anyio
 async def test_send_and_recv_speculation_with_logits(
     connector: ZmqDraftConnector,
 ):
@@ -206,3 +266,60 @@ async def test_default_dispatch_defers_roundtrip(connector: ZmqDraftConnector):
     assert not connector.send_and_recv_speculation.called
     assert await connector.await_speculation(handle) == expected
     connector.send_and_recv_speculation.assert_awaited_once()
+
+
+def test_cuda_ipc_dispatch_copies_eagle_payload():
+    connector = CudaIpcDraftConnector.__new__(CudaIpcDraftConnector)
+    connector._ipc_ready = True
+    connector._ipc_max_batch = 4
+    connector._ipc_K = 3
+    connector._eagle_max_tokens = 8
+    connector._eagle_hidden_size = 4
+    connector._next_slot = 0
+    connector._slot_seqs = [0] * 16
+    connector._buf = _IpcSharedBuffer(
+        torch.device("cpu"),
+        max_batch=4,
+        K=3,
+        eagle_max_tokens=8,
+        eagle_hidden_size=4,
+    )
+    eagle_inputs = EagleTargetInputs(
+        token_ids=torch.tensor([10, 11], dtype=torch.int32),
+        positions=torch.tensor([2, 3], dtype=torch.int64),
+        query_lens=torch.tensor([2], dtype=torch.int32),
+        hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
+    )
+
+    handle = connector.dispatch_speculation(
+        batch_size=1,
+        seq_ids=torch.tensor([7]),
+        k_accepted=torch.tensor([0]),
+        bonus_tokens=torch.tensor([12]),
+        temperatures=None,
+        eagle_inputs=eagle_inputs,
+    )
+
+    assert handle.state == {
+        "slot": 0,
+        "seq16": 1,
+        "batch_size": 1,
+        "is_eagle": True,
+    }
+    assert connector._buf.req_eagle_num_tokens[0].item() == 2
+    assert torch.equal(
+        connector._buf.req_eagle_token_ids[:2],
+        eagle_inputs.token_ids,
+    )
+    assert torch.equal(
+        connector._buf.req_eagle_positions[:2],
+        eagle_inputs.positions,
+    )
+    assert torch.equal(
+        connector._buf.req_eagle_query_lens[:1],
+        eagle_inputs.query_lens,
+    )
+    assert torch.equal(
+        connector._buf.req_eagle_hidden_states[:2],
+        eagle_inputs.hidden_states,
+    )

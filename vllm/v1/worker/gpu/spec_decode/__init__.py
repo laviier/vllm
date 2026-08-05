@@ -22,6 +22,12 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
             DisaggSpeculatorProxy,
         )
 
+        proxy = DisaggSpeculatorProxy(vllm_config, device)
+        # Only TP0 exchanges data with the standalone drafter. Other ranks
+        # receive TP0's draft tokens through the model runner's broadcast.
+        if proxy._tp_rank != 0:
+            return proxy
+
         addresses = speculative_config.disagg_draft_addresses
         assert addresses is not None
         validate_draft_server_connectivity(addresses)
@@ -42,6 +48,13 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         # stitching draft tokens back into draft_toks_out.
         ipc_K = speculative_config.num_speculative_tokens
         ipc_max_batch = vllm_config.scheduler_config.max_num_seqs
+        is_eagle = speculative_config.method == "eagle"
+        eagle_max_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens if is_eagle else 1
+        )
+        eagle_hidden_size = (
+            vllm_config.model_config.get_hidden_size() if is_eagle else 1
+        )
 
         connectors: list[DraftConnector] = [
             CudaIpcDraftConnector(
@@ -50,6 +63,9 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
                 device=device,
                 max_batch=ipc_max_batch,
                 K=ipc_K,
+                eagle_max_tokens=eagle_max_tokens,
+                eagle_hidden_size=eagle_hidden_size,
+                eagle_dtype=vllm_config.model_config.dtype,
                 timeout_ms=timeout_ms,
                 force_zmq=force_zmq,
             )
@@ -62,7 +78,6 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
             verify_server_id=verify_server_id,
             primary_index=speculative_config.disagg_draft_primary_index,
         )
-        proxy = DisaggSpeculatorProxy(vllm_config, device)
         proxy.set_router(router)
         return proxy
     if speculative_config.method == "dflash":

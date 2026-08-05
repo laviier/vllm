@@ -108,6 +108,7 @@ class DisaggSpeculatorProxy:
         self.speculative_config = vllm_config.speculative_config
         assert self.speculative_config is not None
         self.num_speculative_steps = self.speculative_config.num_speculative_tokens
+        self._is_eagle = self.speculative_config.method == "eagle"
         self.draft_model_config = self.speculative_config.draft_model_config
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -341,6 +342,11 @@ class DisaggSpeculatorProxy:
         num_sampled: torch.Tensor,
         last_sampled: torch.Tensor,
         temperature: torch.Tensor,
+        eagle_token_ids: torch.Tensor | None = None,
+        eagle_positions: torch.Tensor | None = None,
+        eagle_query_lens: torch.Tensor | None = None,
+        eagle_hidden_states: torch.Tensor | None = None,
+        eagle_next_token_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> Any:
         """Fire SPECULATE early (kernel-queued + one CPU doorbell write).
@@ -366,6 +372,28 @@ class DisaggSpeculatorProxy:
             return None
 
         try:
+            if self._is_eagle:
+                if any(
+                    value is None
+                    for value in (
+                        eagle_token_ids,
+                        eagle_positions,
+                        eagle_query_lens,
+                        eagle_hidden_states,
+                        eagle_next_token_ids,
+                    )
+                ):
+                    raise ValueError("Standalone EAGLE target payload is incomplete")
+                return self._do_eagle_propose_dispatch(
+                    input_batch=input_batch,
+                    num_sampled=num_sampled,
+                    temperature=temperature,
+                    token_ids=eagle_token_ids,
+                    positions=eagle_positions,
+                    query_lens=eagle_query_lens,
+                    hidden_states=eagle_hidden_states,
+                    next_token_ids=eagle_next_token_ids,
+                )
             return self._do_propose_dispatch(
                 input_batch,
                 num_sampled,
@@ -496,6 +524,78 @@ class DisaggSpeculatorProxy:
             return zeros
 
         try:
+            if self._is_eagle:
+                if (
+                    last_hidden_states is None
+                    or num_rejected is None
+                    or next_prefill_tokens is None
+                ):
+                    raise TypeError(
+                        "MRV2 disaggregated EAGLE requires target hidden states, "
+                        "num_rejected, and next_prefill_tokens."
+                    )
+
+                scheduled_lens = input_batch.num_scheduled_tokens.tolist()
+                rejected_counts = num_rejected[:num_reqs].tolist()
+                query_lens_list = [
+                    scheduled - int(rejected)
+                    for scheduled, rejected in zip(
+                        scheduled_lens,
+                        rejected_counts,
+                    )
+                ]
+                if any(n <= 0 for n in query_lens_list):
+                    return zeros
+
+                gather_indices: list[int] = []
+                offset = 0
+                for scheduled, valid in zip(scheduled_lens, query_lens_list):
+                    gather_indices.extend(range(offset, offset + valid))
+                    offset += scheduled
+
+                total_scheduled = input_batch.num_tokens
+                if gather_indices == list(range(total_scheduled)):
+                    token_ids = input_batch.input_ids[:total_scheduled]
+                    positions = input_batch.positions[:total_scheduled]
+                    target_hidden_states = last_hidden_states[:total_scheduled]
+                else:
+                    indices = torch.tensor(
+                        gather_indices,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    token_ids = input_batch.input_ids[indices]
+                    positions = input_batch.positions[indices]
+                    target_hidden_states = last_hidden_states[indices]
+
+                idx_mapping = input_batch.idx_mapping[:num_reqs].long()
+                sampled_endpoint = last_sampled[idx_mapping, 0]
+                prefill_endpoint = next_prefill_tokens[0, idx_mapping]
+                next_token_ids = torch.where(
+                    num_sampled[:num_reqs] > 0,
+                    sampled_endpoint,
+                    prefill_endpoint,
+                ).to(torch.int64)
+                batch_temperature = temperature[idx_mapping]
+
+                ctx = self._do_eagle_propose_dispatch(
+                    input_batch=input_batch,
+                    num_sampled=num_sampled,
+                    temperature=batch_temperature,
+                    token_ids=token_ids,
+                    positions=positions,
+                    query_lens=torch.tensor(
+                        query_lens_list,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                )
+                if ctx is None:
+                    return zeros
+                return self._do_propose_await(ctx, num_reqs)
+
             return self._do_propose(
                 input_batch,
                 num_sampled,
@@ -947,6 +1047,86 @@ class DisaggSpeculatorProxy:
             "dispatch_t0": _time.perf_counter(),
         }
 
+    def _do_eagle_propose_dispatch(
+        self,
+        input_batch,
+        num_sampled: torch.Tensor,
+        temperature: torch.Tensor,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_lens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> dict | None:
+        """Dispatch one packed target query to a standalone EAGLE server."""
+        from vllm.v1.spec_decode.draft_connector import EagleTargetInputs
+
+        assert self.router is not None
+        req_ids = input_batch.req_ids
+        self._free_stale_requests(req_ids)
+
+        query_lens_list = [int(x) for x in query_lens.tolist()]
+        active_req_indices = [i for i, n in enumerate(query_lens_list) if n > 0]
+        if not active_req_indices:
+            return None
+        if active_req_indices != list(range(len(req_ids))):
+            raise ValueError(
+                "Standalone EAGLE currently requires a positive target query "
+                "for every request in the batch"
+            )
+
+        for rid in req_ids:
+            if rid not in self._disagg_req_to_seq_id:
+                if self._disagg_free_seq_ids:
+                    sid = self._disagg_free_seq_ids.pop()
+                else:
+                    sid = self._disagg_next_seq_id
+                    self._disagg_next_seq_id += 1
+                self._disagg_req_to_seq_id[rid] = sid
+            if rid not in self.router.assignment:
+                self.router.assign(rid)
+            self._disagg_prefilled_reqs.add(rid)
+
+        server_indices = {self.router.assignment[rid] for rid in req_ids}
+        if len(server_indices) != 1:
+            raise ValueError(
+                "A packed standalone EAGLE batch cannot be split across "
+                "multiple draft servers"
+            )
+        srv_idx = next(iter(server_indices))
+        connector = self.router.connectors[srv_idx]
+        B = len(req_ids)
+        seq_ids = torch.tensor(
+            [self._disagg_req_to_seq_id[rid] for rid in req_ids],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        k_accepted = (num_sampled[:B] - 1).clamp(min=0).to(torch.int64)
+        temps = temperature[:B].to(torch.float32)
+        handle = connector.dispatch_speculation(
+            batch_size=B,
+            seq_ids=seq_ids,
+            k_accepted=k_accepted,
+            bonus_tokens=next_token_ids[:B].to(torch.int64),
+            temperatures=temps,
+            needs_logits=False,
+            eagle_inputs=EagleTargetInputs(
+                token_ids=token_ids,
+                positions=positions,
+                query_lens=query_lens,
+                hidden_states=hidden_states,
+            ),
+        )
+        return {
+            "active_req_indices": active_req_indices,
+            "srv_order": [srv_idx],
+            "srv_local_indices": [list(range(B))],
+            "handles": [handle],
+            "B_active": B,
+            "k_accepted": k_accepted,
+            "dispatch_t0": _time.perf_counter(),
+        }
+
     def _do_propose_await(self, ctx: dict, num_reqs: int) -> torch.Tensor:
         """Wait for dispatched SPECULATEs, stitch back into
         ``self.draft_tokens``."""
@@ -982,6 +1162,7 @@ class DisaggSpeculatorProxy:
         with record_function("propose_await_gather"):
             results = self._run_async(_gather_awaits())
 
+        direct_tokens: torch.Tensor | None = None
         for srv_idx, local_indices, result in zip(
             srv_order,
             srv_local_indices,
@@ -1004,9 +1185,16 @@ class DisaggSpeculatorProxy:
                 continue
 
             _, srv_draft_toks, srv_draft_logits = result
-            for local_j, global_j in enumerate(local_indices):
-                if local_j < srv_draft_toks.shape[0]:
-                    draft_toks_out[global_j] = srv_draft_toks[local_j]
+            if (
+                len(results) == 1
+                and local_indices == list(range(B_active))
+                and srv_draft_toks.shape[0] >= B_active
+            ):
+                direct_tokens = srv_draft_toks[:B_active]
+            else:
+                for local_j, global_j in enumerate(local_indices):
+                    if local_j < srv_draft_toks.shape[0]:
+                        draft_toks_out[global_j] = srv_draft_toks[local_j]
             if srv_draft_logits is not None:
                 if draft_logits_out is None:
                     draft_logits_out = torch.zeros(
@@ -1056,9 +1244,14 @@ class DisaggSpeculatorProxy:
                 self.draft_logits[orig_i, :K_actual] = draft_logits_out[j, :K_actual]
 
         target_vocab = self.vllm_config.model_config.get_vocab_size()
+        if direct_tokens is not None:
+            draft_toks_out = direct_tokens
         draft_toks_out = draft_toks_out.clamp(min=0, max=target_vocab - 1)
-        for j, orig_i in enumerate(active_req_indices):
-            self.draft_tokens[orig_i] = draft_toks_out[j]
+        if active_req_indices == list(range(num_reqs)):
+            self.draft_tokens[:num_reqs].copy_(draft_toks_out[:num_reqs])
+        else:
+            for j, orig_i in enumerate(active_req_indices):
+                self.draft_tokens[orig_i] = draft_toks_out[j]
 
         return self.draft_tokens[:num_reqs]
 

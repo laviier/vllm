@@ -65,10 +65,10 @@ def _str_to_dtype(s: str) -> torch.dtype:
 
 
 def _tensor_to_bytes(t: torch.Tensor) -> bytes:
-    """Serialize a tensor to bytes, casting bfloat16→float32 for numpy."""
+    """Serialize a contiguous CPU tensor without changing its wire dtype."""
     t = t.detach().contiguous().cpu()
     if t.dtype == torch.bfloat16:
-        t = t.to(torch.float32)
+        return t.view(torch.uint16).numpy().tobytes()
     return t.numpy().tobytes()
 
 
@@ -78,10 +78,19 @@ def _bytes_to_tensor(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Deserialize bytes to a tensor, handling bfloat16 via float32."""
-    recv_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
-    t = torch.frombuffer(bytearray(buf), dtype=recv_dtype).reshape(shape)
-    return t.to(dtype=dtype, device=device)
+    """Deserialize bytes to a tensor while preserving the declared dtype."""
+    t = torch.frombuffer(bytearray(buf), dtype=dtype).reshape(shape)
+    return t.to(device=device)
+
+
+@dataclass
+class EagleTargetInputs:
+    """Packed target-model query consumed by a standalone EAGLE server."""
+
+    token_ids: torch.Tensor
+    positions: torch.Tensor
+    query_lens: torch.Tensor
+    hidden_states: torch.Tensor
 
 
 @dataclass
@@ -105,6 +114,7 @@ class DraftConnector(ABC):
         bonus_tokens: torch.Tensor,
         temperatures: torch.Tensor | None,
         needs_logits: bool = False,
+        eagle_inputs: EagleTargetInputs | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]: ...
 
     def dispatch_speculation(
@@ -115,6 +125,7 @@ class DraftConnector(ABC):
         bonus_tokens: torch.Tensor,
         temperatures: torch.Tensor | None,
         needs_logits: bool = False,
+        eagle_inputs: EagleTargetInputs | None = None,
     ) -> PendingSpeculation:
         """Fire a SPECULATE without waiting for the reply.
 
@@ -134,6 +145,7 @@ class DraftConnector(ABC):
                 "bonus_tokens": bonus_tokens,
                 "temperatures": temperatures,
                 "needs_logits": needs_logits,
+                "eagle_inputs": eagle_inputs,
             },
         )
 
@@ -155,6 +167,7 @@ class DraftConnector(ABC):
             bonus_tokens=s["bonus_tokens"],
             temperatures=s["temperatures"],
             needs_logits=s["needs_logits"],
+            eagle_inputs=s["eagle_inputs"],
         )
 
     @abstractmethod
@@ -326,6 +339,7 @@ class ZmqDraftConnector(DraftConnector):
         bonus_tokens: torch.Tensor,
         temperatures: torch.Tensor | None,
         needs_logits: bool = False,
+        eagle_inputs: EagleTargetInputs | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         from torch.profiler import record_function
 
@@ -355,6 +369,27 @@ class ZmqDraftConnector(DraftConnector):
                 temps_ref = self._make_tensor_ref(_temps)
                 tensor_list.append(_temps)
 
+            eagle_refs = (None, None, None, None)
+            if eagle_inputs is not None:
+                eagle_token_ids = eagle_inputs.token_ids.reshape(-1)
+                eagle_positions = eagle_inputs.positions.to(torch.int64).reshape(-1)
+                eagle_query_lens = eagle_inputs.query_lens.to(torch.int32).reshape(-1)
+                eagle_hidden_states = eagle_inputs.hidden_states
+                eagle_refs = (
+                    self._make_tensor_ref(eagle_token_ids),
+                    self._make_tensor_ref(eagle_positions),
+                    self._make_tensor_ref(eagle_query_lens),
+                    self._make_tensor_ref(eagle_hidden_states),
+                )
+                tensor_list.extend(
+                    [
+                        eagle_token_ids,
+                        eagle_positions,
+                        eagle_query_lens,
+                        eagle_hidden_states,
+                    ]
+                )
+
             outcome = VerificationOutcome(
                 verify_server_id=self._verify_server_id,
                 batch_size=batch_size,
@@ -363,6 +398,10 @@ class ZmqDraftConnector(DraftConnector):
                 bonus_tokens_ref=self._make_tensor_ref(_bonus_tokens),
                 temperatures_ref=temps_ref,
                 needs_logits=needs_logits,
+                eagle_token_ids_ref=eagle_refs[0],
+                eagle_positions_ref=eagle_refs[1],
+                eagle_query_lens_ref=eagle_refs[2],
+                eagle_hidden_states_ref=eagle_refs[3],
             )
             cmd_bytes = encode_command("SPECULATE", outcome)
 
@@ -469,7 +508,15 @@ class _IpcSharedBuffer:
     stream, so the drafter observes them in order via P2P).
     """
 
-    def __init__(self, device: torch.device, max_batch: int, K: int):
+    def __init__(
+        self,
+        device: torch.device,
+        max_batch: int,
+        K: int,
+        eagle_max_tokens: int = 1,
+        eagle_hidden_size: int = 1,
+        eagle_dtype: torch.dtype = torch.bfloat16,
+    ):
         self.device = device
         self.max_batch = max_batch
         self.K = K
@@ -497,6 +544,35 @@ class _IpcSharedBuffer:
                 IPC_N_SLOTS,
                 B,
                 dtype=torch.float32,
+                device=device,
+            )
+            # Only one SPECULATE can be in flight per connector, so EAGLE's
+            # large target payload is shared across ring slots. The per-slot
+            # token count also acts as the request-mode discriminator.
+            self.req_eagle_num_tokens = torch.zeros(
+                IPC_N_SLOTS,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.req_eagle_token_ids = torch.zeros(
+                eagle_max_tokens,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.req_eagle_positions = torch.zeros(
+                eagle_max_tokens,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.req_eagle_query_lens = torch.zeros(
+                B,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.req_eagle_hidden_states = torch.zeros(
+                eagle_max_tokens,
+                eagle_hidden_size,
+                dtype=eagle_dtype,
                 device=device,
             )
             self.resp_cache_hits = torch.zeros(
@@ -529,6 +605,11 @@ class _IpcSharedBuffer:
         "req_k_accepted",
         "req_bonus_tokens",
         "req_temperatures",
+        "req_eagle_num_tokens",
+        "req_eagle_token_ids",
+        "req_eagle_positions",
+        "req_eagle_query_lens",
+        "req_eagle_hidden_states",
         "resp_cache_hits",
         "resp_draft_tokens",
         "dbell_req_gpu",
@@ -630,12 +711,18 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         device: torch.device,
         max_batch: int = IPC_DEFAULT_MAX_BATCH,
         K: int = IPC_DEFAULT_K,
+        eagle_max_tokens: int = 1,
+        eagle_hidden_size: int = 1,
+        eagle_dtype: torch.dtype = torch.bfloat16,
         timeout_ms: int = 5000,
         force_zmq: bool = False,
     ) -> None:
         super().__init__(address, verify_server_id, device, timeout_ms)
         self._ipc_max_batch = max_batch
         self._ipc_K = K
+        self._eagle_max_tokens = eagle_max_tokens
+        self._eagle_hidden_size = eagle_hidden_size
+        self._eagle_dtype = eagle_dtype
         self._ipc_ready = False
         self._buf: _IpcSharedBuffer | None = None
         self._dbell: _IpcDoorbells | None = None
@@ -708,6 +795,9 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
             self._device,
             self._ipc_max_batch,
             self._ipc_K,
+            self._eagle_max_tokens,
+            self._eagle_hidden_size,
+            self._eagle_dtype,
         )
         # GPU-side doorbells live inside self._buf. The shm_path field
         # in the handshake is retained for wire-format compatibility
@@ -752,6 +842,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         bonus_tokens: torch.Tensor,
         temperatures: torch.Tensor | None,
         needs_logits: bool = False,
+        eagle_inputs: EagleTargetInputs | None = None,
     ) -> PendingSpeculation:
         if not self._ipc_ready or needs_logits:
             # Fall back to the base default (deferred ZMQ round-trip)
@@ -762,6 +853,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
                 bonus_tokens,
                 temperatures,
                 needs_logits,
+                eagle_inputs,
             )
         if batch_size > self._ipc_max_batch:
             logger.warning(
@@ -776,6 +868,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
                 bonus_tokens,
                 temperatures,
                 needs_logits,
+                eagle_inputs,
             )
 
         slot = self._next_slot
@@ -805,6 +898,48 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         else:
             buf.req_temperatures[slot, :batch_size].fill_(1.0)
 
+        if eagle_inputs is None:
+            buf.req_eagle_num_tokens[slot].zero_()
+        else:
+            num_tokens = eagle_inputs.hidden_states.shape[0]
+            if (
+                num_tokens > self._eagle_max_tokens
+                or eagle_inputs.hidden_states.shape[1] != self._eagle_hidden_size
+            ):
+                logger.warning(
+                    "EAGLE IPC payload shape %s exceeds configured (%d, %d); "
+                    "using ZMQ fallback",
+                    tuple(eagle_inputs.hidden_states.shape),
+                    self._eagle_max_tokens,
+                    self._eagle_hidden_size,
+                )
+                return super().dispatch_speculation(
+                    batch_size,
+                    seq_ids,
+                    k_accepted,
+                    bonus_tokens,
+                    temperatures,
+                    needs_logits,
+                    eagle_inputs,
+                )
+            buf.req_eagle_token_ids[:num_tokens].copy_(
+                eagle_inputs.token_ids,
+                non_blocking=True,
+            )
+            buf.req_eagle_positions[:num_tokens].copy_(
+                eagle_inputs.positions,
+                non_blocking=True,
+            )
+            buf.req_eagle_query_lens[:batch_size].copy_(
+                eagle_inputs.query_lens,
+                non_blocking=True,
+            )
+            buf.req_eagle_hidden_states[:num_tokens].copy_(
+                eagle_inputs.hidden_states,
+                non_blocking=True,
+            )
+            buf.req_eagle_num_tokens[slot].fill_(num_tokens)
+
         assert batch_size < (1 << 16), "batch_size doesn't fit in 16 bits"
         # Wrap seq_no to 16 bits so the encoding stays in int32. Consumers
         # compare against their own remembered seq_no, so wrap-around is
@@ -825,7 +960,12 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
 
         return PendingSpeculation(
             connector=self,
-            state={"slot": slot, "seq16": seq16, "batch_size": batch_size},
+            state={
+                "slot": slot,
+                "seq16": seq16,
+                "batch_size": batch_size,
+                "is_eagle": eagle_inputs is not None,
+            },
         )
 
     async def await_speculation(
@@ -869,8 +1009,14 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
                 )
             await asyncio.sleep(poll_delay)
 
-        cache_hits = buf.resp_cache_hits[slot, :batch_size].clone().to(torch.bool)
-        draft_tokens = buf.resp_draft_tokens[slot, :batch_size].clone()
+        if s["is_eagle"]:
+            # EAGLE has one in-flight round per connector, and the caller
+            # consumes these views before publishing the next doorbell.
+            cache_hits = buf.resp_cache_hits[slot, :batch_size].to(torch.bool)
+            draft_tokens = buf.resp_draft_tokens[slot, :batch_size]
+        else:
+            cache_hits = buf.resp_cache_hits[slot, :batch_size].clone().to(torch.bool)
+            draft_tokens = buf.resp_draft_tokens[slot, :batch_size].clone()
         return cache_hits, draft_tokens, None
 
     async def send_and_recv_speculation(
@@ -881,6 +1027,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
         bonus_tokens: torch.Tensor,
         temperatures: torch.Tensor | None,
         needs_logits: bool = False,
+        eagle_inputs: EagleTargetInputs | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Blocking API: implemented via dispatch + await so callers that
         haven't been split-aware still work."""
@@ -892,6 +1039,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
                 bonus_tokens,
                 temperatures,
                 needs_logits,
+                eagle_inputs,
             )
         handle = self.dispatch_speculation(
             batch_size,
@@ -900,6 +1048,7 @@ class CudaIpcDraftConnector(ZmqDraftConnector):
             bonus_tokens,
             temperatures,
             needs_logits,
+            eagle_inputs,
         )
         return await self.await_speculation(handle)
 

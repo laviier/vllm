@@ -38,6 +38,12 @@ class VerificationOutcome(
     bonus_tokens_ref: TensorRef  # [B] int64
     temperatures_ref: TensorRef | None = None  # [B] float32
     needs_logits: bool = False  # whether draft_logits should be returned
+    # Standalone EAGLE input. When present, the draft server bypasses the
+    # speculative-result cache and runs EAGLE directly on this target query.
+    eagle_token_ids_ref: TensorRef | None = None  # [T] int32/int64
+    eagle_positions_ref: TensorRef | None = None  # [T] int64
+    eagle_query_lens_ref: TensorRef | None = None  # [B] int32
+    eagle_hidden_states_ref: TensorRef | None = None  # [T, H] fp16/bf16
 
 
 class SpeculationResponse(

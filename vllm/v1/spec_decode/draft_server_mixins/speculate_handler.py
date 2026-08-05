@@ -63,6 +63,13 @@ class DraftServerSpeculateMixin:
         server does not hang.
         """
         B = outcome.batch_size
+        if outcome.eagle_hidden_states_ref is not None:
+            await self._handle_eagle_speculation(
+                verify_server_id,
+                identity,
+                outcome,
+            )
+            return
         logger.debug(
             "DraftServer SPECULATE from %s, batch_size=%d",
             verify_server_id,
@@ -122,6 +129,52 @@ class DraftServerSpeculateMixin:
                         "DraftServer failed to send fallback response to %s",
                         verify_server_id,
                     )
+
+    async def _handle_eagle_speculation(
+        self,
+        verify_server_id: str,
+        identity: bytes,
+        outcome: VerificationOutcome,
+    ) -> None:
+        """Run one standalone EAGLE proposal directly from target outputs."""
+        B = outcome.batch_size
+        try:
+            seq_ids, _, next_token_ids, _ = self._recv_speculation_tensors(
+                verify_server_id,
+                outcome,
+            )
+            token_ids, positions, query_lens, hidden_states = (
+                self._recv_eagle_tensors(outcome)
+            )
+            for sid in seq_ids.tolist():
+                ext_key = self._int_to_ext_seq[int(sid)]
+                self._register_request(verify_server_id, ext_key[1])
+
+            runner = self.draft_model_runner
+            if runner is None:
+                raise RuntimeError("Draft model runner is not loaded")
+            draft_tokens = runner.eagle_propose(
+                target_token_ids=token_ids,
+                target_positions=positions,
+                target_hidden_states=hidden_states,
+                query_lens=query_lens,
+                next_token_ids=next_token_ids,
+                seq_ids=seq_ids,
+            )
+            cache_hits = torch.ones(B, dtype=torch.bool, device=self.device)
+            await self._send_speculation_response(
+                verify_server_id,
+                identity,
+                cache_hits,
+                draft_tokens,
+                None,
+            )
+        except Exception:
+            logger.exception(
+                "DraftServer standalone EAGLE failed for %s",
+                verify_server_id,
+            )
+            await self._send_fallback_speculation(verify_server_id, identity, B)
 
     def _sync_runner_seq_lens_and_blocks(
         self,

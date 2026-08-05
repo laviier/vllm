@@ -71,14 +71,13 @@ class DraftServerTransportMixin:
             )
             return torch.zeros(shape, dtype=dtype, device=self.device)
         buf = frames[idx]
-        recv_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
         return (
             torch.frombuffer(
                 bytearray(buf),
-                dtype=recv_dtype,
+                dtype=dtype,
             )
             .reshape(shape)
-            .to(dtype=dtype, device=self.device)
+            .to(device=self.device)
         )
 
     def _make_tensor_ref(self, tensor: torch.Tensor) -> TensorRef:
@@ -137,6 +136,43 @@ class DraftServerTransportMixin:
                 idx_state=idx_state,
             )
         return seq_ids, k_accepted, bonus_tokens, temperatures
+
+    def _recv_eagle_tensors(
+        self,
+        outcome: VerificationOutcome,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read the optional packed EAGLE target query after base tensors."""
+        refs = (
+            outcome.eagle_token_ids_ref,
+            outcome.eagle_positions_ref,
+            outcome.eagle_query_lens_ref,
+            outcome.eagle_hidden_states_ref,
+        )
+        if any(ref is None for ref in refs):
+            raise ValueError("Incomplete EAGLE tensor payload")
+        token_ref, position_ref, query_ref, hidden_ref = refs
+        assert token_ref is not None
+        assert position_ref is not None
+        assert query_ref is not None
+        assert hidden_ref is not None
+        return (
+            self._recv_tensor(
+                token_ref.shape,
+                _str_to_dtype(token_ref.dtype),
+            ),
+            self._recv_tensor(
+                position_ref.shape,
+                _str_to_dtype(position_ref.dtype),
+            ),
+            self._recv_tensor(
+                query_ref.shape,
+                _str_to_dtype(query_ref.dtype),
+            ),
+            self._recv_tensor(
+                hidden_ref.shape,
+                _str_to_dtype(hidden_ref.dtype),
+            ),
+        )
 
     async def _send_speculation_response(
         self,

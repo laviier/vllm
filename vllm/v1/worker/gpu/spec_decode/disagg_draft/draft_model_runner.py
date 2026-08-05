@@ -24,6 +24,8 @@ Reference: SSD ref impl ssd/engine/model_runner.py
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import time
 
 import torch
@@ -32,6 +34,9 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.v1.spec_decode.utils import (
+    eagle_step_update_slot_mapping_and_metadata,
+)
 from vllm.v1.worker.gpu.spec_decode.disagg_draft.attn_metadata import (
     DraftAttnMetadataMixin,
 )
@@ -82,6 +87,7 @@ class DraftModelRunner(
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = self.draft_config.max_model_len
         self._num_spec_tokens = spec_config.num_speculative_tokens
+        self._is_eagle = spec_config.method == "eagle"
         # Total geometric fan-out budget per sequence (matches the
         # OutcomePredictor's total_budget on the server side). Used by
         # the CUDA graph capture mixin to size graphs for parallel
@@ -465,16 +471,34 @@ class DraftModelRunner(
         # substituted for model_config. This ensures the model loader
         # uses the draft model's hidden_size, num_layers, etc. instead
         # of the target model's.
-        # Also disable torch.compile and CUDA graphs for the draft model
-        # since our simplified runner doesn't provide the full forward
-        # context that the compiled/captured graph expects.
+        # Independent draft models keep using the runner's existing eager
+        # CUDA-graph path. EAGLE uses its supported compilation wrapper below.
         draft_vllm_config = deepcopy(self.vllm_config)
-        draft_vllm_config.model_config = self.draft_config
-        draft_vllm_config.compilation_config = CompilationConfig(
-            mode=CompilationMode.NONE,
-            cudagraph_mode=CUDAGraphMode.NONE,
-            custom_ops=["all"],
-        )
+        # EAGLE constructors need the target model config (for example, the
+        # target layer count used in attention-layer names). get_model still
+        # receives draft_config explicitly, so only independent draft models
+        # replace the enclosing model config.
+        if not self._is_eagle:
+            draft_vllm_config.model_config = self.draft_config
+        if self._is_eagle:
+            # Llama EAGLE's inner model supports vLLM's compilation wrapper.
+            # Keep the target's validated compile settings, but do not use
+            # CUDA graphs: this standalone runner does not provide MRV2's
+            # graph input-padding and replay machinery.
+            draft_vllm_config.compilation_config = deepcopy(
+                self.vllm_config.compilation_config
+            )
+            draft_vllm_config.compilation_config.cudagraph_mode = (
+                CUDAGraphMode.NONE
+            )
+            draft_vllm_config.compilation_config.cudagraph_capture_sizes = []
+            draft_vllm_config.compilation_config.max_cudagraph_capture_size = 0
+        else:
+            draft_vllm_config.compilation_config = CompilationConfig(
+                mode=CompilationMode.NONE,
+                cudagraph_mode=CUDAGraphMode.NONE,
+                custom_ops=["all"],
+            )
         # Use TP=1 parallel config for the draft model.
         spec_config = self.vllm_config.speculative_config
         if spec_config is not None and spec_config.draft_parallel_config is not None:
@@ -486,11 +510,22 @@ class DraftModelRunner(
             draft_vllm_config.parallel_config.tensor_parallel_size = 1
             draft_vllm_config.parallel_config.pipeline_parallel_size = 1
 
-        self.model = get_model(
-            vllm_config=draft_vllm_config,
-            model_config=self.draft_config,
-        )
+        if self._is_eagle:
+            from vllm.compilation.backends import set_model_tag
+
+            with set_model_tag("eagle_head"):
+                self.model = get_model(
+                    vllm_config=draft_vllm_config,
+                    model_config=self.draft_config,
+                )
+        else:
+            self.model = get_model(
+                vllm_config=draft_vllm_config,
+                model_config=self.draft_config,
+            )
         self.model.eval()
+        if self._is_eagle:
+            self._load_eagle_target_weights()
 
         # Store the draft vllm_config — attention layers register
         # themselves in compilation_config.static_forward_context
@@ -521,11 +556,15 @@ class DraftModelRunner(
         # exactly where we need it and nowhere else.
         from vllm.config.kernel import IrOpPriorityConfig
 
-        self._drafter_ir_priority = IrOpPriorityConfig.with_default(
-            ["vllm_c", "native"]
-        )
+        if not self._is_eagle:
+            self._drafter_ir_priority = IrOpPriorityConfig.with_default(
+                ["vllm_c", "native"]
+            )
 
         with self._ir_priority_ctx():
+            if self._is_eagle:
+                self._warmup_eagle()
+                return
             try:
                 self._capture_decode_graphs()
             except Exception as e:
@@ -551,6 +590,277 @@ class DraftModelRunner(
             # Callers fall through to the per-layer eager loop when the
             # graph dict is empty (see ``run_kv_copy``).
             self._kv_copy_graphs = {}
+
+    def _warmup_eagle(self) -> None:
+        """Compile and warm EAGLE before the draft server accepts requests."""
+        logger.info("Warming standalone EAGLE model.")
+        warmup_seq_id = self.max_num_seqs + 1023
+        try:
+            self.eagle_propose(
+                target_token_ids=torch.zeros(
+                    1,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                target_positions=torch.zeros(
+                    1,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                target_hidden_states=torch.zeros(
+                    1,
+                    self.hidden_size,
+                    dtype=self.dtype,
+                    device=self.device,
+                ),
+                query_lens=torch.ones(
+                    1,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                next_token_ids=torch.zeros(
+                    1,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                seq_ids=torch.full(
+                    (1,),
+                    warmup_seq_id,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+            )
+            torch.accelerator.synchronize()
+        finally:
+            self.free_blocks(warmup_seq_id)
+        logger.info("Standalone EAGLE warmup complete.")
+
+    def _load_eagle_target_weights(self) -> None:
+        """Load target weights that co-located EAGLE normally shares."""
+        assert self.model is not None
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import safe_open
+
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+            VocabParallelEmbedding,
+        )
+
+        target_config = self.vllm_config.model_config
+        model_path = target_config.model
+        index_name = "model.safetensors.index.json"
+        if os.path.isdir(model_path):
+            index_path = os.path.join(model_path, index_name)
+        else:
+            index_path = hf_hub_download(
+                repo_id=model_path,
+                filename=index_name,
+                revision=target_config.revision,
+                cache_dir=self.vllm_config.load_config.download_dir,
+            )
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+
+        def load_weight(name: str) -> tuple[torch.Tensor, str]:
+            shard_name = weight_map[name]
+            if os.path.isdir(model_path):
+                shard_path = os.path.join(model_path, shard_name)
+            else:
+                shard_path = hf_hub_download(
+                    repo_id=model_path,
+                    filename=shard_name,
+                    revision=target_config.revision,
+                    cache_dir=self.vllm_config.load_config.download_dir,
+                )
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                return f.get_tensor(name), shard_name
+
+        embedding = VocabParallelEmbedding(
+            target_config.get_vocab_size(),
+            target_config.get_hidden_size(),
+            params_dtype=self.dtype,
+            prefix="model.embed_tokens",
+        ).to(self.device)
+        embedding_weight, embedding_shard = load_weight("model.embed_tokens.weight")
+        embedding.weight_loader(embedding.weight, embedding_weight)
+        self.model.model.embed_tokens = embedding
+
+        lm_head = ParallelLMHead(
+            target_config.get_vocab_size(),
+            target_config.get_hidden_size(),
+            params_dtype=self.dtype,
+            prefix="lm_head",
+        ).to(self.device)
+        lm_head_weight, lm_head_shard = load_weight("lm_head.weight")
+        lm_head.weight_loader(lm_head.weight, lm_head_weight)
+        self.model.lm_head = lm_head
+        logger.info(
+            "Loaded target embedding and lm_head for standalone EAGLE "
+            "from %s and %s.",
+            embedding_shard,
+            lm_head_shard,
+        )
+
+    def _eagle_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.model is not None
+        logits = self.model.logits_processor(
+            self.model.lm_head,
+            hidden_states,
+        )
+        assert logits is not None
+        return logits[:, : self.vocab_size]
+
+    @torch.inference_mode()
+    def eagle_propose(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        query_lens: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        seq_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generate K EAGLE tokens from one packed target-model query."""
+        assert self._is_eagle and self._model_loaded
+        assert self.model is not None
+        query_lens_list = [int(x) for x in query_lens.tolist()]
+        if any(n <= 0 for n in query_lens_list):
+            raise ValueError(f"EAGLE query lengths must be positive: {query_lens_list}")
+        B = len(query_lens_list)
+        total = sum(query_lens_list)
+        if target_hidden_states.shape[0] != total:
+            raise ValueError(
+                "EAGLE hidden-state/token count mismatch: "
+                f"{target_hidden_states.shape[0]} != {total}"
+            )
+
+        # EAGLE shifts token IDs left within each request and inserts the
+        # target's newly sampled token at the final query position.
+        input_ids = target_token_ids[:total].to(torch.int32).clone()
+        last_indices: list[int] = []
+        expanded_seq_ids: list[int] = []
+        offset = 0
+        seq_ids_list = [int(x) for x in seq_ids.tolist()]
+        for i, (sid, n) in enumerate(zip(seq_ids_list, query_lens_list)):
+            end = offset + n
+            if n > 1:
+                input_ids[offset : end - 1] = target_token_ids[offset + 1 : end]
+            input_ids[end - 1] = next_token_ids[i]
+            last_indices.append(end - 1)
+            expanded_seq_ids.extend([sid] * n)
+            offset = end
+
+        expanded_seq_ids_t = torch.tensor(
+            expanded_seq_ids,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        last_indices_t = torch.tensor(
+            last_indices,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        positions = target_positions[:total].to(torch.int64)
+        last_positions = positions[last_indices_t]
+        last_positions_list = [int(x) for x in last_positions.tolist()]
+        for sid, max_position in zip(seq_ids_list, last_positions_list):
+            self.ensure_blocks(sid, max_position + self._num_spec_tokens + 1)
+        seq_lens = (last_positions + 1).to(torch.int32)
+        query_start_loc = torch.zeros(
+            B + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.cumsum(query_lens.to(torch.int32), dim=0, out=query_start_loc[1:])
+        slot_mapping = self._compute_slot_mapping(positions, expanded_seq_ids_t)
+        block_tables = self._get_block_table_tensor(seq_ids)
+        attn_metadata = self._build_flash_attn_metadata(
+            num_tokens=total,
+            seq_lens_tensor=seq_lens,
+            max_seq_len=max(last_positions_list) + 1,
+            max_query_len=max(query_lens_list),
+            query_start_loc=query_start_loc,
+            block_table=block_tables,
+            slot_mapping=slot_mapping,
+        )
+        batch_descriptor = BatchDescriptor(num_tokens=total)
+        with (
+            set_forward_context(
+                attn_metadata=attn_metadata,
+                vllm_config=self._draft_vllm_config,
+                num_tokens=total,
+                slot_mapping=self._build_slot_mapping_dict(slot_mapping),
+                batch_descriptor=batch_descriptor,
+            ),
+            self._ir_priority_ctx(),
+        ):
+            first_output = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=target_hidden_states[:total],
+            )
+        first_logits_hidden, feedback_hidden = first_output
+        logits_hidden = first_logits_hidden[last_indices_t]
+        feedback_hidden = feedback_hidden[last_indices_t]
+        token = self._eagle_logits(logits_hidden).argmax(dim=-1)
+        draft_tokens = torch.empty(
+            B,
+            self._num_spec_tokens,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        draft_tokens[:, 0].copy_(token)
+        current_positions = last_positions
+        decode_slot_mapping = torch.empty(
+            B,
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        decode_query_start = self._decode_query_start_loc[: B + 1]
+        for step in range(1, self._num_spec_tokens):
+            eagle_step_update_slot_mapping_and_metadata(
+                positions_1d=current_positions,
+                block_table_tensor=block_tables,
+                seq_lens=seq_lens,
+                block_size=self.block_size,
+                max_model_len=self.max_model_len,
+                out_clamped_positions=current_positions,
+                out_slot_mapping=decode_slot_mapping,
+            )
+            attn_metadata = self._build_flash_attn_metadata(
+                num_tokens=B,
+                seq_lens_tensor=seq_lens,
+                max_seq_len=max(last_positions_list) + step + 1,
+                max_query_len=1,
+                query_start_loc=decode_query_start,
+                block_table=block_tables,
+                slot_mapping=decode_slot_mapping,
+            )
+            with (
+                set_forward_context(
+                    attn_metadata=attn_metadata,
+                    vllm_config=self._draft_vllm_config,
+                    num_tokens=B,
+                    slot_mapping=self._build_slot_mapping_dict(
+                        decode_slot_mapping
+                    ),
+                    batch_descriptor=BatchDescriptor(num_tokens=B),
+                ),
+                self._ir_priority_ctx(),
+            ):
+                step_output = self.model(
+                    input_ids=token.to(torch.int32),
+                    positions=current_positions,
+                    hidden_states=feedback_hidden,
+                )
+            logits_hidden, feedback_hidden = step_output
+            token = self._eagle_logits(logits_hidden).argmax(dim=-1)
+            draft_tokens[:, step].copy_(token)
+
+        for sid, last_position in zip(seq_ids_list, last_positions_list):
+            self._seq_lens[sid] = last_position + self._num_spec_tokens
+        return draft_tokens
 
     @torch.inference_mode()
     def prefill(

@@ -50,6 +50,14 @@ class TestEncodeDecodeRoundTrip:
             bonus_tokens_ref=_make_tensor_ref(buffer_id="buf-2"),
             temperatures_ref=_make_tensor_ref(dtype="float32", buffer_id="buf-3"),
             needs_logits=True,
+            eagle_token_ids_ref=_make_tensor_ref(buffer_id="eagle-tokens"),
+            eagle_positions_ref=_make_tensor_ref(buffer_id="eagle-positions"),
+            eagle_query_lens_ref=_make_tensor_ref(buffer_id="eagle-query"),
+            eagle_hidden_states_ref=_make_tensor_ref(
+                shape=(8, 8192),
+                dtype="bfloat16",
+                buffer_id="eagle-hidden",
+            ),
         )
         assert decode(encode(msg), VerificationOutcome) == msg
 
