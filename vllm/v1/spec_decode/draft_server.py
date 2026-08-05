@@ -157,7 +157,7 @@ class DraftServerMetrics:
         )
         self.eagle_shadow_build_latency = prometheus_client.Histogram(
             name="vllm:draft_server_eagle_shadow_build_latency_seconds",
-            documentation=("Time to build one fan-out-1 SSD-EAGLE shadow cache."),
+            documentation=("Time to build one SSD-EAGLE shadow cache."),
             buckets=(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0),
         )
         self.eagle_shadow_response_interval = prometheus_client.Histogram(
@@ -333,6 +333,12 @@ class DraftServer(
         # (bonus vs draft_tokens[:, -1]) to feed each row.
         self._last_miss_mask: torch.Tensor | None = None
         self._eagle_shadow_enabled = envs.VLLM_DISAGG_EAGLE_SHADOW
+        self._eagle_shadow_fanout = envs.VLLM_DISAGG_EAGLE_SHADOW_FANOUT
+        if not 1 <= self._eagle_shadow_fanout <= 32:
+            raise ValueError(
+                "VLLM_DISAGG_EAGLE_SHADOW_FANOUT must be between 1 and 32, "
+                f"got {self._eagle_shadow_fanout}."
+            )
         self._eagle_shadow_keys: torch.Tensor | None = None
         self._eagle_shadow_tokens: torch.Tensor | None = None
         self._eagle_shadow_last_response_time: float | None = None
@@ -517,12 +523,14 @@ class DraftServer(
 
         logger.info(
             "DraftServer initialized, bind_address=%s, K=%d, "
-            "fan_out=%d, max_batch_size=%d, eagle_shadow=%s",
+            "fan_out=%d, max_batch_size=%d, eagle_shadow=%s, "
+            "eagle_shadow_fanout=%d",
             self.bind_address,
             self.K,
             self.fan_out,
             self._max_batch_size,
             self._eagle_shadow_enabled,
+            self._eagle_shadow_fanout,
         )
 
     # ------------------------------------------------------------------
@@ -1688,22 +1696,23 @@ class DraftServer(
         feedback_trace: torch.Tensor,
         last_positions: torch.Tensor,
     ) -> None:
-        """Build fan-out-1 future branches without changing live responses."""
+        """Build future branches without changing live responses."""
         B = seq_ids.shape[0]
         K = self.K
+        F = self._eagle_shadow_fanout
         branch_owner = "__eagle_shadow__"
         runner.recycle_dedicated_blocks(branch_owner)
 
         k_positions = (
             torch.arange(K + 1, dtype=torch.int64, device=self.device)
-            .unsqueeze(0)
-            .expand(B, K + 1)
+            .view(1, K + 1, 1)
+            .expand(B, K + 1, F)
             .reshape(-1)
         )
         entry_batch_ids = (
             torch.arange(B, dtype=torch.int64, device=self.device)
-            .unsqueeze(1)
-            .expand(B, K + 1)
+            .view(B, 1, 1)
+            .expand(B, K + 1, F)
             .reshape(-1)
         )
 
@@ -1715,7 +1724,7 @@ class DraftServer(
             draft_tokens.unsqueeze(2),
             float("-inf"),
         )
-        bonus_candidates = candidate_logits.argmax(dim=-1).reshape(-1)
+        bonus_candidates = candidate_logits.topk(F, dim=-1).indices.reshape(-1)
         prefix_lens = (
             last_positions[entry_batch_ids] + k_positions + 1
         ).to(torch.int64)

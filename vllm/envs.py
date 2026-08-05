@@ -277,6 +277,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_DISAGG_EAGLE_SHADOW: bool = False
+    VLLM_DISAGG_EAGLE_SHADOW_FANOUT: int = 1
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1952,6 +1953,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISAGG_EAGLE_SHADOW": lambda: bool(
         int(os.getenv("VLLM_DISAGG_EAGLE_SHADOW", "0"))
     ),
+    # Number of recovery-token candidates to build per EAGLE acceptance
+    # outcome in the speculative-speculative shadow cache.
+    "VLLM_DISAGG_EAGLE_SHADOW_FANOUT": lambda: int(
+        os.getenv("VLLM_DISAGG_EAGLE_SHADOW_FANOUT", "1")
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2139,6 +2145,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_DISAGG_EAGLE_SHADOW",
+        "VLLM_DISAGG_EAGLE_SHADOW_FANOUT",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.

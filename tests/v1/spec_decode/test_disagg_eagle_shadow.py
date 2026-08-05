@@ -41,6 +41,7 @@ def test_eagle_shadow_build_excludes_rejected_draft_tokens():
     server = DraftServer.__new__(DraftServer)
     server.K = 2
     server.device = torch.device("cpu")
+    server._eagle_shadow_fanout = 1
 
     captured: dict[str, torch.Tensor] = {}
 
@@ -91,4 +92,73 @@ def test_eagle_shadow_build_excludes_rejected_draft_tokens():
     assert torch.equal(
         server._eagle_shadow_tokens,
         torch.tensor([[7, 7], [8, 8], [9, 9]]),
+    )
+
+
+def test_eagle_shadow_build_uses_top_f_recovery_tokens():
+    server = DraftServer.__new__(DraftServer)
+    server.K = 1
+    server.device = torch.device("cpu")
+    server._eagle_shadow_fanout = 2
+
+    captured: dict[str, torch.Tensor | int] = {}
+
+    def allocate(_self, **kwargs):
+        captured["n"] = kwargs["N"]
+        captured["entry_batch_ids"] = kwargs["entry_batch_ids"].clone()
+        captured["k_positions"] = kwargs["k_positions"].clone()
+        return torch.zeros(kwargs["N"], 4, dtype=torch.int32), kwargs[
+            "prefix_lens_override"
+        ]
+
+    server._allocate_branch_blocks_and_copy_kv = MethodType(allocate, server)
+
+    def shadow_decode(**kwargs):
+        captured["bonus_tokens"] = kwargs["bonus_tokens"].clone()
+        captured["initial_hidden_states"] = kwargs["initial_hidden_states"].clone()
+        return kwargs["bonus_tokens"].unsqueeze(1)
+
+    runner = SimpleNamespace(
+        recycle_dedicated_blocks=lambda _owner: None,
+        eagle_shadow_tree_decode=shadow_decode,
+    )
+    logits = torch.zeros(1, 2, 10)
+    logits[0, 0, 3] = 10
+    logits[0, 0, 5] = 9
+    logits[0, 0, 7] = 8
+    logits[0, 1, 4] = 10
+    logits[0, 1, 6] = 9
+    feedback = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+
+    server._build_eagle_shadow(
+        runner=runner,
+        seq_ids=torch.tensor([42]),
+        draft_tokens=torch.tensor([[3]]),
+        outcome_logits=logits,
+        feedback_trace=feedback,
+        last_positions=torch.tensor([10]),
+    )
+
+    assert captured["n"] == 4
+    assert torch.equal(captured["entry_batch_ids"], torch.tensor([0, 0, 0, 0]))
+    assert torch.equal(captured["k_positions"], torch.tensor([0, 0, 1, 1]))
+    assert torch.equal(captured["bonus_tokens"], torch.tensor([5, 7, 4, 6]))
+    assert torch.equal(
+        captured["initial_hidden_states"],
+        torch.tensor([[1.0, 2.0], [1.0, 2.0], [3.0, 4.0], [3.0, 4.0]]),
+    )
+    assert torch.equal(
+        server._eagle_shadow_keys,
+        torch.tensor(
+            [
+                [42, 0, 5],
+                [42, 0, 7],
+                [42, 1, 4],
+                [42, 1, 6],
+            ]
+        ),
+    )
+    assert torch.equal(
+        server._eagle_shadow_tokens,
+        torch.tensor([[5], [7], [4], [6]]),
     )
